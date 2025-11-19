@@ -1,0 +1,47 @@
+# Python 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# Poetry
+poetry.lock
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 环境变量
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# 数据库
+*.db
+*.sqlite
+chroma_db/
+
+# 日志
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 测试
+.pytest_cache/
+.coverage
+
+# 临时文件
+tmp/
+temp/
+*.tmp

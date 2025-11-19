@@ -1,0 +1,22 @@
+[project]
+name = "pdf-chatbot"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "huaan9426",email = "321210712@qq.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "langchain (>=1.0.7,<2.0.0)",
+    "openai (>=2.8.1,<3.0.0)",
+    "pypdf (>=6.3.0,<7.0.0)",
+    "streamlit (>=1.51.0,<2.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "pdf_chatbot", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
