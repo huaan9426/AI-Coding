@@ -281,7 +281,10 @@ search_results = [
 
 # 遍历列表处理每个文档
 for doc in documents:
-    print(f"处理文档：{doc}")
+    print(f"处理文档：{doc}") 
+#第一次：doc = "doc1.pdf"  → 打印 “处理文档：doc1.pdf”
+#第二次：doc = "doc2.pdf"  → 打印 “处理文档：doc2.pdf”
+#第三次：doc = "doc3.pdf"  → 打印 “处理文档：doc3.pdf”
 
 # 获取前3个结果
 top_3 = search_results[:3]
