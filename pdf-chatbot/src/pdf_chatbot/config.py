@@ -22,6 +22,9 @@ class Config:
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 
+    # 对话记忆配置
+    ENABLE_MEMORY = os.getenv("ENABLE_MEMORY", "true").lower() == "true"
+
     @classmethod
     def validate(cls):
         """验证必需的配置是否存在"""

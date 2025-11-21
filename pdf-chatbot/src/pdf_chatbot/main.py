@@ -3,6 +3,7 @@ import os
 import sys
 
 from pdf_chatbot import DocumentProcessor, VectorStoreManager, QASystem
+from pdf_chatbot.config import Config
 
 
 def main():
@@ -45,14 +46,18 @@ def main():
     print("\n" + "=" * 60)
     print("步骤 3/3: 初始化问答系统")
     print("=" * 60)
-    qa_system = QASystem(vector_manager)
+    qa_system = QASystem(vector_manager, enable_memory=Config.ENABLE_MEMORY)
     qa_system.initialize()
 
     # 4. 进入问答循环
     print("\n" + "=" * 60)
     print("🎉 系统准备就绪！开始提问吧")
     print("=" * 60)
-    print("💡 提示: 输入 'quit' 或 'exit' 退出")
+    print("💡 提示:")
+    print("  - 输入 'quit' 或 'exit' 退出")
+    if Config.ENABLE_MEMORY:
+        print("  - 输入 'history' 查看对话历史")
+        print("  - 输入 'clear' 清空对话历史")
     print()
 
     while True:
@@ -65,6 +70,15 @@ def main():
             if question.lower() in ['quit', 'exit', 'q']:
                 print("👋 再见！")
                 break
+
+            # 特殊命令处理（仅在启用记忆时可用）
+            if Config.ENABLE_MEMORY:
+                if question.lower() == 'history':
+                    qa_system.show_history()
+                    continue
+                if question.lower() == 'clear':
+                    qa_system.clear_history()
+                    continue
 
             # 回答问题
             qa_system.ask(question)
