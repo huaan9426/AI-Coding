@@ -1,4 +1,5 @@
 """问答链模块（支持对话记忆）"""
+import time
 from langchain.chains import ConversationalRetrievalChain
 from langchain.chat_models import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
@@ -76,39 +77,84 @@ class QASystem:
 
         返回:
             包含答案和来源文档的字典
+
+        异常:
+            ValueError: 问题为空或问答链未初始化
+            Exception: API 调用失败
         """
         if not self.qa_chain:
             raise ValueError("问答链未初始化！请先调用 initialize()")
 
+        # 验证问题
+        if not question or not question.strip():
+            raise ValueError("问题不能为空")
+
+        question = question.strip()
+
+        # 问题长度限制
+        if len(question) > 1000:
+            raise ValueError("问题过长（超过 1000 字符），请简化问题")
+
         print(f"\n❓ 问题: {question}")
         print("🔍 正在搜索相关文档...")
 
-        # 调用问答链
-        if self.enable_memory:
-            result = self.qa_chain({"question": question})
-            answer = result['answer']
-        else:
-            result = self.qa_chain({"query": question})
-            answer = result['result']
+        max_retries = 3
+        retry_delay = 2
 
-        print(f"\n💡 答案: {answer}")
+        for attempt in range(max_retries):
+            try:
+                # 调用问答链
+                if self.enable_memory:
+                    result = self.qa_chain({"question": question})
+                    answer = result['answer']
+                else:
+                    result = self.qa_chain({"query": question})
+                    answer = result['result']
 
-        # 保存到历史记录
-        self.chat_history.append({
-            "question": question,
-            "answer": answer
-        })
+                print(f"\n💡 答案: {answer}")
 
-        # 显示来源
-        if show_source and result.get('source_documents'):
-            print("\n📚 参考来源:")
-            for i, doc in enumerate(result['source_documents'], 1):
-                source = doc.metadata.get('source', '未知')
-                page = doc.metadata.get('page', '?')
-                print(f"  {i}. {source} (第{page}页)")
-                print(f"     {doc.page_content[:100]}...")
+                # 保存到历史记录
+                self.chat_history.append({
+                    "question": question,
+                    "answer": answer
+                })
 
-        return result
+                # 显示来源
+                if show_source and result.get('source_documents'):
+                    print("\n📚 参考来源:")
+                    for i, doc in enumerate(result['source_documents'], 1):
+                        source = doc.metadata.get('source', '未知')
+                        page = doc.metadata.get('page', '?')
+                        print(f"  {i}. {source} (第{page}页)")
+                        print(f"     {doc.page_content[:100]}...")
+
+                return result
+
+            except Exception as e:
+                error_msg = str(e)
+
+                # 检测常见错误类型
+                if "api key" in error_msg.lower() or "authentication" in error_msg.lower():
+                    raise ValueError("OpenAI API Key 无效或已过期，请检查 .env 配置")
+                elif "rate limit" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        print(f"⚠️  API 调用频率限制，{wait_time} 秒后重试...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise Exception("API 调用频率限制，请稍后再试或升级 API 套餐")
+                elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        print(f"⚠️  网络超时，正在重试（{attempt + 1}/{max_retries}）...")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise Exception("网络连接失败，请检查网络连接")
+                elif "insufficient_quota" in error_msg.lower():
+                    raise Exception("OpenAI API 额度不足，请充值或检查账户状态")
+                else:
+                    raise Exception(f"问答失败: {error_msg}")
 
     def get_chat_history(self) -> list:
         """

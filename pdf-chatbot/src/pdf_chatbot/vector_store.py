@@ -1,4 +1,6 @@
 """向量存储模块"""
+import os
+import time
 from typing import List
 from langchain.vectorstores import Chroma
 from langchain.embeddings import OpenAIEmbeddings
@@ -11,11 +13,14 @@ class VectorStoreManager:
     """向量数据库管理类"""
 
     def __init__(self):
-        self.embeddings = OpenAIEmbeddings(
-            model=Config.EMBEDDING_MODEL,
-            openai_api_key=Config.OPENAI_API_KEY
-        )
-        self.vectorstore = None
+        try:
+            self.embeddings = OpenAIEmbeddings(
+                model=Config.EMBEDDING_MODEL,
+                openai_api_key=Config.OPENAI_API_KEY
+            )
+            self.vectorstore = None
+        except Exception as e:
+            raise Exception(f"初始化 Embedding 模型失败: {str(e)}")
 
     def create_vectorstore(self, documents: List[Document]) -> Chroma:
         """
@@ -26,20 +31,57 @@ class VectorStoreManager:
 
         返回:
             向量数据库对象
+
+        异常:
+            ValueError: 文档列表为空
+            Exception: 向量化或保存失败
         """
+        if not documents:
+            raise ValueError("文档列表为空，无法创建向量数据库")
+
         print(f"🔄 正在向量化 {len(documents)} 个文档块...")
+        print(f"⏱️  预计需要 {len(documents) * 0.5:.0f} 秒（取决于网络速度）")
 
-        self.vectorstore = Chroma.from_documents(
-            documents=documents,
-            embedding=self.embeddings,
-            persist_directory=Config.CHROMA_PERSIST_DIR
-        )
+        max_retries = 3
+        retry_delay = 2
 
-        # 持久化保存
-        self.vectorstore.persist()
-        print(f"✅ 向量数据库创建完成，已保存到 {Config.CHROMA_PERSIST_DIR}")
+        for attempt in range(max_retries):
+            try:
+                self.vectorstore = Chroma.from_documents(
+                    documents=documents,
+                    embedding=self.embeddings,
+                    persist_directory=Config.CHROMA_PERSIST_DIR
+                )
 
-        return self.vectorstore
+                # 持久化保存
+                self.vectorstore.persist()
+                print(f"✅ 向量数据库创建完成，已保存到 {Config.CHROMA_PERSIST_DIR}")
+
+                return self.vectorstore
+
+            except Exception as e:
+                error_msg = str(e)
+
+                # 检测常见错误类型
+                if "api key" in error_msg.lower() or "authentication" in error_msg.lower():
+                    raise ValueError("OpenAI API Key 无效或已过期，请检查 .env 配置")
+                elif "rate limit" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)
+                        print(f"⚠️  API 调用频率限制，{wait_time} 秒后重试...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        raise Exception("API 调用频率限制，请稍后再试")
+                elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+                    if attempt < max_retries - 1:
+                        print(f"⚠️  网络超时，正在重试（{attempt + 1}/{max_retries}）...")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        raise Exception("网络连接失败，请检查网络连接")
+                else:
+                    raise Exception(f"创建向量数据库失败: {error_msg}")
 
     def load_vectorstore(self) -> Chroma:
         """
@@ -47,16 +89,35 @@ class VectorStoreManager:
 
         返回:
             向量数据库对象
+
+        异常:
+            FileNotFoundError: 向量数据库不存在
+            Exception: 加载失败
         """
+        if not os.path.exists(Config.CHROMA_PERSIST_DIR):
+            raise FileNotFoundError(
+                f"向量数据库不存在: {Config.CHROMA_PERSIST_DIR}\n"
+                "请先加载 PDF 文件创建向量数据库"
+            )
+
         print(f"📂 正在加载向量数据库...")
 
-        self.vectorstore = Chroma(
-            persist_directory=Config.CHROMA_PERSIST_DIR,
-            embedding_function=self.embeddings
-        )
+        try:
+            self.vectorstore = Chroma(
+                persist_directory=Config.CHROMA_PERSIST_DIR,
+                embedding_function=self.embeddings
+            )
 
-        print(f"✅ 向量数据库加载完成")
-        return self.vectorstore
+            # 验证数据库是否可用
+            collection_count = self.vectorstore._collection.count()
+            if collection_count == 0:
+                raise ValueError("向量数据库为空，请重新创建")
+
+            print(f"✅ 向量数据库加载完成（包含 {collection_count} 个文档块）")
+            return self.vectorstore
+
+        except Exception as e:
+            raise Exception(f"加载向量数据库失败: {str(e)}")
 
     def search(self, query: str, k: int = 3) -> List[Document]:
         """

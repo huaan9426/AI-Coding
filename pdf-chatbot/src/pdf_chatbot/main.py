@@ -19,35 +19,65 @@ def main():
         print("\n🆕 首次运行，需要先加载 PDF 文档")
         pdf_path = input("📄 请输入 PDF 文件路径: ").strip()
 
-        if not pdf_path or not os.path.exists(pdf_path):
-            print("❌ 文件不存在！")
+        # 验证文件路径
+        if not pdf_path:
+            print("❌ 文件路径不能为空！")
+            return
+
+        # 去除可能的引号
+        pdf_path = pdf_path.strip('"').strip("'")
+
+        if not os.path.exists(pdf_path):
+            print(f"❌ 文件不存在: {pdf_path}")
+            print("💡 提示: 请输入完整的文件路径，例如: /Users/xxx/document.pdf")
+            return
+
+        if not pdf_path.lower().endswith('.pdf'):
+            print(f"❌ 文件格式错误，仅支持 PDF 文件: {pdf_path}")
             return
 
         # 1. 处理文档
         print("\n" + "=" * 60)
         print("步骤 1/3: 处理文档")
         print("=" * 60)
-        processor = DocumentProcessor()
-        chunks = processor.process_pdf(pdf_path)
+        try:
+            processor = DocumentProcessor()
+            chunks = processor.process_pdf(pdf_path)
+        except Exception as e:
+            print(f"❌ {str(e)}")
+            return
 
         # 2. 创建向量数据库
         print("\n" + "=" * 60)
         print("步骤 2/3: 创建向量数据库")
         print("=" * 60)
-        vector_manager = VectorStoreManager()
-        vector_manager.create_vectorstore(chunks)
+        try:
+            vector_manager = VectorStoreManager()
+            vector_manager.create_vectorstore(chunks)
+        except Exception as e:
+            print(f"❌ {str(e)}")
+            return
 
     else:
         print("\n📂 检测到已存在的向量数据库，直接加载...")
-        vector_manager = VectorStoreManager()
-        vector_manager.load_vectorstore()
+        try:
+            vector_manager = VectorStoreManager()
+            vector_manager.load_vectorstore()
+        except Exception as e:
+            print(f"❌ {str(e)}")
+            print("💡 提示: 如需重新创建数据库，请删除 chroma_db 文件夹")
+            return
 
     # 3. 初始化问答系统
     print("\n" + "=" * 60)
     print("步骤 3/3: 初始化问答系统")
     print("=" * 60)
-    qa_system = QASystem(vector_manager, enable_memory=Config.ENABLE_MEMORY)
-    qa_system.initialize()
+    try:
+        qa_system = QASystem(vector_manager, enable_memory=Config.ENABLE_MEMORY)
+        qa_system.initialize()
+    except Exception as e:
+        print(f"❌ {str(e)}")
+        return
 
     # 4. 进入问答循环
     print("\n" + "=" * 60)
@@ -81,13 +111,18 @@ def main():
                     continue
 
             # 回答问题
-            qa_system.ask(question)
+            try:
+                qa_system.ask(question)
+            except Exception as e:
+                print(f"❌ {str(e)}")
+                # 继续循环，不退出程序
 
         except KeyboardInterrupt:
             print("\n\n👋 再见！")
             break
         except Exception as e:
-            print(f"❌ 错误: {e}")
+            print(f"❌ 未知错误: {e}")
+            print("💡 提示: 如果问题持续，请检查网络连接和 API 配置")
 
 
 if __name__ == "__main__":
