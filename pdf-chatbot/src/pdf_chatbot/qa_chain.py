@@ -1,11 +1,35 @@
 """问答链模块（支持对话记忆）"""
 import time
+from typing import Tuple
 from langchain.chains import ConversationalRetrievalChain
 from langchain.chat_models import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 
 from .config import Config
 from .vector_store import VectorStoreManager
+
+
+def get_confidence_level(distance: float) -> Tuple[str, str, float]:
+    """
+    根据余弦距离判断可信度
+
+    参数:
+        distance: 余弦距离（0-2，Chroma 返回值）
+
+    返回:
+        (可信度等级, 颜色图标, 相似度分数)
+    """
+    # 转换为相似度（0-1）
+    similarity = 1 - distance
+
+    if similarity >= 0.85:
+        return "高度相关", "🟢", similarity
+    elif similarity >= 0.70:
+        return "较为相关", "🟡", similarity
+    elif similarity >= 0.50:
+        return "可能相关", "🟠", similarity
+    else:
+        return "不太相关", "🔴", similarity
 
 
 class QASystem:
@@ -119,14 +143,35 @@ class QASystem:
                     "answer": answer
                 })
 
-                # 显示来源
+                # 显示来源（包含相似度分数）
                 if show_source and result.get('source_documents'):
-                    print("\n📚 参考来源:")
-                    for i, doc in enumerate(result['source_documents'], 1):
-                        source = doc.metadata.get('source', '未知')
-                        page = doc.metadata.get('page', '?')
-                        print(f"  {i}. {source} (第{page}页)")
-                        print(f"     {doc.page_content[:100]}...")
+                    # 使用 search_with_score 获取相似度分数
+                    try:
+                        docs_with_scores = self.vector_store_manager.search_with_score(
+                            question,
+                            k=len(result['source_documents'])
+                        )
+
+                        print("\n📚 参考来源（按相似度排序）:")
+                        for i, (doc, score) in enumerate(docs_with_scores, 1):
+                            source = doc.metadata.get('source', '未知')
+                            page = doc.metadata.get('page', '?')
+
+                            # 获取可信度等级
+                            level, icon, similarity = get_confidence_level(score)
+
+                            print(f"  {i}. {source} (第{page}页) {icon} {level}")
+                            print(f"     相似度: {similarity:.1%} | 距离: {score:.3f}")
+                            print(f"     {doc.page_content[:100]}...")
+
+                    except Exception as e:
+                        # 如果获取分数失败，回退到原来的显示方式
+                        print("\n📚 参考来源:")
+                        for i, doc in enumerate(result['source_documents'], 1):
+                            source = doc.metadata.get('source', '未知')
+                            page = doc.metadata.get('page', '?')
+                            print(f"  {i}. {source} (第{page}页)")
+                            print(f"     {doc.page_content[:100]}...")
 
                 return result
 

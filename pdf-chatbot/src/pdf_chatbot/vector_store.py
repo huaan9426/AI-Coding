@@ -135,3 +135,22 @@ class VectorStoreManager:
 
         results = self.vectorstore.similarity_search(query, k=k)
         return results
+
+    def search_with_score(self, query: str, k: int = 3) -> List[tuple]:
+        """
+        搜索相关文档（包含相似度分数）
+
+        参数:
+            query: 查询问题
+            k: 返回结果数量
+
+        返回:
+            (Document, score) 元组列表
+            - Document: 文档对象
+            - score: 相似度分数（距离，越小越相似）
+        """
+        if not self.vectorstore:
+            raise ValueError("向量数据库未初始化！请先创建或加载向量数据库")
+
+        results = self.vectorstore.similarity_search_with_score(query, k=k)
+        return results
