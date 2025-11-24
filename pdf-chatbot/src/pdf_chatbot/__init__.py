@@ -1,4 +1,4 @@
-"""PDF J):hº - ú RAG „‡cîTûß"""
+"""PDF èŠå¤©æœºå™¨äºº - åŸºäº RAG çš„æ–‡æ¡£é—®ç­”ç³»ç»Ÿ"""
 
 from .config import Config
 from .document_loader import DocumentProcessor

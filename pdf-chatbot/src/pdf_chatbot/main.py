@@ -88,6 +88,7 @@ def main():
     if Config.ENABLE_MEMORY:
         print("  - 输入 'history' 查看对话历史")
         print("  - 输入 'clear' 清空对话历史")
+        print("  - 输入 'export' 导出对话记录")
     print()
 
     while True:
@@ -108,6 +109,31 @@ def main():
                     continue
                 if question.lower() == 'clear':
                     qa_system.clear_history()
+                    continue
+                if question.lower() == 'export':
+                    try:
+                        # 提示用户选择导出格式
+                        print("\n📤 选择导出格式:")
+                        print("  1. 纯文本 (txt)")
+                        print("  2. JSON")
+                        print("  3. Markdown (md)")
+                        format_choice = input("请输入选项 (1/2/3, 默认为 1): ").strip() or "1"
+
+                        format_map = {
+                            "1": "text",
+                            "2": "json",
+                            "3": "markdown"
+                        }
+
+                        format_type = format_map.get(format_choice, "text")
+
+                        # 导出
+                        filepath = qa_system.export_history(format_type)
+                        print(f"✅ 对话记录已导出到: {filepath}")
+                    except ValueError as e:
+                        print(f"❌ {str(e)}")
+                    except Exception as e:
+                        print(f"❌ 导出失败: {str(e)}")
                     continue
 
             # 回答问题

@@ -1,5 +1,8 @@
 """问答链模块（支持对话记忆）"""
 import time
+import json
+from datetime import datetime
+from pathlib import Path
 from typing import Tuple
 from langchain.chains import ConversationalRetrievalChain
 from langchain.chat_models import ChatOpenAI
@@ -231,3 +234,149 @@ class QASystem:
             print(f"❓ 问: {item['question']}")
             print(f"💡 答: {item['answer'][:200]}{'...' if len(item['answer']) > 200 else ''}")
         print("\n" + "=" * 60)
+
+    def export_to_text(self, output_dir: str = "./exports") -> str:
+        """
+        导出对话记录为纯文本格式
+
+        参数:
+            output_dir: 导出目录（默认 ./exports）
+
+        返回:
+            导出文件路径
+        """
+        if not self.chat_history:
+            raise ValueError("对话历史为空，无法导出")
+
+        # 创建导出目录
+        export_path = Path(output_dir)
+        export_path.mkdir(parents=True, exist_ok=True)
+
+        # 生成文件名（包含时间戳）
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"chat_history_{timestamp}.txt"
+        filepath = export_path / filename
+
+        # 写入文件
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("=" * 70 + "\n")
+            f.write("PDF 聊天机器人对话记录\n")
+            f.write("=" * 70 + "\n")
+            f.write(f"导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"对话轮数: {len(self.chat_history)}\n")
+            f.write("=" * 70 + "\n\n")
+
+            for i, item in enumerate(self.chat_history, 1):
+                f.write(f"【第 {i} 轮对话】\n")
+                f.write(f"{'─' * 70}\n")
+                f.write(f"问题: {item['question']}\n\n")
+                f.write(f"答案:\n{item['answer']}\n")
+                f.write("\n" + "=" * 70 + "\n\n")
+
+        return str(filepath)
+
+    def export_to_json(self, output_dir: str = "./exports") -> str:
+        """
+        导出对话记录为 JSON 格式
+
+        参数:
+            output_dir: 导出目录（默认 ./exports）
+
+        返回:
+            导出文件路径
+        """
+        if not self.chat_history:
+            raise ValueError("对话历史为空，无法导出")
+
+        # 创建导出目录
+        export_path = Path(output_dir)
+        export_path.mkdir(parents=True, exist_ok=True)
+
+        # 生成文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"chat_history_{timestamp}.json"
+        filepath = export_path / filename
+
+        # 构建 JSON 数据
+        data = {
+            "export_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "total_conversations": len(self.chat_history),
+            "conversations": [
+                {
+                    "round": i,
+                    "question": item['question'],
+                    "answer": item['answer']
+                }
+                for i, item in enumerate(self.chat_history, 1)
+            ]
+        }
+
+        # 写入文件（美化输出）
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        return str(filepath)
+
+    def export_to_markdown(self, output_dir: str = "./exports") -> str:
+        """
+        导出对话记录为 Markdown 格式
+
+        参数:
+            output_dir: 导出目录（默认 ./exports）
+
+        返回:
+            导出文件路径
+        """
+        if not self.chat_history:
+            raise ValueError("对话历史为空，无法导出")
+
+        # 创建导出目录
+        export_path = Path(output_dir)
+        export_path.mkdir(parents=True, exist_ok=True)
+
+        # 生成文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"chat_history_{timestamp}.md"
+        filepath = export_path / filename
+
+        # 写入 Markdown 文件
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("# PDF 聊天机器人对话记录\n\n")
+            f.write(f"**导出时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"**对话轮数**: {len(self.chat_history)}\n\n")
+            f.write("---\n\n")
+
+            for i, item in enumerate(self.chat_history, 1):
+                f.write(f"## 第 {i} 轮对话\n\n")
+                f.write(f"### ❓ 问题\n\n")
+                f.write(f"{item['question']}\n\n")
+                f.write(f"### 💡 答案\n\n")
+                f.write(f"{item['answer']}\n\n")
+                f.write("---\n\n")
+
+        return str(filepath)
+
+    def export_history(self, format_type: str = "text", output_dir: str = "./exports") -> str:
+        """
+        导出对话历史（统一接口）
+
+        参数:
+            format_type: 导出格式 ('text', 'json', 'markdown')
+            output_dir: 导出目录
+
+        返回:
+            导出文件路径
+
+        异常:
+            ValueError: 格式不支持或对话历史为空
+        """
+        format_type = format_type.lower()
+
+        if format_type == "text" or format_type == "txt":
+            return self.export_to_text(output_dir)
+        elif format_type == "json":
+            return self.export_to_json(output_dir)
+        elif format_type == "markdown" or format_type == "md":
+            return self.export_to_markdown(output_dir)
+        else:
+            raise ValueError(f"不支持的导出格式: {format_type}，支持的格式: text, json, markdown")
