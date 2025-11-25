@@ -1,15 +1,54 @@
-"""问答链模块（支持对话记忆）"""
+"""问答链模块（支持对话记忆和流式输出）"""
+import sys
 import time
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
-from langchain.chains import ConversationalRetrievalChain
-from langchain.chat_models import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
+from typing import Tuple, Optional
+from langchain.chains import ConversationalRetrievalChain, RetrievalQA
+from langchain_openai import ChatOpenAI
+from langchain_core.memory import ConversationBufferMemory
+from langchain_core.callbacks import BaseCallbackHandler
 
 from .config import Config
 from .vector_store import VectorStoreManager
+
+
+class StreamingCallbackHandler(BaseCallbackHandler):
+    """
+    流式输出回调处理器
+
+    功能:
+        - 实时逐字符/逐词打印 LLM 生成的内容
+        - 收集完整答案用于保存到历史记录
+    """
+
+    def __init__(self):
+        self.answer = ""  # 收集完整答案
+        self.is_first_token = True  # 是否是第一个 token
+
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        """
+        每当 LLM 生成新 token 时调用
+
+        参数:
+            token: 新生成的文本片段
+        """
+        # 第一个 token 前打印提示
+        if self.is_first_token:
+            print("\n💡 答案: ", end="", flush=True)
+            self.is_first_token = False
+
+        # 实时打印
+        print(token, end="", flush=True)
+
+        # 收集完整答案
+        self.answer += token
+
+    def reset(self):
+        """重置状态，用于下一次问答"""
+        self.answer = ""
+        self.is_first_token = True
 
 
 def get_confidence_level(distance: float) -> Tuple[str, str, float]:
@@ -36,23 +75,38 @@ def get_confidence_level(distance: float) -> Tuple[str, str, float]:
 
 
 class QASystem:
-    """问答系统类（支持多轮对话）"""
+    """问答系统类（支持多轮对话和流式输出）"""
 
-    def __init__(self, vector_store_manager: VectorStoreManager, enable_memory: bool = True):
+    def __init__(
+        self,
+        vector_store_manager: VectorStoreManager,
+        enable_memory: bool = True,
+        enable_streaming: bool = True
+    ):
         """
         初始化问答系统
 
         参数:
             vector_store_manager: 向量存储管理器
             enable_memory: 是否启用对话记忆（默认启用）
+            enable_streaming: 是否启用流式输出（默认启用）
         """
         self.vector_store_manager = vector_store_manager
         self.enable_memory = enable_memory
+        self.enable_streaming = enable_streaming
+
+        # 创建流式回调处理器
+        self.streaming_handler = StreamingCallbackHandler() if enable_streaming else None
+
+        # 初始化 LLM（启用流式输出）
         self.llm = ChatOpenAI(
             model=Config.MODEL_NAME,
             temperature=Config.TEMPERATURE,
-            openai_api_key=Config.OPENAI_API_KEY
+            openai_api_key=Config.OPENAI_API_KEY,
+            streaming=enable_streaming,  # 启用流式输出
+            callbacks=[self.streaming_handler] if enable_streaming else None
         )
+
         self.qa_chain = None
         self.memory = None
         self.chat_history = []  # 存储对话历史（用于显示）
@@ -62,7 +116,9 @@ class QASystem:
         if not self.vector_store_manager.vectorstore:
             raise ValueError("向量数据库未加载！请先加载或创建向量数据库")
 
-        print(f"🤖 正在初始化问答系统（记忆功能：{'开启' if self.enable_memory else '关闭'}）...")
+        print(f"🤖 正在初始化问答系统...")
+        print(f"   - 记忆功能：{'✅ 开启' if self.enable_memory else '❌ 关闭'}")
+        print(f"   - 流式输出：{'✅ 开启' if self.enable_streaming else '❌ 关闭'}")
 
         if self.enable_memory:
             # 创建对话记忆
@@ -83,7 +139,6 @@ class QASystem:
             )
         else:
             # 使用普通的 RetrievalQA（不支持记忆）
-            from langchain.chains import RetrievalQA
             self.qa_chain = RetrievalQA.from_chain_type(
                 llm=self.llm,
                 retriever=self.vector_store_manager.vectorstore.as_retriever(
@@ -130,6 +185,10 @@ class QASystem:
 
         for attempt in range(max_retries):
             try:
+                # 重置流式处理器状态
+                if self.enable_streaming and self.streaming_handler:
+                    self.streaming_handler.reset()
+
                 # 调用问答链
                 if self.enable_memory:
                     result = self.qa_chain({"question": question})
@@ -138,7 +197,13 @@ class QASystem:
                     result = self.qa_chain({"query": question})
                     answer = result['result']
 
-                print(f"\n💡 答案: {answer}")
+                # 流式模式下，从 callback 获取答案
+                if self.enable_streaming and self.streaming_handler:
+                    answer = self.streaming_handler.answer
+                    print()  # 流式输出结束后换行
+                else:
+                    # 非流式模式，一次性打印
+                    print(f"\n💡 答案: {answer}")
 
                 # 保存到历史记录
                 self.chat_history.append({

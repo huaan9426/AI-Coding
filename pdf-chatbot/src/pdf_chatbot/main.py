@@ -89,6 +89,7 @@ def main():
         print("  - 输入 'history' 查看对话历史")
         print("  - 输入 'clear' 清空对话历史")
         print("  - 输入 'export' 导出对话记录")
+    print("  - 答案将以流式输出方式实时显示")
     print()
 
     while True:
