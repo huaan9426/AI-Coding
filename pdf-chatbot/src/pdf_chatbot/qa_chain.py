@@ -6,9 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Tuple, Optional
 from langchain.chains import ConversationalRetrievalChain, RetrievalQA
-from langchain_openai import ChatOpenAI
-from langchain_core.memory import ConversationBufferMemory
-from langchain_core.callbacks import BaseCallbackHandler
+from langchain.chat_models import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.callbacks.base import BaseCallbackHandler
 
 from .config import Config
 from .vector_store import VectorStoreManager

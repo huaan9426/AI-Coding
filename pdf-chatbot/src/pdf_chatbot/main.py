@@ -24,8 +24,10 @@ def main():
             print("❌ 文件路径不能为空！")
             return
 
-        # 去除可能的引号
+        # 去除可能的引号和转义字符
         pdf_path = pdf_path.strip('"').strip("'")
+        # 处理 shell 转义字符（反斜杠）
+        pdf_path = pdf_path.replace("\\ ", " ").replace("\\'", "'")
 
         if not os.path.exists(pdf_path):
             print(f"❌ 文件不存在: {pdf_path}")

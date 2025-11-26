@@ -1,9 +1,9 @@
 """文档加载模块"""
 import os
 from typing import List
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
 
 from .config import Config
 
