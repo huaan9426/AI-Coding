@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Tuple, Optional
 from langchain.chains import ConversationalRetrievalChain, RetrievalQA
 from langchain.chat_models import ChatOpenAI
+from langchain_community.chat_models import ChatTongyi
 from langchain.memory import ConversationBufferMemory
 from langchain.callbacks.base import BaseCallbackHandler
 
@@ -98,14 +99,27 @@ class QASystem:
         # 创建流式回调处理器
         self.streaming_handler = StreamingCallbackHandler() if enable_streaming else None
 
-        # 初始化 LLM（启用流式输出）
-        self.llm = ChatOpenAI(
-            model=Config.MODEL_NAME,
-            temperature=Config.TEMPERATURE,
-            openai_api_key=Config.OPENAI_API_KEY,
-            streaming=enable_streaming,  # 启用流式输出
-            callbacks=[self.streaming_handler] if enable_streaming else None
-        )
+        # 根据配置选择 LLM
+        if Config.LLM_PROVIDER == "openai":
+            print(f"🔧 使用 OpenAI LLM: {Config.MODEL_NAME}")
+            self.llm = ChatOpenAI(
+                model=Config.MODEL_NAME,
+                temperature=Config.TEMPERATURE,
+                openai_api_key=Config.OPENAI_API_KEY,
+                streaming=enable_streaming,
+                callbacks=[self.streaming_handler] if enable_streaming else None
+            )
+        elif Config.LLM_PROVIDER == "qwen":
+            print(f"🔧 使用通义千问 LLM: {Config.MODEL_NAME}")
+            self.llm = ChatTongyi(
+                model_name=Config.MODEL_NAME,
+                temperature=Config.TEMPERATURE,
+                dashscope_api_key=Config.DASHSCOPE_API_KEY,
+                streaming=enable_streaming,
+                callbacks=[self.streaming_handler] if enable_streaming else None
+            )
+        else:
+            raise ValueError(f"不支持的 LLM 提供商: {Config.LLM_PROVIDER}")
 
         self.qa_chain = None
         self.memory = None
@@ -246,26 +260,45 @@ class QASystem:
             except Exception as e:
                 error_msg = str(e)
 
-                # 检测常见错误类型
-                if "api key" in error_msg.lower() or "authentication" in error_msg.lower():
-                    raise ValueError("OpenAI API Key 无效或已过期，请检查 .env 配置")
-                elif "rate limit" in error_msg.lower():
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (attempt + 1)
-                        print(f"⚠️  API 调用频率限制，{wait_time} 秒后重试...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        raise Exception("API 调用频率限制，请稍后再试或升级 API 套餐")
-                elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+                # 检测常见错误类型（OpenAI）
+                if Config.LLM_PROVIDER == "openai":
+                    if "api key" in error_msg.lower() or "authentication" in error_msg.lower():
+                        raise ValueError("OpenAI API Key 无效或已过期，请检查 .env 配置")
+                    elif "rate limit" in error_msg.lower():
+                        if attempt < max_retries - 1:
+                            wait_time = retry_delay * (attempt + 1)
+                            print(f"⚠️  API 调用频率限制，{wait_time} 秒后重试...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            raise Exception("API 调用频率限制，请稍后再试或升级 API 套餐")
+                    elif "insufficient_quota" in error_msg.lower():
+                        raise Exception("OpenAI API 额度不足，请充值或检查账户状态")
+
+                # 检测常见错误类型（通义千问）
+                elif Config.LLM_PROVIDER == "qwen":
+                    if "invalid api" in error_msg.lower() or "authentication" in error_msg.lower():
+                        raise ValueError(
+                            "DashScope API Key 无效或已过期\n"
+                            "请访问 https://dashscope.console.aliyun.com/ 检查 API Key"
+                        )
+                    elif "throttling" in error_msg.lower() or "rate limit" in error_msg.lower():
+                        if attempt < max_retries - 1:
+                            wait_time = retry_delay * (attempt + 1)
+                            print(f"⚠️  API 调用频率限制，{wait_time} 秒后重试...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            raise Exception("API 调用频率限制，请稍后再试")
+
+                # 通用错误处理
+                if "timeout" in error_msg.lower() or "connection" in error_msg.lower():
                     if attempt < max_retries - 1:
                         print(f"⚠️  网络超时，正在重试（{attempt + 1}/{max_retries}）...")
                         time.sleep(retry_delay)
                         continue
                     else:
                         raise Exception("网络连接失败，请检查网络连接")
-                elif "insufficient_quota" in error_msg.lower():
-                    raise Exception("OpenAI API 额度不足，请充值或检查账户状态")
                 else:
                     raise Exception(f"问答失败: {error_msg}")
 

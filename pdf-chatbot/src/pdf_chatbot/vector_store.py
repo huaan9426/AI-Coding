@@ -3,7 +3,7 @@ import os
 import time
 from typing import List
 from langchain.vectorstores import Chroma
-from langchain.embeddings import OpenAIEmbeddings
+from langchain.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
 from langchain.schema import Document
 
 from .config import Config
@@ -14,10 +14,25 @@ class VectorStoreManager:
 
     def __init__(self):
         try:
-            self.embeddings = OpenAIEmbeddings(
-                model=Config.EMBEDDING_MODEL,
-                openai_api_key=Config.OPENAI_API_KEY
-            )
+            # 根据配置选择 Embedding 模型
+            if Config.EMBEDDING_PROVIDER == "openai":
+                print(f"🔧 使用 OpenAI Embedding: {Config.EMBEDDING_MODEL}")
+                self.embeddings = OpenAIEmbeddings(
+                    model=Config.EMBEDDING_MODEL,
+                    openai_api_key=Config.OPENAI_API_KEY
+                )
+            elif Config.EMBEDDING_PROVIDER == "local":
+                print(f"🔧 使用本地 Embedding: {Config.LOCAL_EMBEDDING_MODEL}")
+                print("📥 首次使用会自动下载模型（约 100MB），请稍候...")
+                self.embeddings = HuggingFaceEmbeddings(
+                    model_name=Config.LOCAL_EMBEDDING_MODEL,
+                    model_kwargs={'device': 'cpu'},  # 使用 CPU（无需 GPU）
+                    encode_kwargs={'normalize_embeddings': True}  # 归一化向量
+                )
+                print("✅ 本地 Embedding 模型加载完成")
+            else:
+                raise ValueError(f"不支持的 Embedding 提供商: {Config.EMBEDDING_PROVIDER}")
+
             self.vectorstore = None
         except Exception as e:
             raise Exception(f"初始化 Embedding 模型失败: {str(e)}")
@@ -40,7 +55,12 @@ class VectorStoreManager:
             raise ValueError("文档列表为空，无法创建向量数据库")
 
         print(f"🔄 正在向量化 {len(documents)} 个文档块...")
-        print(f"⏱️  预计需要 {len(documents) * 0.5:.0f} 秒（取决于网络速度）")
+
+        # 根据 Embedding 提供商显示不同的时间估计
+        if Config.EMBEDDING_PROVIDER == "openai":
+            print(f"⏱️  预计需要 {len(documents) * 0.5:.0f} 秒（取决于网络速度）")
+        else:
+            print(f"⏱️  预计需要 {len(documents) * 0.1:.0f} 秒（本地处理）")
 
         max_retries = 3
         retry_delay = 2
@@ -62,26 +82,28 @@ class VectorStoreManager:
             except Exception as e:
                 error_msg = str(e)
 
-                # 检测常见错误类型
-                if "api key" in error_msg.lower() or "authentication" in error_msg.lower():
-                    raise ValueError("OpenAI API Key 无效或已过期，请检查 .env 配置")
-                elif "rate limit" in error_msg.lower():
-                    if attempt < max_retries - 1:
-                        wait_time = retry_delay * (attempt + 1)
-                        print(f"⚠️  API 调用频率限制，{wait_time} 秒后重试...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        raise Exception("API 调用频率限制，请稍后再试")
-                elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
-                    if attempt < max_retries - 1:
-                        print(f"⚠️  网络超时，正在重试（{attempt + 1}/{max_retries}）...")
-                        time.sleep(retry_delay)
-                        continue
-                    else:
-                        raise Exception("网络连接失败，请检查网络连接")
-                else:
-                    raise Exception(f"创建向量数据库失败: {error_msg}")
+                # 检测常见错误类型（仅 OpenAI）
+                if Config.EMBEDDING_PROVIDER == "openai":
+                    if "api key" in error_msg.lower() or "authentication" in error_msg.lower():
+                        raise ValueError("OpenAI API Key 无效或已过期，请检查 .env 配置")
+                    elif "rate limit" in error_msg.lower():
+                        if attempt < max_retries - 1:
+                            wait_time = retry_delay * (attempt + 1)
+                            print(f"⚠️  API 调用频率限制，{wait_time} 秒后重试...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            raise Exception("API 调用频率限制，请稍后再试")
+                    elif "timeout" in error_msg.lower() or "connection" in error_msg.lower():
+                        if attempt < max_retries - 1:
+                            print(f"⚠️  网络超时，正在重试（{attempt + 1}/{max_retries}）...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            raise Exception("网络连接失败，请检查网络连接")
+
+                # 通用错误处理
+                raise Exception(f"创建向量数据库失败: {error_msg}")
 
     def load_vectorstore(self) -> Chroma:
         """

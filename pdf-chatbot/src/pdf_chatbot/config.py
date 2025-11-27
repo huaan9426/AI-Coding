@@ -9,9 +9,17 @@ load_dotenv()
 class Config:
     """应用配置类"""
 
+    # LLM 提供商选择
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "qwen").lower()  # openai / qwen
+
     # OpenAI 配置
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    MODEL_NAME = os.getenv("MODEL_NAME", "gpt-3.5-turbo")
+
+    # 通义千问配置
+    DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
+
+    # 模型名称
+    MODEL_NAME = os.getenv("MODEL_NAME", "qwen-turbo")
 
     # Temperature 配置验证
     try:
@@ -20,7 +28,14 @@ class Config:
         print("⚠️  TEMPERATURE 配置错误，使用默认值 0.0")
         TEMPERATURE = 0.0
 
+    # Embedding 提供商选择
+    EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local").lower()  # openai / local
+
+    # OpenAI Embedding 配置
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+    # 本地 Embedding 配置
+    LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")
 
     # 向量数据库配置
     CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
@@ -46,28 +61,54 @@ class Config:
         """验证必需的配置是否存在和合法性"""
         errors = []
 
-        # 验证 API Key
-        if not cls.OPENAI_API_KEY:
+        # 验证 LLM 提供商
+        if cls.LLM_PROVIDER not in ["openai", "qwen"]:
             errors.append(
-                "未找到 OPENAI_API_KEY！\n"
-                "  请创建 .env 文件并设置 OPENAI_API_KEY=your-api-key"
-            )
-        elif not cls.OPENAI_API_KEY.startswith("sk-"):
-            errors.append(
-                "OPENAI_API_KEY 格式错误！\n"
-                "  API Key 应该以 'sk-' 开头"
+                f"LLM_PROVIDER 配置错误: {cls.LLM_PROVIDER}\n"
+                "  支持的提供商: openai, qwen"
             )
 
+        # 验证对应的 API Key
+        if cls.LLM_PROVIDER == "openai":
+            if not cls.OPENAI_API_KEY:
+                errors.append(
+                    "未找到 OPENAI_API_KEY！\n"
+                    "  请在 .env 文件中设置 OPENAI_API_KEY=your-api-key"
+                )
+            elif not cls.OPENAI_API_KEY.startswith("sk-"):
+                errors.append(
+                    "OPENAI_API_KEY 格式错误！\n"
+                    "  API Key 应该以 'sk-' 开头"
+                )
+        elif cls.LLM_PROVIDER == "qwen":
+            if not cls.DASHSCOPE_API_KEY:
+                errors.append(
+                    "未找到 DASHSCOPE_API_KEY！\n"
+                    "  请访问 https://dashscope.console.aliyun.com/ 获取 API Key\n"
+                    "  并在 .env 文件中设置 DASHSCOPE_API_KEY=your-api-key"
+                )
+
         # 验证模型名称
-        valid_models = [
-            "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o",
-            "gpt-4o-mini", "gpt-3.5-turbo-16k"
-        ]
-        if cls.MODEL_NAME not in valid_models:
-            errors.append(
-                f"MODEL_NAME 可能不正确: {cls.MODEL_NAME}\n"
-                f"  支持的模型: {', '.join(valid_models)}"
-            )
+        if cls.LLM_PROVIDER == "openai":
+            valid_models = [
+                "gpt-3.5-turbo", "gpt-4", "gpt-4-turbo", "gpt-4o",
+                "gpt-4o-mini", "gpt-3.5-turbo-16k"
+            ]
+            if cls.MODEL_NAME not in valid_models:
+                errors.append(
+                    f"MODEL_NAME 可能不正确: {cls.MODEL_NAME}\n"
+                    f"  支持的 OpenAI 模型: {', '.join(valid_models)}"
+                )
+        elif cls.LLM_PROVIDER == "qwen":
+            valid_models = [
+                "qwen-turbo", "qwen-plus", "qwen-max",
+                "qwen-turbo-latest", "qwen-plus-latest", "qwen-max-latest"
+            ]
+            if cls.MODEL_NAME not in valid_models:
+                errors.append(
+                    f"MODEL_NAME 可能不正确: {cls.MODEL_NAME}\n"
+                    f"  支持的通义千问模型: {', '.join(valid_models)}"
+                )
 
         # 验证 Temperature
         if not 0 <= cls.TEMPERATURE <= 2:
@@ -76,16 +117,24 @@ class Config:
                 "  有效范围: 0.0 - 2.0"
             )
 
-        # 验证 Embedding 模型
-        valid_embedding_models = [
-            "text-embedding-3-small", "text-embedding-3-large",
-            "text-embedding-ada-002"
-        ]
-        if cls.EMBEDDING_MODEL not in valid_embedding_models:
+        # 验证 Embedding 提供商
+        if cls.EMBEDDING_PROVIDER not in ["openai", "local"]:
             errors.append(
-                f"EMBEDDING_MODEL 可能不正确: {cls.EMBEDDING_MODEL}\n"
-                f"  推荐模型: {', '.join(valid_embedding_models)}"
+                f"EMBEDDING_PROVIDER 配置错误: {cls.EMBEDDING_PROVIDER}\n"
+                "  支持的提供商: openai, local"
             )
+
+        # 验证 Embedding 模型
+        if cls.EMBEDDING_PROVIDER == "openai":
+            valid_embedding_models = [
+                "text-embedding-3-small", "text-embedding-3-large",
+                "text-embedding-ada-002"
+            ]
+            if cls.EMBEDDING_MODEL not in valid_embedding_models:
+                errors.append(
+                    f"EMBEDDING_MODEL 可能不正确: {cls.EMBEDDING_MODEL}\n"
+                    f"  推荐的 OpenAI 模型: {', '.join(valid_embedding_models)}"
+                )
 
         # 验证文档分块配置
         if cls.CHUNK_SIZE < 100 or cls.CHUNK_SIZE > 5000:
