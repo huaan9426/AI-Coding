@@ -6,38 +6,44 @@
 
 ```python
 class GPTModel:
-    def __init__(self, vocab_size=50257, d_model=768, num_layers=12, num_heads=12):
-        # Embedding
+    def __init__(self, vocab_size=50257, d_model=768, num_layers=12, num_heads=12, context_length=1024):
+        # ========================== 词表和位置嵌入 ==========================
+        # 把每个 token id 变成 768 维的向量（就是经典的词嵌入）
         self.token_embedding = Embedding(vocab_size, d_model)
+        
+        # Transformer 自己不知道顺序，所以给每个位置（0,1,2...）也准备一个 768 维向量
         self.position_embedding = Embedding(context_length, d_model)
-
-        # Transformer blocks
+        
+        # ========================== 12 层 Transformer 主干 ==========================
+        # 直接造 12 个一模一样的 Transformer block 出来（每层都有多头注意力 + FFN）
         self.blocks = [TransformerBlock(d_model, num_heads) for _ in range(num_layers)]
 
-        # Output head
+        # ========================== 最后收尾的部分 ==========================
+        # 最后再来一次 LayerNorm，让数值更稳定（GPT-2 原版就是这么干的）
         self.ln_f = LayerNorm(d_model)
+        
+        # 把 768 维打回词表大小，得到每个位置下一个词的得分
         self.lm_head = Linear(d_model, vocab_size)
 
     def forward(self, token_ids):
-        # token_ids: [batch_size, seq_len]
+        # token_ids 形状: [batch_size, seq_len]，比如 [32, 256]
         B, T = token_ids.shape
 
-        # Embeddings
-        tok_emb = self.token_embedding(token_ids)  # [B, T, d_model]
-        pos = torch.arange(T, device=token_ids.device)
-        pos_emb = self.position_embedding(pos)  # [T, d_model]
-        x = tok_emb + pos_emb  # [B, T, d_model]
+        # ------------------- 第1步：词嵌入 + 位置嵌入 -------------------
+        tok_emb = self.token_embedding(token_ids)           # [B, T, 768]  每个词变成向量
+        pos = torch.arange(T, device=token_ids.device)      # [0, 1, 2, ..., T-1]
+        pos_emb = self.position_embedding(pos)              # [T, 768]     每个位置的向量
+        x = tok_emb + pos_emb                               # [B, T, 768]  相加！这就是 Transformer 真正的输入
 
-        # Transformer blocks
-        for block in self.blocks:
+        # ------------------- 第2步：过 12 层 Transformer -------------------
+        for block in self.blocks:   # 一层一层喂进去，越跑越聪明
             x = block(x)
 
-        # Final layer norm
-        x = self.ln_f(x)  # [B, T, d_model]
+        # ------------------- 第3步：最后收尾 -------------------
+        x = self.ln_f(x)                  # 最后再 Norm 一次，数值更乖
+        logits = self.lm_head(x)          # [B, T, 50257]  每个位置每个词的原始得分
 
-        # Project to vocabulary
-        logits = self.lm_head(x)  # [B, T, vocab_size]
-
+        # 完事！后面接 softmax 就能采样下一个词啦
         return logits
 ```
 
@@ -46,33 +52,50 @@ class GPTModel:
 ```python
 def masked_self_attention(Q, K, V):
     """
-    Causal (masked) self-attention for autoregressive generation
+    Causal（因果）自注意力 —— 用来做自回归生成的核心！
+    保证“过去能看到未来，但未来绝对看不到过去”（不然会作弊呀）
 
-    Q, K, V: [batch_size, seq_len, d_k]
+    输入 Q, K, V 形状都是: [batch_size, seq_len, d_k]  
+    （d_k 通常等于 d_model // num_heads，比如 768 // 12 = 64）
     """
-    B, T, d_k = Q.shape
+    B, T, d_k = Q.shape   # B=批大小，T=当前序列长度，d_k=每个头的维度
 
-    # 1. Compute attention scores
-    scores = Q @ K.transpose(-2, -1) / np.sqrt(d_k)  # [B, T, T]
+    # ============================== 第1步：算注意力分数 ==============================
+    # Q 和 K 做点积，得到每个 token 对序列中所有 token 的“原始关注度”
+    # @ 是矩阵乘法，K.transpose(-2, -1) 把最后两维转置 → 变成 [B, d_k, T]
+    # 除以 √d_k 是经典的缩放点积注意力，防止点积太大导致 softmax 梯度消失
+    scores = Q @ K.transpose(-2, -1) / np.sqrt(d_k)   # 结果形状 [B, T, T]
 
-    # 2. Apply causal mask (prevent attending to future tokens)
-    mask = np.tril(np.ones((T, T)))  # Lower triangular matrix
-    mask[mask == 0] = -np.inf
-    scores = scores + mask  # [B, T, T]
+    # 举个例子（T=4）：
+    # scores[i][j] 表示第 i 个 token 有多关注第 j 个 token
 
-    # 3. Softmax
-    attention_weights = softmax(scores, axis=-1)  # [B, T, T]
+    # ============================== 第2步：因果掩码（Causal Mask）—— 防作弊！ ==============================
+    # 我们生成文字时只能“从左往右看”，不能偷看未来的词
+    # 所以要造一个下三角全是 0，上三角全是 -inf 的 mask
+    mask = np.tril(np.ones((T, T)))        # 生成下三角矩阵（包括对角线全是 1）
+    mask[mask == 0] = -np.inf              # 上三角（未来位置）全部设成负无穷
 
-    # 4. Weighted sum
-    output = attention_weights @ V  # [B, T, d_k]
+    # mask 长这样（T=5 时）：
+    # [[  0,  -inf, -inf, -inf, -inf],
+    #  [  0,    0,  -inf, -inf, -inf],
+    #  [  0,    0,    0,  -inf, -inf],
+    #  [  0,    0,    0,    0,  -inf],
+    #  [  0,    0,    0,    0,    0 ]]
 
+    scores = scores + mask                 # 把 mask 加到分数上，未来位置的分数直接变成 -inf
+
+    # ============================== 第3步：Softmax 变成概率 ==============================
+    # 每一行（每个 token）对所有位置的关注度变成 0~1 的概率，且和为 1
+    # 因为未来是 -inf，所以 softmax 后它们会变成 0
+    attention_weights = softmax(scores, axis=-1)   # [B, T, T]
+
+    # ============================== 第4步：用注意力权重加权 V ==============================
+    # 每个位置的输出 = “我关注谁 × 谁的信息” 的加权和
+    output = attention_weights @ V                 # [B, T, d_k]
+
+    # 搞定！output 就是这一头的自注意力结果
+    # 如果是多头注意力，就把所有头的 output 拼起来再投影回去
     return output
-
-# Causal mask 示例：
-# Token:  I    love  dogs
-# Mask:  [[0,  -inf, -inf],    # "I" 只能看到自己
-#         [0,   0,   -inf],    # "love" 可以看到 "I" 和 "love"
-#         [0,   0,    0  ]]    # "dogs" 可以看到所有
 ```
 
 ---
