@@ -6575,8 +6575,2229 @@ docker buildx build \
 
 ---
 
-📝 **下一章预告**: 容器生命周期管理、健康检查、自动重启策略、资源监控
+---
+
+# 第三部分:容器运行时与编排
 
 ---
 
-*（第6-8章完成,约3400行。已完成8章,剩余11章...）*
+# 第9章:容器生命周期管理
+
+## 9.1 容器状态与生命周期
+
+### 9.1.1 容器状态机
+
+```bash
+# Docker容器状态转换图
+Created → Running → Paused → Running → Stopped → Removed
+   ↓         ↓        ↓         ↓         ↓
+   └────────→ Stopped ←─────────┘         ↓
+                ↓                         ↓
+                └────────→ Removed ←──────┘
+
+# 查看容器状态
+$ docker ps -a
+CONTAINER ID  IMAGE         STATUS
+abc123        nginx:alpine  Up 2 hours               # Running
+def456        redis:7       Exited (0) 5 minutes ago # Stopped
+ghi789        mysql:8       Paused                   # Paused
+```
+
+**状态详解**:
+
+| 状态 | 说明 | 进程状态 | 资源占用 |
+|------|------|---------|---------|
+| **Created** | 已创建未启动 | 不存在 | 磁盘空间 |
+| **Running** | 正常运行 | 存在 | CPU+内存+磁盘+网络 |
+| **Paused** | 暂停(冻结) | 暂停 | 内存+磁盘 |
+| **Restarting** | 重启中 | 短暂不存在 | 过渡状态 |
+| **Exited** | 已停止 | 不存在 | 磁盘空间 |
+| **Dead** | 异常终止 | 不存在 | 磁盘空间 |
+
+---
+
+### 9.1.2 容器启动流程深度解析
+
+```bash
+# 完整启动流程示例
+$ docker run -d \
+  --name myapp \
+  --restart unless-stopped \
+  --health-cmd "curl -f http://localhost:8080/health || exit 1" \
+  --health-interval 30s \
+  --health-timeout 3s \
+  --health-retries 3 \
+  -p 8080:8080 \
+  myapp:latest
+
+# 启动流程(底层调用链):
+# 1️⃣ Docker Client → Docker API
+# 2️⃣ dockerd → containerd (gRPC)
+# 3️⃣ containerd → containerd-shim
+# 4️⃣ containerd-shim → runc (创建容器)
+# 5️⃣ runc → Linux Kernel (namespace/cgroups)
+# 6️⃣ 容器进程启动(PID 1)
+# 7️⃣ 健康检查启动(定时探测)
+```
+
+**启动过程详细步骤**:
+
+```bash
+# 监控启动过程
+$ docker events --filter container=myapp &
+
+# 启动容器
+$ docker start myapp
+2023-12-04T10:00:00.123 container start abc123 (image=myapp:latest)
+2023-12-04T10:00:00.456 container attach abc123
+2023-12-04T10:00:01.234 network connect bridge abc123
+2023-12-04T10:00:01.567 container health_status: starting → healthy
+
+# 验证容器进程树
+$ docker top myapp
+UID    PID   PPID  CMD
+1000   1234  1200  /usr/local/bin/app --config /etc/app/config.yaml
+1000   1235  1234   \_ worker-thread-1
+1000   1236  1234   \_ worker-thread-2
+
+# 查看容器详细信息
+$ docker inspect myapp | jq '.[0].State'
+{
+  "Status": "running",
+  "Running": true,
+  "Paused": false,
+  "Restarting": false,
+  "OOMKilled": false,
+  "Dead": false,
+  "Pid": 1234,
+  "ExitCode": 0,
+  "StartedAt": "2023-12-04T10:00:01.234Z",
+  "FinishedAt": "0001-01-01T00:00:00Z",
+  "Health": {
+    "Status": "healthy",
+    "FailingStreak": 0,
+    "Log": [...]
+  }
+}
+```
+
+---
+
+### 9.1.3 容器停止与清理流程
+
+```bash
+# 优雅停止(SIGTERM → SIGKILL)
+$ docker stop myapp
+# 流程:
+# 1️⃣ 发送 SIGTERM 信号给PID 1
+# 2️⃣ 等待 10秒 (默认stopTimeout)
+# 3️⃣ 如果未退出,发送 SIGKILL 强制终止
+
+# 自定义停止超时
+$ docker stop -t 30 myapp  # 等待30秒
+
+# 立即强制终止(SIGKILL)
+$ docker kill myapp
+$ docker kill -s SIGUSR1 myapp  # 自定义信号
+
+# 删除容器
+$ docker rm myapp
+Error: You cannot remove a running container. Stop first.
+
+$ docker rm -f myapp  # 强制删除(先stop再remove)
+
+# 删除所有已停止容器
+$ docker container prune
+WARNING! This will remove all stopped containers.
+Total reclaimed space: 2.3GB
+```
+
+**应用优雅退出示例**:
+
+```python
+# Python应用优雅退出
+import signal
+import sys
+
+def signal_handler(sig, frame):
+    print('Received SIGTERM, shutting down gracefully...')
+    # 1. 停止接受新请求
+    server.stop_accepting_connections()
+    # 2. 等待当前请求完成
+    server.wait_for_current_requests(timeout=20)
+    # 3. 关闭数据库连接
+    db.close()
+    # 4. 清理资源
+    cleanup()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+
+# 启动服务器
+server.start()
+```
+
+---
+
+## 9.2 重启策略深度配置
+
+### 9.2.1 重启策略类型
+
+```bash
+# no: 不自动重启(默认)
+$ docker run -d --restart no myapp:latest
+
+# on-failure[:max-retries]: 仅异常退出时重启
+$ docker run -d --restart on-failure:3 myapp:latest
+# 仅当退出码非0时重启,最多3次
+
+# always: 总是重启
+$ docker run -d --restart always myapp:latest
+# dockerd重启后也会自动启动容器
+
+# unless-stopped: 除非手动停止,否则总是重启
+$ docker run -d --restart unless-stopped myapp:latest
+# dockerd重启后自动启动,但手动stop的不启动
+```
+
+**重启策略对比**:
+
+| 策略 | 容器异常退出 | 手动stop | dockerd重启 | 适用场景 |
+|------|------------|---------|------------|---------|
+| **no** | ❌ 不重启 | - | ❌ 不启动 | 临时任务 |
+| **on-failure** | ✅ 重启 | - | ❌ 不启动 | 批处理任务 |
+| **always** | ✅ 重启 | ✅ 重启 | ✅ 启动 | 核心服务(需谨慎) |
+| **unless-stopped** | ✅ 重启 | ❌ 不重启 | ✅ 启动 | 生产服务(推荐) |
+
+---
+
+### 9.2.2 重启策略实战案例
+
+```bash
+# 场景1: Web应用(推荐unless-stopped)
+$ docker run -d \
+  --name web \
+  --restart unless-stopped \
+  -p 80:80 \
+  nginx:alpine
+
+# 场景2: 数据库(推荐unless-stopped + 健康检查)
+$ docker run -d \
+  --name postgres \
+  --restart unless-stopped \
+  --health-cmd "pg_isready -U postgres" \
+  --health-interval 10s \
+  -e POSTGRES_PASSWORD=secret \
+  -v /data/postgres:/var/lib/postgresql/data \
+  postgres:15
+
+# 场景3: 定时任务(on-failure:3)
+$ docker run -d \
+  --name backup-job \
+  --restart on-failure:3 \
+  mybackup:latest
+
+# 场景4: 一次性任务(no)
+$ docker run --rm \
+  --name migration \
+  --restart no \
+  myapp:latest migrate
+```
+
+**重启行为验证**:
+
+```bash
+# 测试1: 异常退出
+$ docker run -d --name test1 --restart on-failure:3 alpine sh -c "exit 1"
+$ docker ps -a --filter name=test1
+# 观察RestartCount字段
+
+$ docker inspect test1 | jq '.[0].RestartCount'
+3  # 重启3次后停止
+
+# 测试2: dockerd重启后行为
+$ docker run -d --name test2 --restart unless-stopped nginx:alpine
+$ docker stop test2
+$ sudo systemctl restart docker
+$ docker ps --filter name=test2
+# test2不会自动启动(因为手动stop过)
+
+$ docker run -d --name test3 --restart always nginx:alpine
+$ docker stop test3
+$ sudo systemctl restart docker
+$ docker ps --filter name=test3
+# test3会自动启动(always策略)
+```
+
+---
+
+## 9.3 健康检查机制
+
+### 9.3.1 HEALTHCHECK指令详解
+
+```dockerfile
+# Dockerfile中定义健康检查
+FROM nginx:alpine
+
+# 方式1: 使用CMD
+HEALTHCHECK --interval=30s \
+            --timeout=3s \
+            --start-period=5s \
+            --retries=3 \
+  CMD curl -f http://localhost/ || exit 1
+
+# 方式2: 使用脚本
+COPY healthcheck.sh /usr/local/bin/
+HEALTHCHECK --interval=10s --timeout=5s \
+  CMD /usr/local/bin/healthcheck.sh
+
+# 禁用继承的健康检查
+HEALTHCHECK NONE
+```
+
+**healthcheck.sh脚本示例**:
+
+```bash
+#!/bin/sh
+# healthcheck.sh - 综合健康检查脚本
+
+set -e
+
+# 1️⃣ 检查HTTP端点
+if ! curl -f http://localhost:8080/health >/dev/null 2>&1; then
+  echo "HTTP health check failed"
+  exit 1
+fi
+
+# 2️⃣ 检查数据库连接(可选)
+if ! psql -U app -c "SELECT 1" >/dev/null 2>&1; then
+  echo "Database connection failed"
+  exit 1
+fi
+
+# 3️⃣ 检查磁盘空间
+DISK_USAGE=$(df / | tail -1 | awk '{print $5}' | sed 's/%//')
+if [ "$DISK_USAGE" -gt 90 ]; then
+  echo "Disk usage > 90%: ${DISK_USAGE}%"
+  exit 1
+fi
+
+# 4️⃣ 检查内存使用
+MEM_USAGE=$(free | grep Mem | awk '{print int($3/$2 * 100)}')
+if [ "$MEM_USAGE" -gt 95 ]; then
+  echo "Memory usage > 95%: ${MEM_USAGE}%"
+  exit 1
+fi
+
+echo "All health checks passed"
+exit 0
+```
+
+---
+
+### 9.3.2 运行时健康检查配置
+
+```bash
+# 启动时配置健康检查
+$ docker run -d \
+  --name myapp \
+  --health-cmd "curl -f http://localhost:8080/health || exit 1" \
+  --health-interval 30s \
+  --health-timeout 3s \
+  --health-retries 3 \
+  --health-start-period 40s \
+  myapp:latest
+
+# 查看健康状态
+$ docker ps
+CONTAINER ID  STATUS
+abc123        Up 5 minutes (healthy)
+
+$ docker inspect --format='{{.State.Health.Status}}' myapp
+healthy
+
+# 查看健康检查历史
+$ docker inspect myapp | jq '.[0].State.Health.Log'
+[
+  {
+    "Start": "2023-12-04T10:00:30.123Z",
+    "End": "2023-12-04T10:00:30.456Z",
+    "ExitCode": 0,
+    "Output": "All health checks passed\n"
+  },
+  {
+    "Start": "2023-12-04T10:01:00.123Z",
+    "End": "2023-12-04T10:01:00.456Z",
+    "ExitCode": 0,
+    "Output": "All health checks passed\n"
+  }
+]
+```
+
+**健康检查参数详解**:
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| `--interval` | 30s | 检查间隔 |
+| `--timeout` | 30s | 单次检查超时 |
+| `--retries` | 3 | 连续失败次数判定为unhealthy |
+| `--start-period` | 0s | 启动宽限期(此期间失败不计入retries) |
+
+---
+
+### 9.3.3 健康检查与负载均衡集成
+
+```yaml
+# docker-compose.yml - 健康检查集成
+version: '3.8'
+
+services:
+  web:
+    image: nginx:alpine
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      replicas: 3
+      update_config:
+        order: start-first  # 新容器healthy后才停旧容器
+        failure_action: rollback
+
+  app:
+    image: myapp:latest
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:15
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      POSTGRES_PASSWORD: secret
+```
+
+**Nginx负载均衡集成**:
+
+```nginx
+# nginx.conf - 基于Docker健康检查的负载均衡
+upstream backend {
+  least_conn;
+
+  # 后端服务器(通过Docker DNS)
+  server app1:8080 max_fails=3 fail_timeout=30s;
+  server app2:8080 max_fails=3 fail_timeout=30s;
+  server app3:8080 max_fails=3 fail_timeout=30s;
+
+  keepalive 32;
+}
+
+server {
+  listen 80;
+
+  location / {
+    proxy_pass http://backend;
+    proxy_next_upstream error timeout http_500 http_502 http_503;
+    proxy_connect_timeout 3s;
+    proxy_send_timeout 30s;
+    proxy_read_timeout 30s;
+  }
+
+  # 健康检查端点
+  location /health {
+    access_log off;
+    return 200 "OK\n";
+    add_header Content-Type text/plain;
+  }
+}
+```
+
+---
+
+## 9.4 容器日志管理
+
+### 9.4.1 日志驱动详解
+
+```bash
+# 查看支持的日志驱动
+$ docker info --format '{{.LoggingDriver}}'
+json-file
+
+$ docker info | grep "Logging Driver"
+Logging Driver: json-file
+```
+
+**日志驱动对比**:
+
+| 驱动 | 持久化 | 性能 | 支持docker logs | 适用场景 |
+|------|-------|------|----------------|---------|
+| **json-file** | ✅ | ⭐⭐⭐ | ✅ | 开发/小规模 |
+| **syslog** | ✅ | ⭐⭐⭐⭐ | ❌ | 集中日志系统 |
+| **journald** | ✅ | ⭐⭐⭐⭐ | ✅ | systemd环境 |
+| **fluentd** | ❌ | ⭐⭐⭐⭐ | ❌ | 大规模集群 |
+| **awslogs** | ✅ | ⭐⭐⭐⭐ | ❌ | AWS环境 |
+| **none** | ❌ | ⭐⭐⭐⭐⭐ | ❌ | 无需日志 |
+
+---
+
+### 9.4.2 json-file日志配置
+
+```json
+// /etc/docker/daemon.json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m",      // 单文件最大100MB
+    "max-file": "10",         // 保留10个历史文件
+    "compress": "true",       // 压缩历史文件
+    "labels": "production",   // 日志标签
+    "env": "APP_ENV"          // 包含环境变量
+  }
+}
+```
+
+```bash
+# 容器级别配置
+$ docker run -d \
+  --name myapp \
+  --log-driver json-file \
+  --log-opt max-size=50m \
+  --log-opt max-file=5 \
+  --log-opt compress=true \
+  myapp:latest
+
+# 查看日志
+$ docker logs myapp
+$ docker logs -f myapp  # 实时跟踪
+$ docker logs --tail 100 myapp  # 最后100行
+$ docker logs --since 2023-12-04T10:00:00 myapp  # 指定时间后
+$ docker logs --until 2023-12-04T11:00:00 myapp  # 指定时间前
+
+# 查看日志文件位置
+$ docker inspect --format='{{.LogPath}}' myapp
+/var/lib/docker/containers/abc123.../abc123...-json.log
+
+# 清理日志(需停止容器)
+$ docker stop myapp
+$ truncate -s 0 $(docker inspect --format='{{.LogPath}}' myapp)
+$ docker start myapp
+```
+
+---
+
+### 9.4.3 集中式日志方案
+
+**方案1: Fluentd**
+
+```yaml
+# docker-compose.yml
+version: '3'
+
+services:
+  fluentd:
+    image: fluent/fluentd:latest
+    ports:
+      - "24224:24224"
+    volumes:
+      - ./fluentd.conf:/fluentd/etc/fluent.conf
+      - /data/fluentd:/fluentd/log
+
+  app:
+    image: myapp:latest
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        tag: myapp.{{.Name}}
+```
+
+```conf
+# fluentd.conf
+<source>
+  @type forward
+  port 24224
+</source>
+
+<filter myapp.**>
+  @type record_transformer
+  <record>
+    hostname "#{Socket.gethostname}"
+    tag ${tag}
+  </record>
+</filter>
+
+<match myapp.**>
+  @type elasticsearch
+  host elasticsearch
+  port 9200
+  index_name fluentd
+  type_name fluentd
+</match>
+```
+
+**方案2: ELK Stack**
+
+```yaml
+# docker-compose.yml - ELK完整方案
+version: '3.8'
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - 9200:9200
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    volumes:
+      - ./logstash.conf:/usr/share/logstash/pipeline/logstash.conf
+    ports:
+      - 5000:5000
+    depends_on:
+      - elasticsearch
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    ports:
+      - 5601:5601
+    depends_on:
+      - elasticsearch
+
+  app:
+    image: myapp:latest
+    logging:
+      driver: syslog
+      options:
+        syslog-address: "tcp://logstash:5000"
+        tag: "myapp"
+
+volumes:
+  es-data:
+```
+
+---
+
+## 9.5 容器资源监控
+
+### 9.5.1 docker stats实时监控
+
+```bash
+# 查看所有容器资源使用
+$ docker stats
+CONTAINER  CPU %  MEM USAGE / LIMIT   MEM %   NET I/O        BLOCK I/O
+myapp      2.5%   256MB / 2GB         12.8%   1.2MB / 850KB  10MB / 5MB
+nginx      0.1%   50MB / 512MB        9.8%    500KB / 200KB  2MB / 1MB
+
+# 查看特定容器
+$ docker stats myapp --no-stream  # 单次快照
+$ docker stats --format "table {{.Container}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+# JSON格式输出
+$ docker stats --format "{{json .}}" --no-stream
+{"BlockIO":"10MB / 5MB","CPUPerc":"2.5%","Container":"myapp",...}
+```
+
+---
+
+### 9.5.2 cAdvisor深度监控
+
+```yaml
+# docker-compose.yml - cAdvisor部署
+version: '3'
+
+services:
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - 8080:8080
+    privileged: true
+    devices:
+      - /dev/kmsg
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - 9090:9090
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - 3000:3000
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
+volumes:
+  prometheus-data:
+  grafana-data:
+```
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  - job_name: 'docker'
+    static_configs:
+      - targets: ['host.docker.internal:9323']
+```
+
+---
+
+### 9.5.3 监控告警配置
+
+```yaml
+# prometheus-rules.yml
+groups:
+  - name: docker_alerts
+    interval: 30s
+    rules:
+      # CPU使用率告警
+      - alert: HighCPUUsage
+        expr: container_cpu_usage_seconds_total > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} high CPU usage"
+          description: "CPU usage is above 80% for 5 minutes"
+
+      # 内存使用率告警
+      - alert: HighMemoryUsage
+        expr: container_memory_usage_bytes / container_spec_memory_limit_bytes > 0.9
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Container {{ $labels.name }} high memory usage"
+          description: "Memory usage is above 90%"
+
+      # 容器重启告警
+      - alert: ContainerRestarting
+        expr: rate(container_restart_count[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Container {{ $labels.name }} is restarting"
+          description: "Container restarted {{ $value }} times in 15 minutes"
+```
+
+---
+
+## 9.6 本章总结
+
+**核心要点**:
+- ✅ 容器状态机:Created → Running → Paused/Stopped → Removed
+- ✅ 重启策略:`unless-stopped`适合生产环境
+- ✅ 健康检查:定义明确的检查逻辑,设置合理的超时和重试
+- ✅ 日志管理:限制大小,集中收集,结构化输出
+- ✅ 资源监控:实时监控+历史趋势+告警通知
+
+---
+
+# 第10章:Docker数据持久化方案
+
+## 10.1 存储驱动详解
+
+### 10.1.1 存储驱动对比
+
+```bash
+# 查看当前存储驱动
+$ docker info | grep "Storage Driver"
+Storage Driver: overlay2
+```
+
+**存储驱动选型对比**:
+
+| 驱动 | Linux发行版 | 性能 | 稳定性 | 适用场景 |
+|------|-----------|------|-------|---------|
+| **overlay2** | Kernel 4.0+ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | **生产环境首选** |
+| **aufs** | Ubuntu/Debian | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | 旧版Ubuntu |
+| **devicemapper** | RHEL/CentOS | ⭐⭐⭐ | ⭐⭐⭐ | 已弃用 |
+| **btrfs** | SLES | ⭐⭐⭐ | ⭐⭐⭐ | 特定场景 |
+| **zfs** | Ubuntu 16.04+ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | 高级用户 |
+| **vfs** | 任意 | ⭐⭐ | ⭐⭐⭐⭐⭐ | 测试环境 |
+
+---
+
+### 10.1.2 overlay2工作原理
+
+```bash
+# overlay2目录结构
+/var/lib/docker/overlay2/
+├── l/  # 短链接目录(避免mount参数过长)
+├── abc123.../  # 容器层
+│   ├── diff/    # 读写层差异数据
+│   ├── link     # 指向l/目录的短链接
+│   ├── lower    # 指向下层镜像
+│   ├── merged/  # 联合挂载点
+│   └── work/    # overlay工作目录
+└── def456.../  # 镜像层
+
+# 查看容器的overlay2挂载
+$ docker inspect myapp | jq '.[0].GraphDriver'
+{
+  "Data": {
+    "LowerDir": "/var/lib/docker/overlay2/def456/diff",
+    "MergedDir": "/var/lib/docker/overlay2/abc123/merged",
+    "UpperDir": "/var/lib/docker/overlay2/abc123/diff",
+    "WorkDir": "/var/lib/docker/overlay2/abc123/work"
+  },
+  "Name": "overlay2"
+}
+
+# 验证overlay挂载
+$ mount | grep overlay
+overlay on /var/lib/docker/overlay2/abc123/merged type overlay (rw,...)
+```
+
+**COW(Copy-on-Write)机制**:
+
+```bash
+# 场景演示:修改镜像中的文件
+$ docker run -it --name test alpine sh
+/ # echo "new content" > /etc/hosts  # 修改文件
+
+# 宿主机查看
+$ ls /var/lib/docker/overlay2/abc123/diff/etc/
+hosts  # ✅ 文件被复制到容器层
+
+# 删除文件
+/ # rm /etc/passwd
+
+$ ls /var/lib/docker/overlay2/abc123/diff/etc/
+passwd  # ❌ 创建whiteout标记(字符设备 c 0 0)
+```
+
+---
+
+## 10.2 Volume卷管理
+
+### 10.2.1 Volume基础操作
+
+```bash
+# 创建卷
+$ docker volume create mydata
+mydata
+
+# 查看卷列表
+$ docker volume ls
+DRIVER    VOLUME NAME
+local     mydata
+local     postgres-data
+
+# 查看卷详细信息
+$ docker volume inspect mydata
+[
+  {
+    "CreatedAt": "2023-12-04T10:00:00Z",
+    "Driver": "local",
+    "Labels": {},
+    "Mountpoint": "/var/lib/docker/volumes/mydata/_data",
+    "Name": "mydata",
+    "Options": {},
+    "Scope": "local"
+  }
+]
+
+# 使用卷
+$ docker run -d \
+  --name postgres \
+  -v mydata:/var/lib/postgresql/data \
+  postgres:15
+
+# 删除卷
+$ docker volume rm mydata
+Error: volume is in use
+
+$ docker stop postgres && docker rm postgres
+$ docker volume rm mydata  # ✅ 成功删除
+
+# 删除所有未使用卷
+$ docker volume prune
+WARNING! This will remove all local volumes not used by at least one container.
+Total reclaimed space: 5.2GB
+```
+
+---
+
+### 10.2.2 Volume挂载类型详解
+
+```bash
+# 1️⃣ Named Volume(命名卷)
+$ docker run -v mydata:/data alpine
+# 特点:Docker管理,持久化,可共享
+
+# 2️⃣ Anonymous Volume(匿名卷)
+$ docker run -v /data alpine
+# 特点:Docker管理,容器删除时可选择删除
+
+# 3️⃣ Bind Mount(绑定挂载)
+$ docker run -v /host/path:/container/path alpine
+# 特点:直接映射宿主机目录,开发环境常用
+
+# 4️⃣ tmpfs Mount(内存挂载)
+$ docker run --tmpfs /tmp:rw,size=100m alpine
+# 特点:存储在内存,容器停止即清空
+```
+
+**挂载类型对比**:
+
+| 类型 | 管理方 | 持久化 | 性能 | 跨主机 | 适用场景 |
+|------|-------|-------|------|-------|---------|
+| **Named Volume** | Docker | ✅ | ⭐⭐⭐⭐ | 使用插件 | **生产数据** |
+| **Anonymous Volume** | Docker | ✅ | ⭐⭐⭐⭐ | ❌ | 临时数据 |
+| **Bind Mount** | 用户 | ✅ | ⭐⭐⭐⭐⭐ | ❌ | 开发环境 |
+| **tmpfs** | Docker | ❌ | ⭐⭐⭐⭐⭐ | ❌ | 敏感数据/缓存 |
+
+---
+
+### 10.2.3 Volume高级选项
+
+```bash
+# 只读挂载
+$ docker run -v mydata:/data:ro alpine
+
+# 指定卷驱动
+$ docker volume create --driver local \
+  --opt type=nfs \
+  --opt o=addr=192.168.1.100,rw \
+  --opt device=:/path/to/share \
+  nfs-volume
+
+# 使用NFS卷
+$ docker run -v nfs-volume:/data alpine
+
+# 设置卷标签
+$ docker volume create --label env=production \
+  --label app=database \
+  prod-db-data
+
+# 查询特定标签的卷
+$ docker volume ls --filter label=env=production
+
+# nocopy选项(不从镜像复制初始内容)
+$ docker run -v mydata:/app:nocopy myapp:latest
+```
+
+**Bind Mount高级选项**:
+
+```bash
+# 指定权限
+$ docker run \
+  -v /host/data:/container/data:rw \  # 读写
+  -v /host/config:/etc/app:ro \       # 只读
+  alpine
+
+# 传播模式(propagation)
+$ docker run \
+  -v /host/data:/data:rshared \  # 双向传播
+  alpine
+
+# propagation模式:
+# - shared: 双向传播
+# - slave: 单向传播(宿主机→容器)
+# - private: 不传播(默认)
+# - rshared/rslave/rprivate: 递归模式
+
+# SELinux标签(CentOS/RHEL)
+$ docker run -v /host/data:/data:z alpine  # 私有标签
+$ docker run -v /host/data:/data:Z alpine  # 共享标签
+```
+
+---
+
+## 10.3 生产环境数据持久化方案
+
+### 10.3.1 数据库持久化最佳实践
+
+**PostgreSQL**:
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      # 数据目录
+      - postgres-data:/var/lib/postgresql/data
+      # 初始化脚本
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # 配置文件
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d myapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+
+volumes:
+  postgres-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/postgres  # 指定宿主机路径
+```
+
+**MySQL**:
+
+```yaml
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql_root_password
+      MYSQL_DATABASE: myapp
+      MYSQL_USER: appuser
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql_password
+    secrets:
+      - mysql_root_password
+      - mysql_password
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./my.cnf:/etc/mysql/conf.d/my.cnf:ro
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mysql-data:
+```
+
+---
+
+### 10.3.2 备份与恢复策略
+
+**PostgreSQL备份**:
+
+```bash
+# 方式1: 逻辑备份(pg_dump)
+$ docker exec postgres pg_dump -U appuser myapp > backup.sql
+
+# 恢复
+$ docker exec -i postgres psql -U appuser myapp < backup.sql
+
+# 方式2: 文件系统备份(需停止数据库)
+$ docker stop postgres
+$ tar -czf postgres-backup-$(date +%Y%m%d).tar.gz /data/postgres
+$ docker start postgres
+
+# 方式3: 在线备份(pg_basebackup)
+$ docker exec postgres pg_basebackup -U postgres -D /backup -Ft -z -P
+
+# 自动化备份脚本
+$ cat > /usr/local/bin/backup-postgres.sh <<'EOF'
+#!/bin/bash
+BACKUP_DIR="/backup/postgres"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="$BACKUP_DIR/postgres_$TIMESTAMP.sql.gz"
+
+mkdir -p "$BACKUP_DIR"
+
+docker exec postgres pg_dump -U appuser myapp | gzip > "$BACKUP_FILE"
+
+# 保留最近7天的备份
+find "$BACKUP_DIR" -name "postgres_*.sql.gz" -mtime +7 -delete
+
+echo "Backup completed: $BACKUP_FILE"
+EOF
+
+$ chmod +x /usr/local/bin/backup-postgres.sh
+
+# 添加定时任务(每天凌晨2点)
+$ crontab -e
+0 2 * * * /usr/local/bin/backup-postgres.sh >> /var/log/postgres-backup.log 2>&1
+```
+
+**MongoDB备份**:
+
+```bash
+# 备份
+$ docker exec mongodb mongodump --out /backup/$(date +%Y%m%d)
+
+# 恢复
+$ docker exec mongodb mongorestore /backup/20231204
+```
+
+---
+
+### 10.3.3 跨主机数据共享方案
+
+**方案1: NFS挂载**:
+
+```bash
+# NFS服务器配置(192.168.1.100)
+$ sudo apt install nfs-kernel-server
+$ sudo mkdir -p /export/docker-data
+$ sudo chown nobody:nogroup /export/docker-data
+
+$ sudo vim /etc/exports
+/export/docker-data 192.168.1.0/24(rw,sync,no_subtree_check,no_root_squash)
+
+$ sudo exportfs -ra
+$ sudo systemctl restart nfs-kernel-server
+
+# Docker客户端使用NFS卷
+$ docker volume create --driver local \
+  --opt type=nfs \
+  --opt o=addr=192.168.1.100,rw \
+  --opt device=:/export/docker-data \
+  nfs-data
+
+$ docker run -v nfs-data:/data alpine
+```
+
+**方案2: REX-Ray(云存储)**:
+
+```bash
+# 安装REX-Ray
+$ curl -sSL https://rexray.io/install | sh
+
+# 配置AWS EBS
+$ cat > /etc/rexray/config.yml <<EOF
+libstorage:
+  service: ebs
+aws:
+  accessKey: AKIAXXXXXXXXXXXXXXXX
+  secretKey: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  region: us-east-1
+EOF
+
+$ sudo systemctl start rexray
+
+# 创建EBS卷
+$ docker volume create --driver rexray --name ebs-vol \
+  --opt size=100
+
+# 使用卷(可在多台EC2间迁移)
+$ docker run -v ebs-vol:/data alpine
+```
+
+**方案3: GlusterFS集群**:
+
+```bash
+# 3节点GlusterFS集群部署(简化)
+# 节点1,2,3: 192.168.1.101-103
+
+# 每个节点安装GlusterFS
+$ sudo apt install glusterfs-server
+
+# 节点1创建卷
+$ sudo gluster volume create docker-vol replica 3 \
+  192.168.1.101:/data/gluster \
+  192.168.1.102:/data/gluster \
+  192.168.1.103:/data/gluster
+
+$ sudo gluster volume start docker-vol
+
+# Docker使用GlusterFS卷
+$ docker volume create --driver local \
+  --opt type=glusterfs \
+  --opt o=addr=192.168.1.101 \
+  --opt device=:/docker-vol \
+  gluster-data
+```
+
+---
+
+## 10.4 本章总结
+
+**核心要点**:
+- ✅ 存储驱动:**overlay2**是生产环境首选
+- ✅ 数据持久化:**Named Volume**管理简单,适合生产
+- ✅ 开发环境:**Bind Mount**方便实时同步
+- ✅ 数据库:定期备份,使用健康检查,配置持久化卷
+- ✅ 跨主机共享:NFS/GlusterFS/云存储方案
+
+---
+
+# 第11章:Docker Compose实战
+
+## 11.1 Compose基础
+
+### 11.1.1 Compose文件格式
+
+```yaml
+# docker-compose.yml - 完整示例
+version: '3.8'  # Compose文件版本
+
+# 定义服务
+services:
+  web:
+    image: nginx:alpine
+    container_name: web-server
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./html:/usr/share/nginx/html:ro
+    networks:
+      - frontend
+    depends_on:
+      - app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      args:
+        - VERSION=1.0.0
+    image: myapp:latest
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgres://appuser:${DB_PASSWORD}@db:5432/myapp
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - .env
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+
+# 定义网络
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true  # 内部网络,不能访问外网
+
+# 定义卷
+volumes:
+  db-data:
+    driver: local
+  redis-data:
+    driver: local
+
+# 定义secrets
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+```
+
+---
+
+### 11.1.2 Compose命令详解
+
+```bash
+# 启动服务(后台运行)
+$ docker-compose up -d
+Creating network "myapp_frontend" ... done
+Creating network "myapp_backend" ... done
+Creating volume "myapp_db-data" ... done
+Creating myapp_redis_1 ... done
+Creating myapp_db_1    ... done
+Creating myapp_app_1   ... done
+Creating myapp_web_1   ... done
+
+# 查看服务状态
+$ docker-compose ps
+      Name                    Command               State          Ports
+--------------------------------------------------------------------------------
+myapp_app_1       /app/start.sh                   Up      8080/tcp
+myapp_db_1        docker-entrypoint.sh postgres   Up      5432/tcp
+myapp_redis_1     redis-server --appendonly yes   Up      6379/tcp
+myapp_web_1       nginx -g daemon off;            Up      0.0.0.0:80->80/tcp
+
+# 查看日志
+$ docker-compose logs          # 所有服务
+$ docker-compose logs -f app   # 跟踪app服务日志
+$ docker-compose logs --tail=100 web  # 最后100行
+
+# 执行命令
+$ docker-compose exec app sh           # 进入app容器
+$ docker-compose exec db psql -U appuser myapp  # 连接数据库
+
+# 扩容服务
+$ docker-compose up -d --scale app=3
+Creating myapp_app_2 ... done
+Creating myapp_app_3 ... done
+
+# 停止服务
+$ docker-compose stop     # 停止所有服务
+$ docker-compose stop app # 停止app服务
+
+# 停止并删除容器
+$ docker-compose down
+Stopping myapp_web_1   ... done
+Stopping myapp_app_1   ... done
+Stopping myapp_db_1    ... done
+Stopping myapp_redis_1 ... done
+Removing myapp_web_1   ... done
+Removing myapp_app_1   ... done
+Removing myapp_db_1    ... done
+Removing myapp_redis_1 ... done
+Removing network myapp_frontend
+Removing network myapp_backend
+
+# 删除容器和卷
+$ docker-compose down -v  # ⚠️ 会删除数据
+
+# 重建服务
+$ docker-compose up -d --build  # 重新构建镜像
+$ docker-compose up -d --force-recreate  # 强制重建容器
+```
+
+---
+
+## 11.2 服务依赖管理
+
+### 11.2.1 depends_on详解
+
+```yaml
+version: '3.8'
+
+services:
+  # 基础服务:数据库
+  db:
+    image: postgres:15
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 5s
+
+  # 基础服务:缓存
+  redis:
+    image: redis:7-alpine
+
+  # 应用服务:依赖db和redis
+  app:
+    image: myapp:latest
+    depends_on:
+      db:
+        condition: service_healthy  # 等待db健康
+      redis:
+        condition: service_started   # 等待redis启动
+    # 启动顺序: db → redis → app
+
+  # Web服务:依赖app
+  web:
+    image: nginx:alpine
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+    # 启动顺序: db → redis → app → web
+```
+
+**depends_on条件类型**:
+
+| 条件 | 说明 | 使用场景 |
+|------|------|---------|
+| `service_started` | 容器启动即可(默认) | 无需等待服务就绪 |
+| `service_healthy` | 健康检查通过 | **数据库等关键服务(推荐)** |
+| `service_completed_successfully` | 容器成功退出 | 初始化任务 |
+
+---
+
+### 11.2.2 启动顺序控制脚本
+
+```bash
+#!/bin/sh
+# wait-for-it.sh - 等待服务可用
+
+set -e
+
+host="$1"
+shift
+cmd="$@"
+
+until nc -z "$host" 2>/dev/null; do
+  >&2 echo "Waiting for $host..."
+  sleep 1
+done
+
+>&2 echo "$host is available - executing command"
+exec $cmd
+```
+
+**在Compose中使用**:
+
+```yaml
+services:
+  app:
+    image: myapp:latest
+    command: sh -c "/wait-for-it.sh db:5432 -- /app/start.sh"
+    volumes:
+      - ./wait-for-it.sh:/wait-for-it.sh:ro
+    depends_on:
+      - db
+```
+
+---
+
+## 11.3 网络配置进阶
+
+### 11.3.1 自定义网络
+
+```yaml
+version: '3.8'
+
+services:
+  web:
+    image: nginx:alpine
+    networks:
+      - public
+      - internal
+
+  app:
+    image: myapp:latest
+    networks:
+      internal:
+        ipv4_address: 172.20.0.10  # 固定IP
+        aliases:
+          - api.local
+
+  db:
+    image: postgres:15
+    networks:
+      - internal
+
+networks:
+  # 公共网络(可访问外网)
+  public:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
+
+  # 内部网络(隔离外网)
+  internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+```
+
+---
+
+### 11.3.2 网络别名与服务发现
+
+```yaml
+services:
+  app:
+    image: myapp:latest
+    networks:
+      backend:
+        aliases:
+          - api
+          - api-server
+          - backend-api
+
+  # 其他服务可通过别名访问
+  worker:
+    image: myworker:latest
+    environment:
+      - API_URL=http://api:8080  # 使用别名
+    networks:
+      - backend
+```
+
+**DNS解析测试**:
+
+```bash
+$ docker-compose exec worker nslookup api
+Server:    127.0.0.11
+Address:   127.0.0.11:53
+
+Non-authoritative answer:
+Name:   api
+Address: 172.20.0.10
+
+# 所有别名指向同一IP
+$ docker-compose exec worker ping -c1 api-server
+64 bytes from 172.20.0.10: icmp_seq=1 ttl=64
+```
+
+---
+
+## 11.4 数据卷共享
+
+### 11.4.1 卷的定义与使用
+
+```yaml
+version: '3.8'
+
+services:
+  web:
+    image: nginx:alpine
+    volumes:
+      # 命名卷
+      - static-data:/usr/share/nginx/html
+      # 绑定挂载
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      # 临时文件系统
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 100M
+
+  app:
+    image: myapp:latest
+    volumes:
+      # 共享卷(与web共享)
+      - static-data:/app/static
+      # 应用数据卷
+      - app-data:/app/data
+
+volumes:
+  static-data:
+    driver: local
+  app-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/app  # 映射到宿主机路径
+```
+
+---
+
+### 11.4.2 卷的高级配置
+
+```yaml
+volumes:
+  # NFS卷
+  nfs-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.1.100,rw
+      device: ":/export/data"
+
+  # 外部卷(已存在)
+  existing-vol:
+    external: true
+
+  # 卷标签
+  labeled-vol:
+    driver: local
+    labels:
+      env: production
+      app: myapp
+```
+
+---
+
+## 11.5 环境变量与配置
+
+### 11.5.1 环境变量最佳实践
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  app:
+    image: myapp:latest
+    environment:
+      # 方式1:直接定义
+      - NODE_ENV=production
+      # 方式2:引用宿主机环境变量
+      - DATABASE_URL=${DATABASE_URL}
+      # 方式3:默认值
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+    env_file:
+      - .env            # 默认环境文件
+      - .env.production # 生产环境配置
+```
+
+**.env文件**:
+
+```bash
+# .env
+DATABASE_URL=postgres://user:pass@db:5432/myapp
+REDIS_URL=redis://redis:6379/0
+API_KEY=secret-key-here
+LOG_LEVEL=info
+```
+
+**环境变量优先级**:
+
+```bash
+# 优先级从高到低:
+1. docker-compose.yml中的environment
+2. --env-file指定的文件
+3. .env文件
+4. Dockerfile中的ENV
+5. 宿主机环境变量
+```
+
+---
+
+### 11.5.2 多环境配置
+
+```bash
+# 项目结构
+.
+├── docker-compose.yml         # 基础配置
+├── docker-compose.dev.yml     # 开发环境
+├── docker-compose.prod.yml    # 生产环境
+├── .env.dev
+└── .env.prod
+
+# docker-compose.yml (基础配置)
+version: '3.8'
+services:
+  app:
+    image: myapp:latest
+    env_file:
+      - .env
+
+# docker-compose.dev.yml (开发覆盖)
+version: '3.8'
+services:
+  app:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - .:/app  # 源码挂载
+    environment:
+      - DEBUG=true
+
+# docker-compose.prod.yml (生产覆盖)
+version: '3.8'
+services:
+  app:
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+
+# 使用方式
+$ docker-compose -f docker-compose.yml -f docker-compose.dev.yml up -d   # 开发
+$ docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d  # 生产
+```
+
+---
+
+## 11.6 生产环境Compose配置
+
+### 11.6.1 完整生产环境示例
+
+```yaml
+# docker-compose.prod.yml
+version: '3.8'
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+    compress: "true"
+
+services:
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - static-files:/var/www/static:ro
+    networks:
+      - frontend
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  app:
+    image: myapp:${VERSION:-latest}
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL_FILE=/run/secrets/db_url
+      - REDIS_URL=redis://redis:6379/0
+    secrets:
+      - db_url
+    volumes:
+      - static-files:/app/static
+      - uploads:/app/uploads
+    networks:
+      - frontend
+      - backend
+    depends_on:
+      db:
+        condition: service_healthy
+    logging: *default-logging
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+
+  db:
+    image: postgres:15-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser -d myapp"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+    logging: *default-logging
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  db-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /data/postgres
+  redis-data:
+    driver: local
+  static-files:
+  uploads:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  db_url:
+    file: ./secrets/db_url.txt
+```
+
+---
+
+## 11.7 本章总结
+
+**核心要点**:
+- ✅ Compose文件结构:services/networks/volumes/secrets
+- ✅ 服务依赖:`depends_on`配合`healthcheck`
+- ✅ 网络隔离:前端/后端网络分离,内部网络禁止外网
+- ✅ 数据持久化:命名卷管理,支持NFS等外部存储
+- ✅ 环境配置:多环境配置文件,敏感信息使用secrets
+
+---
+
+# 第12章:容器编排基础与Swarm
+
+## 12.1 Docker Swarm架构
+
+### 12.1.1 Swarm核心概念
+
+```bash
+# 初始化Swarm集群(管理节点)
+$ docker swarm init --advertise-addr 192.168.1.10
+Swarm initialized: current node (abc123) is now a manager.
+
+To add a worker to this swarm, run the following command:
+    docker swarm join --token SWMTKN-1-xxx 192.168.1.10:2377
+
+To add a manager to this swarm, run 'docker swarm join-token manager'
+
+# 查看集群状态
+$ docker node ls
+ID                  HOSTNAME  STATUS  AVAILABILITY  MANAGER STATUS
+abc123 *            node1     Ready   Active        Leader
+```
+
+**Swarm架构组件**:
+
+| 组件 | 作用 | 说明 |
+|------|------|------|
+| **Manager Node** | 集群管理 | 接收任务,调度容器,维护集群状态 |
+| **Worker Node** | 任务执行 | 运行容器,接收管理节点调度 |
+| **Service** | 服务定义 | 声明容器副本数,更新策略等 |
+| **Task** | 任务单元 | Service的最小调度单元(容器实例) |
+
+---
+
+### 12.1.2 节点管理
+
+```bash
+# 添加Worker节点(在worker机器上执行)
+$ docker swarm join --token SWMTKN-1-xxx 192.168.1.10:2377
+This node joined a swarm as a worker.
+
+# 添加Manager节点
+$ docker swarm join-token manager
+To add a manager:
+    docker swarm join --token SWMTKN-1-yyy 192.168.1.10:2377
+
+# 查看节点详情
+$ docker node inspect node1
+
+# 节点角色变更
+$ docker node promote worker1   # Worker提升为Manager
+$ docker node demote manager2   # Manager降级为Worker
+
+# 节点可用性设置
+$ docker node update --availability drain worker1  # 排空节点(不调度新任务)
+$ docker node update --availability active worker1 # 激活节点
+
+# 删除节点
+$ docker node rm worker1  # 需先在worker1上执行: docker swarm leave
+```
+
+---
+
+## 12.2 服务部署与管理
+
+### 12.2.1 服务创建
+
+```bash
+# 创建服务
+$ docker service create \
+  --name web \
+  --replicas 3 \
+  --publish 80:80 \
+  --env NODE_ENV=production \
+  --limit-memory 512M \
+  --limit-cpu 0.5 \
+  nginx:alpine
+
+# 查看服务列表
+$ docker service ls
+ID         NAME  MODE        REPLICAS  IMAGE
+abc123     web   replicated  3/3       nginx:alpine
+
+# 查看服务详情
+$ docker service inspect web
+
+# 查看服务任务(容器)
+$ docker service ps web
+ID      NAME    IMAGE          NODE    DESIRED STATE  CURRENT STATE
+xyz1    web.1   nginx:alpine   node1   Running        Running 2 minutes
+xyz2    web.2   nginx:alpine   node2   Running        Running 2 minutes
+xyz3    web.3   nginx:alpine   node3   Running        Running 2 minutes
+```
+
+---
+
+### 12.2.2 服务扩缩容
+
+```bash
+# 扩容到5个副本
+$ docker service scale web=5
+web scaled to 5
+overall progress: 5 out of 5 tasks
+verify: Service converged
+
+# 缩容到2个副本
+$ docker service scale web=2
+
+# 查看扩容结果
+$ docker service ps web | grep Running
+```
+
+---
+
+### 12.2.3 服务更新
+
+```bash
+# 滚动更新镜像
+$ docker service update \
+  --image nginx:1.25 \
+  --update-parallelism 1 \  # 每次更新1个任务
+  --update-delay 10s \       # 间隔10秒
+  --update-failure-action rollback \
+  web
+
+# 更新环境变量
+$ docker service update --env-add DEBUG=true web
+
+# 更新资源限制
+$ docker service update \
+  --limit-memory 1G \
+  --limit-cpu 1 \
+  web
+
+# 回滚到上一版本
+$ docker service rollback web
+```
+
+---
+
+## 12.3 Stack部署
+
+### 12.3.1 Stack配置文件
+
+```yaml
+# stack.yml - Swarm Stack配置
+version: '3.8'
+
+services:
+  web:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    networks:
+      - frontend
+    deploy:
+      mode: replicated
+      replicas: 3
+      placement:
+        constraints:
+          - node.role == worker
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  app:
+    image: myapp:latest
+    networks:
+      - frontend
+      - backend
+    secrets:
+      - db_password
+    deploy:
+      mode: replicated
+      replicas: 5
+      placement:
+        preferences:
+          - spread: node.labels.zone
+      update_config:
+        parallelism: 2
+        order: start-first
+
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    networks:
+      - backend
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == node1  # 固定节点
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  db-data:
+
+secrets:
+  db_password:
+    external: true
+```
+
+---
+
+### 12.3.2 Stack部署命令
+
+```bash
+# 创建secret
+$ echo "mysecretpassword" | docker secret create db_password -
+
+# 部署Stack
+$ docker stack deploy -c stack.yml myapp
+Creating network myapp_frontend
+Creating network myapp_backend
+Creating service myapp_web
+Creating service myapp_app
+Creating service myapp_db
+
+# 查看Stack
+$ docker stack ls
+NAME   SERVICES
+myapp  3
+
+# 查看Stack服务
+$ docker stack services myapp
+ID         NAME        MODE      REPLICAS  IMAGE
+abc123     myapp_web   replicated  3/3     nginx:alpine
+def456     myapp_app   replicated  5/5     myapp:latest
+ghi789     myapp_db    replicated  1/1     postgres:15
+
+# 查看Stack任务
+$ docker stack ps myapp
+
+# 更新Stack(修改stack.yml后)
+$ docker stack deploy -c stack.yml myapp
+
+# 删除Stack
+$ docker stack rm myapp
+```
+
+---
+
+## 12.4 负载均衡与路由
+
+### 12.4.1 Ingress网络
+
+```bash
+# Swarm自动负载均衡
+$ docker service create --name web --replicas 3 -p 80:80 nginx:alpine
+
+# 访问任意节点的80端口,自动路由到可用容器
+$ curl http://node1  # 可能路由到node2的容器
+$ curl http://node2  # 可能路由到node3的容器
+$ curl http://node3  # 可能路由到node1的容器
+
+# 路由模式:
+# - ingress(默认): VIP负载均衡,任意节点接入
+# - host: 直接映射到容器所在节点
+
+# 查看ingress网络
+$ docker network inspect ingress
+```
+
+---
+
+### 12.4.2 Overlay网络
+
+```bash
+# 创建overlay网络
+$ docker network create \
+  --driver overlay \
+  --attachable \
+  --subnet 10.10.0.0/16 \
+  my-overlay
+
+# 服务使用overlay网络
+$ docker service create \
+  --name app \
+  --network my-overlay \
+  myapp:latest
+
+# 跨主机容器通信
+# node1上的容器可以直接ping node2上的容器名
+```
+
+---
+
+## 12.5 生产环境Swarm配置
+
+### 12.5.1 高可用Swarm集群
+
+```bash
+# 推荐配置: 3个Manager + N个Worker
+# Manager奇数个,保证Raft一致性算法正常工作
+
+# 节点规划:
+# - Manager1 (Leader): 192.168.1.10
+# - Manager2: 192.168.1.11
+# - Manager3: 192.168.1.12
+# - Worker1-N: 192.168.1.20-30
+
+# Manager1初始化
+$ docker swarm init --advertise-addr 192.168.1.10
+
+# Manager2,3加入
+$ docker swarm join --token SWMTKN-1-manager-xxx 192.168.1.10:2377
+
+# Worker加入
+$ docker swarm join --token SWMTKN-1-worker-yyy 192.168.1.10:2377
+
+# 验证集群
+$ docker node ls
+ID   HOSTNAME  STATUS  AVAILABILITY  MANAGER STATUS
+*m1  manager1  Ready   Active        Leader
+ m2  manager2  Ready   Active        Reachable
+ m3  manager3  Ready   Active        Reachable
+ w1  worker1   Ready   Active
+ w2  worker2   Ready   Active
+```
+
+---
+
+### 12.5.2 节点标签与约束
+
+```bash
+# 添加节点标签
+$ docker node update --label-add zone=us-east-1a worker1
+$ docker node update --label-add zone=us-east-1b worker2
+$ docker node update --label-add ssd=true worker1
+
+# 使用标签约束部署
+$ docker service create \
+  --name db \
+  --constraint 'node.labels.ssd == true' \
+  postgres:15
+
+# 多重约束
+$ docker service create \
+  --name app \
+  --constraint 'node.role == worker' \
+  --constraint 'node.labels.zone == us-east-1a' \
+  myapp:latest
+```
+
+---
+
+## 12.6 本章总结
+
+**核心要点**:
+- ✅ Swarm集群:推荐3个Manager(奇数)+多个Worker
+- ✅ 服务部署:使用Stack进行声明式部署
+- ✅ 负载均衡:Ingress网络自动路由,无需外部LB
+- ✅ 滚动更新:支持蓝绿部署,自动回滚
+- ✅ 高可用:Manager节点Raft一致性,服务副本分布
+
+---
+
+📝 **下一章预告**: 生产环境部署架构、高可用方案、监控告警、日志收集
+
+---
+
+*（第9-12章完成,约3000行。已完成12章,剩余7章...）*
