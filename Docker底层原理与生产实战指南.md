@@ -8796,8 +8796,5593 @@ $ docker service create \
 
 ---
 
-📝 **下一章预告**: 生产环境部署架构、高可用方案、监控告警、日志收集
+---
 
 ---
 
-*（第9-12章完成,约3000行。已完成12章,剩余7章...）*
+# 第四部分:生产环境部署与运维
+
+---
+
+# 第13章:生产环境部署架构
+
+## 13.1 部署架构模式
+
+### 13.1.1 单机部署架构
+
+**适用场景**: 开发环境、小型应用、PoC验证
+
+```yaml
+# docker-compose.yml (单机All-in-One)
+version: '3.8'
+
+services:
+  # Web应用
+  app:
+    image: myapp:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://appuser:${DB_PASSWORD}@db:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - app-logs:/var/log/app
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # 反向代理
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - app
+    networks:
+      - backend
+
+  # 数据库
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_DB: appdb
+    secrets:
+      - db_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser"]
+      interval: 10s
+
+  # 缓存
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  app-logs:
+  nginx-logs:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+```
+
+**Nginx配置示例**:
+
+```nginx
+# nginx/nginx.conf
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 1024;
+    use epoll;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # 日志格式
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for" '
+                    'rt=$request_time uct="$upstream_connect_time" '
+                    'uht="$upstream_header_time" urt="$upstream_response_time"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    client_max_body_size 50M;
+
+    # Gzip压缩
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
+
+    # 后端应用
+    upstream backend {
+        server app:8080 max_fails=3 fail_timeout=30s;
+        keepalive 32;
+    }
+
+    # HTTP重定向到HTTPS
+    server {
+        listen 80;
+        server_name example.com;
+        return 301 https://$server_name$request_uri;
+    }
+
+    # HTTPS主配置
+    server {
+        listen 443 ssl http2;
+        server_name example.com;
+
+        # SSL证书
+        ssl_certificate /etc/nginx/ssl/fullchain.pem;
+        ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_prefer_server_ciphers on;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
+
+        # 安全头
+        add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+
+        # 反向代理
+        location / {
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_connect_timeout 60s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+            proxy_buffering off;
+        }
+
+        # 静态资源缓存
+        location ~* \.(jpg|jpeg|png|gif|ico|css|js|svg|woff|woff2)$ {
+            proxy_pass http://backend;
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+        }
+
+        # 健康检查端点
+        location /health {
+            access_log off;
+            proxy_pass http://backend/health;
+        }
+    }
+}
+```
+
+---
+
+### 13.1.2 Docker Swarm集群架构
+
+**适用场景**: 中小型生产环境(10-100台节点)
+
+```bash
+# 集群拓扑
+┌─────────────────────────────────────────────────────────┐
+│                     负载均衡层                           │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐        │
+│  │  HAProxy 1 │  │  HAProxy 2 │  │  HAProxy 3 │        │
+│  │ (keepalived)│ │ (keepalived)│ │ (keepalived)│        │
+│  └────────────┘  └────────────┘  └────────────┘        │
+└─────────────────────────────────────────────────────────┘
+                         │
+┌─────────────────────────────────────────────────────────┐
+│                  Swarm Manager节点                       │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐        │
+│  │ Manager 1  │  │ Manager 2  │  │ Manager 3  │        │
+│  │  (Leader)  │  │ (Reachable)│  │ (Reachable)│        │
+│  └────────────┘  └────────────┘  └────────────┘        │
+└─────────────────────────────────────────────────────────┘
+                         │
+┌─────────────────────────────────────────────────────────┐
+│                  Swarm Worker节点                        │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐         │
+│  │Worker│ │Worker│ │Worker│ │Worker│ │Worker│  ...    │
+│  │  1   │ │  2   │ │  3   │ │  4   │ │  5   │         │
+│  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘         │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Swarm集群初始化**:
+
+```bash
+# ========================================
+# 1. 准备节点(所有节点执行)
+# ========================================
+
+# 关闭防火墙或开放必要端口
+$ firewall-cmd --permanent --add-port=2377/tcp  # Swarm管理端口
+$ firewall-cmd --permanent --add-port=7946/tcp  # 节点间通信
+$ firewall-cmd --permanent --add-port=7946/udp
+$ firewall-cmd --permanent --add-port=4789/udp  # Overlay网络
+$ firewall-cmd --reload
+
+# 配置时间同步(关键!)
+$ timedatectl set-ntp true
+$ systemctl enable chronyd && systemctl start chronyd
+
+# ========================================
+# 2. 初始化Swarm集群(Manager1执行)
+# ========================================
+
+# 初始化第一个Manager
+$ docker swarm init \
+  --advertise-addr 192.168.1.10 \
+  --data-path-addr 192.168.1.10
+
+# 输出:
+Swarm initialized: current node (abc123) is now a manager.
+
+To add a worker to this swarm, run the following command:
+    docker swarm join --token SWMTKN-1-xxx-worker 192.168.1.10:2377
+
+To add a manager to this swarm, run 'docker swarm join-token manager' and follow the instructions.
+
+# 获取Manager加入令牌
+$ docker swarm join-token manager
+docker swarm join --token SWMTKN-1-xxx-manager 192.168.1.10:2377
+
+# 获取Worker加入令牌
+$ docker swarm join-token worker
+docker swarm join --token SWMTKN-1-xxx-worker 192.168.1.10:2377
+
+# ========================================
+# 3. 添加Manager节点(Manager2/3执行)
+# ========================================
+
+# Manager2 (192.168.1.11)
+$ docker swarm join \
+  --token SWMTKN-1-xxx-manager \
+  --advertise-addr 192.168.1.11 \
+  192.168.1.10:2377
+
+# Manager3 (192.168.1.12)
+$ docker swarm join \
+  --token SWMTKN-1-xxx-manager \
+  --advertise-addr 192.168.1.12 \
+  192.168.1.10:2377
+
+# ========================================
+# 4. 添加Worker节点(Worker1-N执行)
+# ========================================
+
+# Worker1 (192.168.1.21)
+$ docker swarm join \
+  --token SWMTKN-1-xxx-worker \
+  --advertise-addr 192.168.1.21 \
+  192.168.1.10:2377
+
+# Worker2-N 类似操作...
+
+# ========================================
+# 5. 验证集群状态(任意Manager执行)
+# ========================================
+
+$ docker node ls
+ID                HOSTNAME    STATUS  AVAILABILITY  MANAGER STATUS
+abc123 *          manager1    Ready   Active        Leader
+def456            manager2    Ready   Active        Reachable
+ghi789            manager3    Ready   Active        Reachable
+jkl012            worker1     Ready   Active
+mno345            worker2     Ready   Active
+pqr678            worker3     Ready   Active
+
+# 查看集群详细信息
+$ docker info | grep -A 10 Swarm
+Swarm: active
+ NodeID: abc123
+ Is Manager: true
+ ClusterID: xyz789
+ Managers: 3
+ Nodes: 6
+ Default Address Pool: 10.0.0.0/8
+ SubnetSize: 24
+ Orchestration:
+  Task History Retention Limit: 5
+```
+
+**生产级Stack部署**:
+
+```yaml
+# stack.yml - 完整生产环境配置
+version: '3.8'
+
+# 全局配置锚点
+x-default-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+    compress: "true"
+    labels: "service,stack"
+
+x-deploy-defaults: &deploy-defaults
+  update_config:
+    parallelism: 1
+    delay: 10s
+    failure_action: rollback
+    monitor: 60s
+  rollback_config:
+    parallelism: 1
+    delay: 5s
+  restart_policy:
+    condition: on-failure
+    delay: 5s
+    max_attempts: 3
+    window: 120s
+
+services:
+  # ========================================
+  # Web应用层
+  # ========================================
+  app:
+    image: registry.company.com/myapp:${VERSION:-latest}
+    logging: *default-logging
+    networks:
+      - frontend
+      - backend
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://appuser:${DB_PASSWORD}@db:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+    secrets:
+      - db_password
+      - app_secret_key
+    configs:
+      - source: app_config
+        target: /etc/app/config.yaml
+    deploy:
+      <<: *deploy-defaults
+      mode: replicated
+      replicas: 6
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.tier == app
+        preferences:
+          - spread: node.labels.zone  # 跨可用区分布
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.app.rule=Host(`app.example.com`)"
+        - "traefik.http.services.app.loadbalancer.server.port=8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+
+  # ========================================
+  # 负载均衡/反向代理
+  # ========================================
+  traefik:
+    image: traefik:v2.10
+    logging: *default-logging
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: host  # 监控面板
+    networks:
+      - frontend
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-certs:/etc/traefik/certs
+    configs:
+      - source: traefik_config
+        target: /etc/traefik/traefik.yml
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.role == manager  # 仅在Manager节点运行
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+  # ========================================
+  # 数据库(有状态服务)
+  # ========================================
+  db:
+    image: postgres:15-alpine
+    logging: *default-logging
+    networks:
+      - backend
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_DB: appdb
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - db_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.tier == db
+          - node.labels.ssd == true  # 要求SSD存储
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ========================================
+  # 缓存层
+  # ========================================
+  redis:
+    image: redis:7-alpine
+    logging: *default-logging
+    networks:
+      - backend
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+      --appendonly yes
+    secrets:
+      - redis_password
+    volumes:
+      - redis-data:/data
+    deploy:
+      mode: replicated
+      replicas: 3
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.tier == cache
+        preferences:
+          - spread: node.labels.zone
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # ========================================
+  # 后台任务Worker
+  # ========================================
+  worker:
+    image: registry.company.com/myapp:${VERSION:-latest}
+    logging: *default-logging
+    networks:
+      - backend
+    command: ["python", "worker.py"]
+    environment:
+      WORKER_CONCURRENCY: 4
+      REDIS_URL: redis://redis:6379/0
+    secrets:
+      - db_password
+    deploy:
+      <<: *deploy-defaults
+      mode: replicated
+      replicas: 3
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.tier == app
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ========================================
+  # 定时任务调度器
+  # ========================================
+  scheduler:
+    image: registry.company.com/myapp:${VERSION:-latest}
+    logging: *default-logging
+    networks:
+      - backend
+    command: ["python", "scheduler.py"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    secrets:
+      - db_password
+    deploy:
+      mode: replicated
+      replicas: 1  # 仅运行1个实例避免重复调度
+      placement:
+        constraints:
+          - node.role == worker
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+# ========================================
+# 网络配置
+# ========================================
+networks:
+  frontend:
+    driver: overlay
+    attachable: true
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+  backend:
+    driver: overlay
+    internal: true  # 内部网络,不允许外部访问
+    attachable: true
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+
+# ========================================
+# 数据卷
+# ========================================
+volumes:
+  postgres-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=192.168.1.100,rw,nolock
+      device: ":/export/postgres-data"
+
+  redis-data:
+    driver: local
+
+  traefik-certs:
+    driver: local
+
+# ========================================
+# 配置文件
+# ========================================
+configs:
+  app_config:
+    file: ./configs/app-config.yaml
+
+  traefik_config:
+    file: ./configs/traefik.yml
+
+# ========================================
+# 秘钥
+# ========================================
+secrets:
+  db_password:
+    external: true
+
+  redis_password:
+    external: true
+
+  app_secret_key:
+    external: true
+```
+
+**部署与管理**:
+
+```bash
+# ========================================
+# 创建外部秘钥
+# ========================================
+
+# 从文件创建秘钥
+$ echo "MyDBPassword123" | docker secret create db_password -
+$ echo "MyRedisPassword456" | docker secret create redis_password -
+$ openssl rand -base64 32 | docker secret create app_secret_key -
+
+# 验证秘钥
+$ docker secret ls
+ID            NAME              CREATED
+abc123        db_password       10 seconds ago
+def456        redis_password    8 seconds ago
+ghi789        app_secret_key    5 seconds ago
+
+# ========================================
+# 部署Stack
+# ========================================
+
+# 部署到生产环境
+$ docker stack deploy -c stack.yml --with-registry-auth myapp
+
+# 验证部署状态
+$ docker stack services myapp
+ID        NAME           MODE        REPLICAS  IMAGE
+abc123    myapp_app      replicated  6/6       registry.company.com/myapp:v1.2.3
+def456    myapp_db       replicated  1/1       postgres:15-alpine
+ghi789    myapp_redis    replicated  3/3       redis:7-alpine
+jkl012    myapp_worker   replicated  3/3       registry.company.com/myapp:v1.2.3
+mno345    myapp_traefik  global      3/3       traefik:v2.10
+
+# 查看服务详情
+$ docker service ps myapp_app
+ID        NAME          IMAGE                           NODE      DESIRED STATE  CURRENT STATE
+abc123    myapp_app.1   registry.company.com/myapp:v1  worker1   Running        Running 2 minutes ago
+def456    myapp_app.2   registry.company.com/myapp:v1  worker2   Running        Running 2 minutes ago
+ghi789    myapp_app.3   registry.company.com/myapp:v1  worker3   Running        Running 2 minutes ago
+
+# 查看服务日志
+$ docker service logs -f myapp_app --tail 100
+
+# ========================================
+# 扩缩容
+# ========================================
+
+# 水平扩容
+$ docker service scale myapp_app=10
+
+# 验证扩容
+$ docker service ls
+ID        NAME        REPLICAS
+abc123    myapp_app   10/10
+
+# ========================================
+# 滚动更新
+# ========================================
+
+# 更新镜像版本
+$ docker service update \
+  --image registry.company.com/myapp:v1.2.4 \
+  --update-parallelism 2 \
+  --update-delay 30s \
+  myapp_app
+
+# 监控更新进度
+$ watch -n 1 'docker service ps myapp_app'
+
+# 回滚到上一版本
+$ docker service rollback myapp_app
+
+# ========================================
+# 清理
+# ========================================
+
+# 删除Stack(保留数据卷)
+$ docker stack rm myapp
+
+# 完全清理(包括数据卷)
+$ docker stack rm myapp
+$ docker volume prune -f
+```
+
+---
+
+### 13.1.3 Kubernetes集群架构(对比)
+
+**适用场景**: 大型生产环境(100+台节点)、多集群管理
+
+```bash
+# Kubernetes vs Swarm 对比
+
+┌────────────────┬─────────────────────┬─────────────────────┐
+│   特性         │   Docker Swarm      │   Kubernetes        │
+├────────────────┼─────────────────────┼─────────────────────┤
+│ 学习曲线       │ ⭐⭐ 简单            │ ⭐⭐⭐⭐⭐ 复杂      │
+│ 部署复杂度     │ ⭐⭐ 内置            │ ⭐⭐⭐⭐ 需额外安装  │
+│ 集群规模       │ 中小(10-100节点)    │ 大型(1000+节点)     │
+│ 生态系统       │ ⭐⭐⭐ 够用          │ ⭐⭐⭐⭐⭐ 丰富      │
+│ 服务发现       │ 内置DNS             │ CoreDNS + Ingress   │
+│ 负载均衡       │ Ingress自动         │ Service + Ingress   │
+│ 存储编排       │ Volume插件          │ StorageClass + PV   │
+│ 配置管理       │ Config + Secret     │ ConfigMap + Secret  │
+│ 自动扩缩容     │ 手动scale           │ HPA自动             │
+│ 多集群管理     │ ❌ 不支持            │ ✅ Federation       │
+│ RBAC权限       │ ⭐⭐⭐ 基础          │ ⭐⭐⭐⭐⭐ 细粒度    │
+│ 监控集成       │ 需自行部署          │ Metrics Server      │
+│ 社区活跃度     │ ⭐⭐⭐ 中等          │ ⭐⭐⭐⭐⭐ 非常活跃  │
+└────────────────┴─────────────────────┴─────────────────────┘
+
+# 选型建议:
+✅ Swarm: 中小型团队、快速上线、Docker原生、学习成本低
+✅ K8s: 大型企业、复杂场景、需要高级特性、有运维团队
+```
+
+**K8s等效配置(仅供参考)**:
+
+```yaml
+# kubernetes/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp
+  namespace: production
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: myapp
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: myapp
+        version: v1.2.3
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - myapp
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: app
+        image: registry.company.com/myapp:v1.2.3
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: database-url
+        resources:
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 40
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: myapp-service
+  namespace: production
+spec:
+  type: ClusterIP
+  selector:
+    app: myapp
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: myapp-ingress
+  namespace: production
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - app.example.com
+    secretName: app-tls
+  rules:
+  - host: app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: myapp-service
+            port:
+              number: 80
+```
+
+---
+
+## 13.2 服务发现与注册
+
+### 13.2.1 Docker内置服务发现
+
+**Swarm DNS自动服务发现**:
+
+```bash
+# Swarm自动为每个服务创建DNS记录
+
+# 部署服务
+$ docker service create --name web --replicas 3 nginx:alpine
+$ docker service create --name api --replicas 5 myapi:latest
+
+# 在任意容器内测试DNS解析
+$ docker run --rm --network myapp_backend alpine nslookup web
+Server:    127.0.0.11
+Address 1: 127.0.0.11
+
+Name:      web
+Address 1: 10.0.1.2 web.1.abc123  # VIP(虚拟IP)
+
+# DNS负载均衡测试
+$ for i in {1..10}; do
+    docker run --rm --network myapp_backend alpine \
+      wget -qO- http://api:8080/health
+  done
+
+# Swarm自动轮询所有api服务副本
+```
+
+**服务别名(Service Alias)**:
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  app:
+    image: myapp:latest
+    networks:
+      backend:
+        aliases:
+          - myapp  # 别名
+          - application  # 多个别名
+
+  db:
+    image: postgres:15
+    networks:
+      backend:
+        aliases:
+          - database
+          - postgres-master
+
+networks:
+  backend:
+    driver: overlay
+```
+
+```bash
+# 通过别名访问服务
+$ docker run --rm --network backend alpine ping myapp
+$ docker run --rm --network backend alpine ping application
+$ docker run --rm --network backend alpine ping database
+```
+
+---
+
+### 13.2.2 Consul服务注册与发现
+
+**Consul架构**:
+
+```bash
+# Consul集群拓扑
+┌─────────────────────────────────────────────┐
+│           Consul Server集群 (3节点)         │
+│  ┌────────────┐ ┌────────────┐ ┌────────────┐│
+│  │  Server 1  │ │  Server 2  │ │  Server 3  ││
+│  │  (Leader)  │ │ (Follower) │ │ (Follower) ││
+│  └────────────┘ └────────────┘ └────────────┘│
+└─────────────────────────────────────────────┘
+              │         │         │
+    ┌─────────┴─────────┴─────────┴─────────┐
+    │                                        │
+┌───▼────┐  ┌────────┐  ┌────────┐  ┌────────┐
+│Client 1│  │Client 2│  │Client 3│  │Client N│
+│(Agent) │  │(Agent) │  │(Agent) │  │(Agent) │
+└────────┘  └────────┘  └────────┘  └────────┘
+```
+
+**Consul部署**:
+
+```yaml
+# consul-stack.yml
+version: '3.8'
+
+services:
+  # Consul Server集群
+  consul-server-1:
+    image: consul:1.17
+    hostname: consul-server-1
+    command: >
+      agent -server -bootstrap-expect=3
+      -ui -client=0.0.0.0
+      -bind='{{ GetInterfaceIP "eth0" }}'
+      -retry-join=consul-server-2
+      -retry-join=consul-server-3
+    environment:
+      CONSUL_LOCAL_CONFIG: |
+        {
+          "datacenter": "dc1",
+          "data_dir": "/consul/data",
+          "log_level": "INFO",
+          "node_name": "consul-server-1",
+          "server": true
+        }
+    volumes:
+      - consul-server-1-data:/consul/data
+    networks:
+      - consul-net
+    ports:
+      - "8500:8500"  # HTTP API
+      - "8600:8600/udp"  # DNS
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.consul == server1
+
+  consul-server-2:
+    image: consul:1.17
+    hostname: consul-server-2
+    command: >
+      agent -server -bootstrap-expect=3
+      -bind='{{ GetInterfaceIP "eth0" }}'
+      -retry-join=consul-server-1
+      -retry-join=consul-server-3
+    environment:
+      CONSUL_LOCAL_CONFIG: |
+        {
+          "datacenter": "dc1",
+          "data_dir": "/consul/data",
+          "log_level": "INFO",
+          "node_name": "consul-server-2",
+          "server": true
+        }
+    volumes:
+      - consul-server-2-data:/consul/data
+    networks:
+      - consul-net
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.consul == server2
+
+  consul-server-3:
+    image: consul:1.17
+    hostname: consul-server-3
+    command: >
+      agent -server -bootstrap-expect=3
+      -bind='{{ GetInterfaceIP "eth0" }}'
+      -retry-join=consul-server-1
+      -retry-join=consul-server-2
+    environment:
+      CONSUL_LOCAL_CONFIG: |
+        {
+          "datacenter": "dc1",
+          "data_dir": "/consul/data",
+          "log_level": "INFO",
+          "node_name": "consul-server-3",
+          "server": true
+        }
+    volumes:
+      - consul-server-3-data:/consul/data
+    networks:
+      - consul-net
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.consul == server3
+
+  # Consul Client (每个Worker节点运行)
+  consul-agent:
+    image: consul:1.17
+    command: >
+      agent -client=0.0.0.0
+      -bind='{{ GetInterfaceIP "eth0" }}'
+      -retry-join=consul-server-1
+      -retry-join=consul-server-2
+      -retry-join=consul-server-3
+    environment:
+      CONSUL_LOCAL_CONFIG: |
+        {
+          "datacenter": "dc1",
+          "data_dir": "/consul/data",
+          "log_level": "INFO",
+          "enable_script_checks": true,
+          "leave_on_terminate": true
+        }
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - consul-agent-data:/consul/data
+    networks:
+      - consul-net
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.role == worker
+
+networks:
+  consul-net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  consul-server-1-data:
+  consul-server-2-data:
+  consul-server-3-data:
+  consul-agent-data:
+```
+
+**应用注册到Consul**:
+
+```python
+# app.py - Python应用示例
+import os
+import consul
+import socket
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+# Consul配置
+CONSUL_HOST = os.getenv('CONSUL_HOST', 'consul-agent')
+CONSUL_PORT = int(os.getenv('CONSUL_PORT', 8500))
+SERVICE_NAME = os.getenv('SERVICE_NAME', 'myapp')
+SERVICE_PORT = int(os.getenv('SERVICE_PORT', 8080))
+
+def register_service():
+    """注册服务到Consul"""
+    c = consul.Consul(host=CONSUL_HOST, port=CONSUL_PORT)
+
+    # 获取容器IP
+    hostname = socket.gethostname()
+    container_ip = socket.gethostbyname(hostname)
+
+    # 健康检查配置
+    check = consul.Check.http(
+        url=f'http://{container_ip}:{SERVICE_PORT}/health',
+        interval='10s',
+        timeout='5s',
+        deregister='30s'  # 30秒无响应自动注销
+    )
+
+    # 注册服务
+    c.agent.service.register(
+        name=SERVICE_NAME,
+        service_id=f'{SERVICE_NAME}-{hostname}',
+        address=container_ip,
+        port=SERVICE_PORT,
+        tags=['api', 'v1', 'production'],
+        check=check,
+        meta={
+            'version': '1.2.3',
+            'git_commit': 'abc123',
+            'environment': 'production'
+        }
+    )
+    print(f'✅ Service registered: {SERVICE_NAME} at {container_ip}:{SERVICE_PORT}')
+
+def deregister_service():
+    """注销服务"""
+    c = consul.Consul(host=CONSUL_HOST, port=CONSUL_PORT)
+    hostname = socket.gethostname()
+    service_id = f'{SERVICE_NAME}-{hostname}'
+    c.agent.service.deregister(service_id)
+    print(f'✅ Service deregistered: {service_id}')
+
+@app.route('/health')
+def health():
+    """健康检查端点"""
+    return jsonify({'status': 'healthy'}), 200
+
+@app.route('/api/users')
+def get_users():
+    """业务API"""
+    return jsonify({'users': []}), 200
+
+if __name__ == '__main__':
+    import atexit
+    import signal
+
+    # 启动时注册
+    register_service()
+
+    # 优雅关闭时注销
+    def cleanup(signum, frame):
+        deregister_service()
+        exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+    atexit.register(deregister_service)
+
+    # 启动Flask
+    app.run(host='0.0.0.0', port=SERVICE_PORT)
+```
+
+**服务发现客户端**:
+
+```python
+# client.py - 从Consul发现服务
+import consul
+import requests
+import random
+
+def discover_service(service_name='myapp'):
+    """从Consul发现服务实例"""
+    c = consul.Consul(host='consul-agent', port=8500)
+
+    # 查询健康的服务实例
+    index, services = c.health.service(service_name, passing=True)
+
+    if not services:
+        raise Exception(f'No healthy instances found for {service_name}')
+
+    # 随机选择一个实例(客户端负载均衡)
+    instance = random.choice(services)
+    service_info = instance['Service']
+
+    return {
+        'address': service_info['Address'],
+        'port': service_info['Port'],
+        'tags': service_info['Tags'],
+        'meta': service_info['Meta']
+    }
+
+# 使用示例
+def call_api():
+    service = discover_service('myapp')
+    url = f"http://{service['address']}:{service['port']}/api/users"
+    response = requests.get(url)
+    return response.json()
+
+# 测试
+if __name__ == '__main__':
+    for i in range(10):
+        service = discover_service('myapp')
+        print(f"Request {i+1}: {service['address']}:{service['port']}")
+        result = call_api()
+        print(f"  Response: {result}")
+```
+
+**Consul管理命令**:
+
+```bash
+# ========================================
+# Consul集群管理
+# ========================================
+
+# 查看集群成员
+$ docker exec consul-server-1 consul members
+Node              Address          Status  Type    Build  Protocol  DC   Segment
+consul-server-1   10.0.1.2:8301    alive   server  1.17   2         dc1  <all>
+consul-server-2   10.0.1.3:8301    alive   server  1.17   2         dc1  <all>
+consul-server-3   10.0.1.4:8301    alive   server  1.17   2         dc1  <all>
+worker1           10.0.1.10:8301   alive   client  1.17   2         dc1  <default>
+worker2           10.0.1.11:8301   alive   client  1.17   2         dc1  <default>
+
+# 查看Leader
+$ docker exec consul-server-1 consul operator raft list-peers
+Node              ID               Address          State     Voter  RaftProtocol
+consul-server-1   abc123           10.0.1.2:8300    leader    true   3
+consul-server-2   def456           10.0.1.3:8300    follower  true   3
+consul-server-3   ghi789           10.0.1.4:8300    follower  true   3
+
+# ========================================
+# 服务查询
+# ========================================
+
+# 查看所有服务
+$ docker exec consul-server-1 consul catalog services
+consul
+myapp
+postgres
+redis
+
+# 查看服务详情
+$ docker exec consul-server-1 consul catalog service myapp
+Node     Address    TaggedAddresses  ServiceID      ServiceName  ServiceTags
+worker1  10.0.1.10  ...              myapp-abc123   myapp        api,v1,production
+worker2  10.0.1.11  ...              myapp-def456   myapp        api,v1,production
+worker3  10.0.1.12  ...              myapp-ghi789   myapp        api,v1,production
+
+# DNS查询服务
+$ dig @127.0.0.1 -p 8600 myapp.service.consul SRV
+;; ANSWER SECTION:
+myapp.service.consul. 0 IN SRV 1 1 8080 abc123.node.dc1.consul.
+myapp.service.consul. 0 IN SRV 1 1 8080 def456.node.dc1.consul.
+myapp.service.consul. 0 IN SRV 1 1 8080 ghi789.node.dc1.consul.
+
+# ========================================
+# 健康检查
+# ========================================
+
+# 查看服务健康状态
+$ docker exec consul-server-1 consul health checks myapp
+Node     CheckID          Name                 Status  Notes
+worker1  service:myapp    Service 'myapp' check passing
+worker2  service:myapp    Service 'myapp' check passing
+worker3  service:myapp    Service 'myapp' check critical HTTP GET http://10.0.1.12:8080/health: timeout
+
+# ========================================
+# KV存储
+# ========================================
+
+# 写入配置
+$ docker exec consul-server-1 consul kv put config/myapp/db_host postgres.example.com
+$ docker exec consul-server-1 consul kv put config/myapp/db_port 5432
+
+# 读取配置
+$ docker exec consul-server-1 consul kv get config/myapp/db_host
+postgres.example.com
+
+# 监听配置变更
+$ docker exec consul-server-1 consul watch -type=key -key=config/myapp/db_host \
+  /usr/local/bin/reload-config.sh
+```
+
+---
+
+## 13.3 负载均衡方案
+
+### 13.3.1 HAProxy高可用负载均衡
+
+**HAProxy + Keepalived架构**:
+
+```bash
+# 高可用负载均衡拓扑
+┌────────────────────────────────────────┐
+│       虚拟IP (VIP: 192.168.1.100)      │
+│              Keepalived                │
+│  ┌──────────────┐   ┌──────────────┐  │
+│  │  HAProxy 1   │   │  HAProxy 2   │  │
+│  │  (MASTER)    │   │  (BACKUP)    │  │
+│  │192.168.1.101 │   │192.168.1.102 │  │
+│  └──────────────┘   └──────────────┘  │
+└────────────────────────────────────────┘
+           │                 │
+    ┌──────┴─────────────────┴──────┐
+    │                                │
+┌───▼────┐  ┌────────┐  ┌────────┐ ┌▼──────┐
+│Backend │  │Backend │  │Backend │ │Backend│
+│   1    │  │   2    │  │   3    │ │   N   │
+└────────┘  └────────┘  └────────┘ └───────┘
+```
+
+**HAProxy配置**:
+
+```bash
+# haproxy.cfg
+global
+    log stdout format raw local0 info
+    maxconn 40000
+    user haproxy
+    group haproxy
+    daemon
+    stats socket /var/run/haproxy.sock mode 660 level admin
+    stats timeout 30s
+
+    # SSL配置
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+    option  dontlognull
+    option  http-server-close
+    option  forwardfor except 127.0.0.0/8
+    option  redispatch
+    retries 3
+    timeout connect 5000
+    timeout client  50000
+    timeout server  50000
+    errorfile 400 /etc/haproxy/errors/400.http
+    errorfile 403 /etc/haproxy/errors/403.http
+    errorfile 408 /etc/haproxy/errors/408.http
+    errorfile 500 /etc/haproxy/errors/500.http
+    errorfile 502 /etc/haproxy/errors/502.http
+    errorfile 503 /etc/haproxy/errors/503.http
+    errorfile 504 /etc/haproxy/errors/504.http
+
+# ========================================
+# 监控面板
+# ========================================
+listen stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 5s
+    stats show-legends
+    stats show-node
+    stats auth admin:SecurePassword123
+
+# ========================================
+# HTTP前端(80端口)
+# ========================================
+frontend http_front
+    bind *:80
+    mode http
+
+    # 请求限速(防DDoS)
+    stick-table type ip size 100k expire 30s store http_req_rate(10s)
+    http-request track-sc0 src
+    http-request deny if { sc_http_req_rate(0) gt 100 }
+
+    # ACL规则
+    acl is_api path_beg /api
+    acl is_static path_end .jpg .jpeg .png .gif .css .js .ico .svg .woff .woff2
+    acl is_health path /health
+
+    # 路由规则
+    use_backend api_backend if is_api
+    use_backend static_backend if is_static
+    use_backend health_backend if is_health
+    default_backend web_backend
+
+# ========================================
+# HTTPS前端(443端口)
+# ========================================
+frontend https_front
+    bind *:443 ssl crt /etc/haproxy/certs/example.com.pem alpn h2,http/1.1
+    mode http
+
+    # HSTS头
+    http-response set-header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+
+    # 同样的ACL和路由规则
+    acl is_api path_beg /api
+    acl is_static path_end .jpg .jpeg .png .gif .css .js .ico .svg .woff .woff2
+
+    use_backend api_backend if is_api
+    use_backend static_backend if is_static
+    default_backend web_backend
+
+# ========================================
+# Web应用后端
+# ========================================
+backend web_backend
+    mode http
+    balance roundrobin
+    option httpchk GET /health
+    http-check expect status 200
+
+    # 后端服务器
+    server web1 192.168.1.21:8080 check inter 5s fall 3 rise 2 weight 100
+    server web2 192.168.1.22:8080 check inter 5s fall 3 rise 2 weight 100
+    server web3 192.168.1.23:8080 check inter 5s fall 3 rise 2 weight 100
+    server web4 192.168.1.24:8080 check inter 5s fall 3 rise 2 weight 50 backup
+
+# ========================================
+# API后端(粘性会话)
+# ========================================
+backend api_backend
+    mode http
+    balance leastconn
+    option httpchk GET /api/health
+    http-check expect status 200
+
+    # Cookie粘性会话
+    cookie SERVERID insert indirect nocache
+
+    server api1 192.168.1.31:8080 check cookie api1 inter 5s
+    server api2 192.168.1.32:8080 check cookie api2 inter 5s
+    server api3 192.168.1.33:8080 check cookie api3 inter 5s
+    server api4 192.168.1.34:8080 check cookie api4 inter 5s
+    server api5 192.168.1.35:8080 check cookie api5 inter 5s
+
+# ========================================
+# 静态资源后端(缓存)
+# ========================================
+backend static_backend
+    mode http
+    balance roundrobin
+    option httpchk GET /health
+
+    # 缓存配置
+    http-request cache-use static_cache
+    http-response cache-store static_cache
+
+    server static1 192.168.1.41:8080 check inter 10s
+    server static2 192.168.1.42:8080 check inter 10s
+
+cache static_cache
+    total-max-size 256
+    max-object-size 10240
+    max-age 3600
+
+# ========================================
+# 健康检查后端
+# ========================================
+backend health_backend
+    mode http
+    server health 127.0.0.1:8404
+```
+
+**Keepalived配置(HAProxy 1 - MASTER)**:
+
+```bash
+# /etc/keepalived/keepalived.conf (HAProxy 1)
+global_defs {
+    router_id HAProxy_1
+    vrrp_skip_check_adv_addr
+    vrrp_garp_interval 0
+    vrrp_gna_interval 0
+}
+
+vrrp_script chk_haproxy {
+    script "/usr/bin/killall -0 haproxy"
+    interval 2
+    weight 2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 101
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass SecurePassword123
+    }
+
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+
+    track_script {
+        chk_haproxy
+    }
+
+    notify_master "/etc/keepalived/notify.sh MASTER"
+    notify_backup "/etc/keepalived/notify.sh BACKUP"
+    notify_fault "/etc/keepalived/notify.sh FAULT"
+}
+```
+
+**Keepalived配置(HAProxy 2 - BACKUP)**:
+
+```bash
+# /etc/keepalived/keepalived.conf (HAProxy 2)
+global_defs {
+    router_id HAProxy_2
+    vrrp_skip_check_adv_addr
+    vrrp_garp_interval 0
+    vrrp_gna_interval 0
+}
+
+vrrp_script chk_haproxy {
+    script "/usr/bin/killall -0 haproxy"
+    interval 2
+    weight 2
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 100  # 比MASTER低
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass SecurePassword123
+    }
+
+    virtual_ipaddress {
+        192.168.1.100/24
+    }
+
+    track_script {
+        chk_haproxy
+    }
+
+    notify_master "/etc/keepalived/notify.sh MASTER"
+    notify_backup "/etc/keepalived/notify.sh BACKUP"
+    notify_fault "/etc/keepalived/notify.sh FAULT"
+}
+```
+
+**Docker Compose部署HAProxy**:
+
+```yaml
+# haproxy-stack.yml
+version: '3.8'
+
+services:
+  haproxy:
+    image: haproxy:2.9-alpine
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+      - target: 8404
+        published: 8404
+        protocol: tcp
+        mode: host
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./haproxy/certs:/etc/haproxy/certs:ro
+      - haproxy-logs:/var/log/haproxy
+    networks:
+      - frontend
+      - backend
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.labels.lb == true
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "80"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+networks:
+  frontend:
+    driver: overlay
+    attachable: true
+  backend:
+    driver: overlay
+    attachable: true
+
+volumes:
+  haproxy-logs:
+```
+
+**验证与监控**:
+
+```bash
+# ========================================
+# 验证VIP
+# ========================================
+
+# HAProxy 1上查看VIP
+$ ip addr show eth0 | grep 192.168.1.100
+    inet 192.168.1.100/24 scope global secondary eth0
+
+# 测试故障转移
+# 在HAProxy 1上停止服务
+$ systemctl stop haproxy
+
+# VIP应自动漂移到HAProxy 2
+$ ip addr show eth0 | grep 192.168.1.100  # HAProxy 2上执行
+    inet 192.168.1.100/24 scope global secondary eth0
+
+# ========================================
+# 访问监控面板
+# ========================================
+
+# 浏览器访问:
+# http://192.168.1.100:8404/stats
+# 用户名: admin
+# 密码: SecurePassword123
+
+# 命令行查看统计
+$ echo "show stat" | socat unix-connect:/var/run/haproxy.sock stdio
+
+# ========================================
+# 压力测试
+# ========================================
+
+# 使用ab进行压测
+$ ab -n 100000 -c 100 http://192.168.1.100/
+
+# 使用wrk进行压测
+$ wrk -t 12 -c 400 -d 60s http://192.168.1.100/
+
+# 观察HAProxy统计
+$ watch -n 1 'echo "show stat" | socat unix-connect:/var/run/haproxy.sock stdio | grep web_backend'
+```
+
+---
+
+### 13.3.2 Traefik动态负载均衡
+
+**Traefik特点**:
+- ✅ 自动服务发现(Docker/Swarm/K8s)
+- ✅ 自动HTTPS(Let's Encrypt)
+- ✅ 动态配置(无需重启)
+- ✅ 中间件支持(认证/限流/压缩)
+- ✅ WebSocket/gRPC支持
+- ✅ 现代化Dashboard
+
+**Traefik配置**:
+
+```yaml
+# traefik/traefik.yml
+# ========================================
+# 全局配置
+# ========================================
+global:
+  checkNewVersion: true
+  sendAnonymousUsage: false
+
+# ========================================
+# API和Dashboard
+# ========================================
+api:
+  dashboard: true
+  insecure: false  # 生产环境必须false
+
+# ========================================
+# 日志
+# ========================================
+log:
+  level: INFO
+  format: json
+  filePath: /var/log/traefik/traefik.log
+
+accessLog:
+  filePath: /var/log/traefik/access.log
+  format: json
+  fields:
+    headers:
+      defaultMode: keep
+      names:
+        User-Agent: keep
+        Authorization: drop
+        Content-Type: keep
+
+# ========================================
+# 入口点(EntryPoints)
+# ========================================
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+
+  metrics:
+    address: ":8082"
+
+# ========================================
+# 证书解析器(Let's Encrypt)
+# ========================================
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@example.com
+      storage: /etc/traefik/acme/acme.json
+      httpChallenge:
+        entryPoint: web
+      # 生产环境使用:
+      # caServer: "https://acme-v02.api.letsencrypt.org/directory"
+      # 测试环境使用:
+      caServer: "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+# ========================================
+# 提供商(Providers)
+# ========================================
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false  # 默认不暴露服务
+    network: traefik-public
+    swarmMode: true
+    watch: true
+
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+# ========================================
+# 指标(Metrics)
+# ========================================
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addServicesLabels: true
+    buckets:
+      - 0.1
+      - 0.3
+      - 1.2
+      - 5.0
+```
+
+**Traefik Stack部署**:
+
+```yaml
+# traefik-stack.yml
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v2.10
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+      - target: 8082
+        published: 8082
+        protocol: tcp
+        mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - traefik-certs:/etc/traefik/acme
+      - traefik-logs:/var/log/traefik
+    networks:
+      - traefik-public
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        # Dashboard路由
+        - "traefik.enable=true"
+        - "traefik.http.routers.dashboard.rule=Host(`traefik.example.com`)"
+        - "traefik.http.routers.dashboard.entrypoints=websecure"
+        - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.dashboard.service=api@internal"
+        # Dashboard认证
+        - "traefik.http.routers.dashboard.middlewares=dashboard-auth"
+        - "traefik.http.middlewares.dashboard-auth.basicauth.users=admin:$$apr1$$xxx"  # htpasswd生成
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+networks:
+  traefik-public:
+    driver: overlay
+    attachable: true
+
+volumes:
+  traefik-certs:
+  traefik-logs:
+```
+
+**应用服务配置(使用Traefik标签)**:
+
+```yaml
+# app-stack.yml
+version: '3.8'
+
+services:
+  # Web应用
+  app:
+    image: myapp:latest
+    networks:
+      - traefik-public
+      - backend
+    environment:
+      DATABASE_URL: postgresql://db:5432/appdb
+    deploy:
+      replicas: 6
+      labels:
+        # 启用Traefik
+        - "traefik.enable=true"
+
+        # HTTP路由
+        - "traefik.http.routers.app.rule=Host(`app.example.com`)"
+        - "traefik.http.routers.app.entrypoints=websecure"
+        - "traefik.http.routers.app.tls.certresolver=letsencrypt"
+
+        # 服务配置
+        - "traefik.http.services.app.loadbalancer.server.port=8080"
+        - "traefik.http.services.app.loadbalancer.sticky.cookie=true"
+        - "traefik.http.services.app.loadbalancer.sticky.cookie.name=SERVERID"
+        - "traefik.http.services.app.loadbalancer.healthcheck.path=/health"
+        - "traefik.http.services.app.loadbalancer.healthcheck.interval=10s"
+
+        # 中间件: 压缩
+        - "traefik.http.middlewares.app-compress.compress=true"
+        # 中间件: 限流
+        - "traefik.http.middlewares.app-ratelimit.ratelimit.average=100"
+        - "traefik.http.middlewares.app-ratelimit.ratelimit.burst=50"
+        # 中间件: 安全头
+        - "traefik.http.middlewares.app-headers.headers.sslredirect=true"
+        - "traefik.http.middlewares.app-headers.headers.stsSeconds=31536000"
+        - "traefik.http.middlewares.app-headers.headers.contentTypeNosniff=true"
+        - "traefik.http.middlewares.app-headers.headers.browserXssFilter=true"
+        - "traefik.http.middlewares.app-headers.headers.frameDeny=true"
+
+        # 应用中间件
+        - "traefik.http.routers.app.middlewares=app-compress,app-ratelimit,app-headers"
+
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  # API服务(不同域名)
+  api:
+    image: myapi:latest
+    networks:
+      - traefik-public
+      - backend
+    deploy:
+      replicas: 5
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.api.rule=Host(`api.example.com`)"
+        - "traefik.http.routers.api.entrypoints=websecure"
+        - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+        - "traefik.http.services.api.loadbalancer.server.port=3000"
+        - "traefik.http.middlewares.api-cors.headers.accesscontrolallowmethods=GET,POST,PUT,DELETE"
+        - "traefik.http.middlewares.api-cors.headers.accesscontrolalloworiginlist=https://app.example.com"
+        - "traefik.http.middlewares.api-cors.headers.accesscontrolmaxage=100"
+        - "traefik.http.middlewares.api-cors.headers.addvaryheader=true"
+        - "traefik.http.routers.api.middlewares=api-cors"
+
+  # 静态文件服务
+  static:
+    image: nginx:alpine
+    networks:
+      - traefik-public
+    volumes:
+      - static-files:/usr/share/nginx/html:ro
+    deploy:
+      replicas: 3
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.static.rule=Host(`static.example.com`)"
+        - "traefik.http.routers.static.entrypoints=websecure"
+        - "traefik.http.routers.static.tls.certresolver=letsencrypt"
+        - "traefik.http.services.static.loadbalancer.server.port=80"
+        # 静态资源缓存
+        - "traefik.http.middlewares.static-cache.headers.customResponseHeaders.Cache-Control=public, max-age=31536000, immutable"
+        - "traefik.http.routers.static.middlewares=static-cache,app-compress"
+
+networks:
+  traefik-public:
+    external: true
+  backend:
+    driver: overlay
+    internal: true
+
+volumes:
+  static-files:
+```
+
+**动态配置文件**:
+
+```yaml
+# traefik/dynamic/middlewares.yml
+http:
+  middlewares:
+    # 自定义错误页面
+    custom-errors:
+      errors:
+        status:
+          - "404"
+          - "500-599"
+        service: error-pages
+        query: "/{status}.html"
+
+    # IP白名单
+    ip-whitelist:
+      ipWhiteList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "192.168.1.0/24"
+          - "10.0.0.0/8"
+
+    # Basic认证
+    basic-auth:
+      basicAuth:
+        users:
+          - "admin:$apr1$xxx..."  # htpasswd生成
+          - "user:$apr1$yyy..."
+        removeHeader: true
+
+    # 重定向
+    redirect-www:
+      redirectRegex:
+        regex: "^https://example.com/(.*)"
+        replacement: "https://www.example.com/${1}"
+        permanent: true
+
+  services:
+    error-pages:
+      loadBalancer:
+        servers:
+          - url: "http://error-pages:8080"
+```
+
+**验证与监控**:
+
+```bash
+# ========================================
+# 部署Traefik
+# ========================================
+
+# 创建网络
+$ docker network create --driver=overlay traefik-public
+
+# 部署Traefik
+$ docker stack deploy -c traefik-stack.yml traefik
+
+# 部署应用
+$ docker stack deploy -c app-stack.yml myapp
+
+# ========================================
+# 验证
+# ========================================
+
+# 查看Traefik日志
+$ docker service logs -f traefik_traefik
+
+# 访问Dashboard
+# https://traefik.example.com/dashboard/
+
+# 查看路由
+$ curl -s http://localhost:8080/api/http/routers | jq
+
+# 查看服务
+$ curl -s http://localhost:8080/api/http/services | jq
+
+# ========================================
+# 测试自动HTTPS
+# ========================================
+
+# 测试HTTP重定向到HTTPS
+$ curl -I http://app.example.com
+HTTP/1.1 308 Permanent Redirect
+Location: https://app.example.com/
+
+# 测试HTTPS
+$ curl -I https://app.example.com
+HTTP/2 200
+Strict-Transport-Security: max-age=31536000
+
+# ========================================
+# Prometheus指标
+# ========================================
+
+# 访问指标端点
+$ curl http://localhost:8082/metrics
+
+# 指标示例
+traefik_entrypoint_requests_total{code="200",entrypoint="websecure",method="GET",protocol="http"} 1234
+traefik_service_requests_total{code="200",method="GET",service="app@docker"} 5678
+```
+
+---
+
+## 13.4 反向代理与API网关
+
+### 13.4.1 Nginx作为API网关
+
+**Nginx API网关配置**:
+
+```nginx
+# /etc/nginx/nginx.conf
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /var/run/nginx.pid;
+
+events {
+    worker_connections 10000;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # 日志格式
+    log_format api '$remote_addr - $remote_user [$time_local] '
+                   '"$request" $status $body_bytes_sent '
+                   '"$http_referer" "$http_user_agent" '
+                   'request_id=$request_id '
+                   'upstream_addr=$upstream_addr '
+                   'upstream_status=$upstream_status '
+                   'request_time=$request_time '
+                   'upstream_response_time=$upstream_response_time '
+                   'upstream_connect_time=$upstream_connect_time '
+                   'upstream_header_time=$upstream_header_time';
+
+    access_log /var/log/nginx/access.log api;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    client_max_body_size 20M;
+    client_body_buffer_size 128k;
+
+    # Gzip压缩
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+
+    # 缓存配置
+    proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=api_cache:10m max_size=100m inactive=60m use_temp_path=off;
+
+    # 限流区域
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=100r/s;
+    limit_req_zone $binary_remote_addr zone=auth_limit:10m rate=5r/s;
+    limit_conn_zone $binary_remote_addr zone=conn_limit:10m;
+
+    # 上游服务
+    upstream auth_service {
+        least_conn;
+        server auth:3000 max_fails=3 fail_timeout=30s;
+        server auth:3001 max_fails=3 fail_timeout=30s backup;
+        keepalive 32;
+    }
+
+    upstream user_service {
+        least_conn;
+        server user:4000 max_fails=3 fail_timeout=30s weight=2;
+        server user:4001 max_fails=3 fail_timeout=30s weight=1;
+        keepalive 32;
+    }
+
+    upstream order_service {
+        least_conn;
+        server order:5000 max_fails=3 fail_timeout=30s;
+        server order:5001 max_fails=3 fail_timeout=30s;
+        keepalive 32;
+    }
+
+    # API网关主配置
+    server {
+        listen 80;
+        server_name api.example.com;
+
+        # 安全头
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header X-Request-ID $request_id always;
+
+        # CORS配置
+        add_header Access-Control-Allow-Origin "https://app.example.com" always;
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization" always;
+        add_header Access-Control-Expose-Headers "Content-Length,Content-Range" always;
+        add_header Access-Control-Max-Age 1728000 always;
+
+        # OPTIONS请求处理
+        if ($request_method = 'OPTIONS') {
+            return 204;
+        }
+
+        # ====================================
+        # 认证服务(/api/auth/*)
+        # ====================================
+        location /api/auth/ {
+            # 限流: 每秒5个请求
+            limit_req zone=auth_limit burst=10 nodelay;
+            limit_conn conn_limit 10;
+
+            # 代理配置
+            proxy_pass http://auth_service/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Request-ID $request_id;
+
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+            proxy_buffering off;
+
+            # 错误处理
+            proxy_intercept_errors on;
+            error_page 502 503 504 = @fallback_auth;
+        }
+
+        # ====================================
+        # 用户服务(/api/users/*)  需要JWT认证
+        # ====================================
+        location /api/users/ {
+            # JWT验证(使用auth_request)
+            auth_request /api/auth/verify;
+            auth_request_set $auth_user_id $upstream_http_x_user_id;
+            auth_request_set $auth_user_role $upstream_http_x_user_role;
+
+            # 限流
+            limit_req zone=api_limit burst=50 nodelay;
+
+            # 代理配置
+            proxy_pass http://user_service/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-User-ID $auth_user_id;
+            proxy_set_header X-User-Role $auth_user_role;
+            proxy_set_header X-Request-ID $request_id;
+
+            # 缓存配置(GET请求)
+            proxy_cache api_cache;
+            proxy_cache_methods GET;
+            proxy_cache_key "$scheme$request_method$host$request_uri$auth_user_id";
+            proxy_cache_valid 200 5m;
+            proxy_cache_valid 404 1m;
+            proxy_cache_bypass $http_cache_control;
+            add_header X-Cache-Status $upstream_cache_status;
+        }
+
+        # ====================================
+        # 订单服务(/api/orders/*)  需要认证
+        # ====================================
+        location /api/orders/ {
+            # JWT验证
+            auth_request /api/auth/verify;
+            auth_request_set $auth_user_id $upstream_http_x_user_id;
+
+            # 限流
+            limit_req zone=api_limit burst=30 nodelay;
+
+            # 代理配置
+            proxy_pass http://order_service/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-User-ID $auth_user_id;
+            proxy_set_header X-Request-ID $request_id;
+
+            # 超时配置(订单处理可能较慢)
+            proxy_connect_timeout 10s;
+            proxy_send_timeout 120s;
+            proxy_read_timeout 120s;
+        }
+
+        # ====================================
+        # JWT验证端点(内部)
+        # ====================================
+        location = /api/auth/verify {
+            internal;
+            proxy_pass http://auth_service/verify;
+            proxy_pass_request_body off;
+            proxy_set_header Content-Length "";
+            proxy_set_header X-Original-URI $request_uri;
+            proxy_set_header Authorization $http_authorization;
+        }
+
+        # ====================================
+        # 健康检查
+        # ====================================
+        location /health {
+            access_log off;
+            add_header Content-Type text/plain;
+            return 200 "healthy\n";
+        }
+
+        # ====================================
+        # Fallback处理
+        # ====================================
+        location @fallback_auth {
+            add_header Content-Type application/json;
+            return 503 '{"error":"Authentication service temporarily unavailable"}';
+        }
+    }
+}
+```
+
+**JWT验证服务示例(auth_service)**:
+
+```javascript
+// auth-service/server.js
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const app = express();
+
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+
+// 登录端点
+app.post('/login', express.json(), (req, res) => {
+    const { username, password } = req.body;
+
+    // 验证用户名密码(示例)
+    if (username === 'admin' && password === 'password') {
+        const token = jwt.sign(
+            {
+                userId: 1,
+                username: 'admin',
+                role: 'admin'
+            },
+            JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+
+        res.json({ token });
+    } else {
+        res.status(401).json({ error: 'Invalid credentials' });
+    }
+});
+
+// JWT验证端点(供Nginx auth_request使用)
+app.get('/verify', (req, res) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).send('Unauthorized');
+    }
+
+    const token = authHeader.substring(7);
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+
+        // 设置自定义响应头(Nginx会传递给后端)
+        res.setHeader('X-User-ID', decoded.userId);
+        res.setHeader('X-User-Role', decoded.role);
+        res.setHeader('X-Username', decoded.username);
+
+        res.status(200).send('OK');
+    } catch (err) {
+        res.status(401).send('Invalid token');
+    }
+});
+
+app.listen(3000, () => {
+    console.log('Auth service listening on port 3000');
+});
+```
+
+**Docker Compose部署**:
+
+```yaml
+# api-gateway-stack.yml
+version: '3.8'
+
+services:
+  # Nginx API网关
+  api-gateway:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-cache:/var/cache/nginx
+      - nginx-logs:/var/log/nginx
+    networks:
+      - frontend
+      - backend
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    depends_on:
+      - auth
+      - user
+      - order
+
+  # 认证服务
+  auth:
+    image: auth-service:latest
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      NODE_ENV: production
+    networks:
+      - backend
+    deploy:
+      replicas: 2
+
+  # 用户服务
+  user:
+    image: user-service:latest
+    networks:
+      - backend
+    deploy:
+      replicas: 3
+
+  # 订单服务
+  order:
+    image: order-service:latest
+    networks:
+      - backend
+    deploy:
+      replicas: 3
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
+
+volumes:
+  nginx-cache:
+  nginx-logs:
+```
+
+**测试API网关**:
+
+```bash
+# ========================================
+# 测试认证
+# ========================================
+
+# 登录获取JWT
+$ curl -X POST http://api.example.com/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"password"}'
+
+# 响应:
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+
+# ========================================
+# 测试需要认证的API
+# ========================================
+
+# 无Token访问(被拒绝)
+$ curl http://api.example.com/api/users/profile
+# 响应: 401 Unauthorized
+
+# 带Token访问(成功)
+$ TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+$ curl -H "Authorization: Bearer $TOKEN" \
+  http://api.example.com/api/users/profile
+
+# 响应:
+{
+  "userId": 1,
+  "username": "admin",
+  "role": "admin"
+}
+
+# 查看请求ID(用于追踪)
+$ curl -I -H "Authorization: Bearer $TOKEN" \
+  http://api.example.com/api/users/profile | grep X-Request-ID
+X-Request-ID: abc123def456
+
+# ========================================
+# 测试限流
+# ========================================
+
+# 快速发送100个请求(会触发限流)
+$ for i in {1..100}; do
+    curl -H "Authorization: Bearer $TOKEN" \
+      http://api.example.com/api/users/profile &
+  done
+
+# 部分响应: 429 Too Many Requests
+
+# ========================================
+# 测试缓存
+# ========================================
+
+# 第一次请求(MISS)
+$ curl -H "Authorization: Bearer $TOKEN" \
+  http://api.example.com/api/users/1 -I | grep X-Cache-Status
+X-Cache-Status: MISS
+
+# 第二次请求(HIT)
+$ curl -H "Authorization: Bearer $TOKEN" \
+  http://api.example.com/api/users/1 -I | grep X-Cache-Status
+X-Cache-Status: HIT
+```
+
+---
+
+## 13.5 配置管理与秘钥管理
+
+### 13.5.1 Docker Secrets(Swarm内置)
+
+**创建秘钥**:
+
+```bash
+# ========================================
+# 从文件创建秘钥
+# ========================================
+
+# 数据库密码
+$ echo "MySecureDBPassword123!" > db_password.txt
+$ docker secret create db_password db_password.txt
+$ rm db_password.txt  # 删除明文文件
+
+# 从标准输入创建
+$ echo "MyRedisPassword456!" | docker secret create redis_password -
+
+# 从环境变量创建
+$ openssl rand -base64 32 | docker secret create jwt_secret -
+
+# TLS证书
+$ docker secret create ssl_cert ./certs/fullchain.pem
+$ docker secret create ssl_key ./certs/privkey.pem
+
+# ========================================
+# 查看秘钥
+# ========================================
+
+$ docker secret ls
+ID                NAME            CREATED
+abc123            db_password     10 minutes ago
+def456            redis_password  5 minutes ago
+ghi789            jwt_secret      2 minutes ago
+
+# 查看秘钥详情(不显示内容)
+$ docker secret inspect db_password
+[
+    {
+        "ID": "abc123",
+        "Version": {
+            "Index": 10
+        },
+        "CreatedAt": "2023-12-04T10:00:00Z",
+        "UpdatedAt": "2023-12-04T10:00:00Z",
+        "Spec": {
+            "Name": "db_password",
+            "Labels": {}
+        }
+    }
+]
+```
+
+**在服务中使用秘钥**:
+
+```yaml
+# stack.yml
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      # 通过_FILE后缀引用秘钥文件
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_USER: appuser
+      POSTGRES_DB: appdb
+    secrets:
+      - db_password
+    deploy:
+      replicas: 1
+
+  app:
+    image: myapp:latest
+    environment:
+      # 应用代码需要读取秘钥文件
+      DB_PASSWORD_FILE: /run/secrets/db_password
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+    secrets:
+      - db_password
+      - jwt_secret
+    deploy:
+      replicas: 5
+
+secrets:
+  db_password:
+    external: true  # 使用已存在的秘钥
+
+  jwt_secret:
+    external: true
+```
+
+**应用代码读取秘钥**:
+
+```python
+# app.py
+import os
+
+def read_secret(secret_name):
+    """从Docker Secrets读取秘钥"""
+    secret_file = os.getenv(f'{secret_name.upper()}_FILE',
+                            f'/run/secrets/{secret_name}')
+    try:
+        with open(secret_file, 'r') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        # Fallback到环境变量(开发环境)
+        return os.getenv(secret_name.upper())
+
+# 使用秘钥
+DB_PASSWORD = read_secret('db_password')
+JWT_SECRET = read_secret('jwt_secret')
+
+# 数据库连接
+DATABASE_URL = f"postgresql://appuser:{DB_PASSWORD}@db:5432/appdb"
+```
+
+**轮换秘钥**:
+
+```bash
+# ========================================
+# 秘钥轮换步骤
+# ========================================
+
+# 1. 创建新秘钥
+$ echo "NewDBPassword789!" | docker secret create db_password_v2 -
+
+# 2. 更新服务使用新秘钥
+$ docker service update \
+  --secret-rm db_password \
+  --secret-add source=db_password_v2,target=db_password \
+  myapp_db
+
+# 3. 验证服务正常
+$ docker service ps myapp_db
+
+# 4. 删除旧秘钥
+$ docker secret rm db_password
+
+# 5. 重命名新秘钥(可选)
+# Docker不支持重命名,需要重新创建
+```
+
+---
+
+### 13.5.2 Vault集成(企业级秘钥管理)
+
+**HashiCorp Vault架构**:
+
+```bash
+# Vault集群架构
+┌─────────────────────────────────────────┐
+│         Vault集群 (HA模式)              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐│
+│  │ Vault 1  │  │ Vault 2  │  │ Vault 3  ││
+│  │ (Active) │  │ (Standby)│  │ (Standby)││
+│  └──────────┘  └──────────┘  └──────────┘│
+│       │              │              │     │
+│       └──────────────┴──────────────┘     │
+│                    │                      │
+│          ┌─────────▼─────────┐           │
+│          │   Consul Backend  │           │
+│          │  (存储+HA协调)     │           │
+│          └───────────────────┘           │
+└─────────────────────────────────────────┘
+```
+
+**Vault部署**:
+
+```yaml
+# vault-stack.yml
+version: '3.8'
+
+services:
+  # Consul(Vault后端存储)
+  consul:
+    image: consul:1.17
+    command: agent -server -bootstrap-expect=1 -ui -client=0.0.0.0
+    environment:
+      CONSUL_LOCAL_CONFIG: |
+        {
+          "datacenter": "dc1",
+          "data_dir": "/consul/data",
+          "log_level": "INFO"
+        }
+    volumes:
+      - consul-data:/consul/data
+    networks:
+      - vault-net
+    ports:
+      - "8500:8500"
+
+  # Vault Server
+  vault:
+    image: hashicorp/vault:1.15
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_ADDR: http://0.0.0.0:8200
+      VAULT_API_ADDR: http://vault:8200
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - ./vault/config:/vault/config:ro
+      - vault-data:/vault/data
+      - vault-logs:/vault/logs
+    networks:
+      - vault-net
+    command: server
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+networks:
+  vault-net:
+    driver: overlay
+
+volumes:
+  consul-data:
+  vault-data:
+  vault-logs:
+```
+
+**Vault配置文件**:
+
+```hcl
+# vault/config/vault.hcl
+storage "consul" {
+  address = "consul:8500"
+  path    = "vault/"
+}
+
+listener "tcp" {
+  address     = "0.0.0.0:8200"
+  tls_disable = 1
+}
+
+api_addr = "http://vault:8200"
+cluster_addr = "https://vault:8201"
+ui = true
+
+# 日志配置
+log_level = "info"
+log_format = "json"
+
+# Telemetry
+telemetry {
+  prometheus_retention_time = "30s"
+  disable_hostname = false
+}
+```
+
+**初始化Vault**:
+
+```bash
+# ========================================
+# 初始化Vault
+# ========================================
+
+# 部署Vault
+$ docker stack deploy -c vault-stack.yml vault
+
+# 等待Vault启动
+$ docker service logs -f vault_vault
+
+# 初始化Vault(仅第一次)
+$ docker exec -it $(docker ps -q -f name=vault_vault) vault operator init
+Unseal Key 1: abc123...
+Unseal Key 2: def456...
+Unseal Key 3: ghi789...
+Unseal Key 4: jkl012...
+Unseal Key 5: mno345...
+
+Initial Root Token: s.xxxxxxxxxxxx
+
+# ⚠️ 重要: 保存Unseal Keys和Root Token到安全地方!
+
+# ========================================
+# 解封Vault(每次重启后需要)
+# ========================================
+
+# 需要3个Unseal Key才能解封
+$ docker exec -it $(docker ps -q -f name=vault_vault) \
+  vault operator unseal abc123...
+
+$ docker exec -it $(docker ps -q -f name=vault_vault) \
+  vault operator unseal def456...
+
+$ docker exec -it $(docker ps -q -f name=vault_vault) \
+  vault operator unseal ghi789...
+
+# 验证状态
+$ docker exec -it $(docker ps -q -f name=vault_vault) \
+  vault status
+
+Key             Value
+---             -----
+Seal Type       shamir
+Initialized     true
+Sealed          false  # ✅ 已解封
+Total Shares    5
+Threshold       3
+Version         1.15.0
+```
+
+**配置Vault**:
+
+```bash
+# ========================================
+# 登录Vault
+# ========================================
+
+$ export VAULT_ADDR='http://localhost:8200'
+$ vault login s.xxxxxxxxxxxx  # 使用Root Token
+
+# ========================================
+# 启用KV秘钥引擎
+# ========================================
+
+# 启用KV v2引擎
+$ vault secrets enable -version=2 kv
+
+# 写入秘钥
+$ vault kv put kv/myapp/production \
+  db_password="MySecureDBPassword123!" \
+  redis_password="MyRedisPassword456!" \
+  jwt_secret="MyJWTSecret789!"
+
+# 读取秘钥
+$ vault kv get kv/myapp/production
+===== Data =====
+Key               Value
+---               -----
+db_password       MySecureDBPassword123!
+redis_password    MyRedisPassword456!
+jwt_secret        MyJWTSecret789!
+
+# 读取特定字段
+$ vault kv get -field=db_password kv/myapp/production
+MySecureDBPassword123!
+
+# ========================================
+# 创建策略(最小权限)
+# ========================================
+
+# 创建策略文件
+$ cat <<EOF > myapp-policy.hcl
+# 允许读取myapp的生产秘钥
+path "kv/data/myapp/production" {
+  capabilities = ["read"]
+}
+
+# 允许列出秘钥
+path "kv/metadata/myapp/*" {
+  capabilities = ["list"]
+}
+EOF
+
+# 应用策略
+$ vault policy write myapp myapp-policy.hcl
+
+# ========================================
+# 创建AppRole(供应用使用)
+# ========================================
+
+# 启用AppRole认证
+$ vault auth enable approle
+
+# 创建角色
+$ vault write auth/approle/role/myapp \
+  token_policies="myapp" \
+  token_ttl=1h \
+  token_max_ttl=24h \
+  secret_id_ttl=0
+
+# 获取Role ID
+$ vault read auth/approle/role/myapp/role-id
+role_id    abc-123-def-456
+
+# 生成Secret ID
+$ vault write -f auth/approle/role/myapp/secret-id
+secret_id            xyz-789-uvw-012
+secret_id_accessor   ...
+```
+
+**应用集成Vault**:
+
+```python
+# app.py - Python集成Vault
+import hvac
+import os
+
+# Vault配置
+VAULT_ADDR = os.getenv('VAULT_ADDR', 'http://vault:8200')
+VAULT_ROLE_ID = os.getenv('VAULT_ROLE_ID')
+VAULT_SECRET_ID = os.getenv('VAULT_SECRET_ID')
+
+def get_vault_client():
+    """创建Vault客户端"""
+    client = hvac.Client(url=VAULT_ADDR)
+
+    # 使用AppRole登录
+    client.auth.approle.login(
+        role_id=VAULT_ROLE_ID,
+        secret_id=VAULT_SECRET_ID
+    )
+
+    if not client.is_authenticated():
+        raise Exception('Vault authentication failed')
+
+    return client
+
+def get_secrets():
+    """从Vault获取秘钥"""
+    client = get_vault_client()
+
+    # 读取秘钥
+    secret = client.secrets.kv.v2.read_secret_version(
+        path='myapp/production',
+        mount_point='kv'
+    )
+
+    return secret['data']['data']
+
+# 使用秘钥
+secrets = get_secrets()
+DB_PASSWORD = secrets['db_password']
+REDIS_PASSWORD = secrets['redis_password']
+JWT_SECRET = secrets['jwt_secret']
+
+print(f"✅ Successfully loaded {len(secrets)} secrets from Vault")
+```
+
+**Docker Compose集成**:
+
+```yaml
+# app-stack.yml
+version: '3.8'
+
+services:
+  app:
+    image: myapp:latest
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_ROLE_ID: abc-123-def-456
+      VAULT_SECRET_ID: xyz-789-uvw-012
+    networks:
+      - vault-net
+      - backend
+    deploy:
+      replicas: 5
+    command: >
+      sh -c "python -c 'from app import get_secrets; get_secrets()' &&
+             python app.py"
+
+networks:
+  vault-net:
+    external: true
+  backend:
+    driver: overlay
+```
+
+---
+
+### 13.5.3 环境变量管理最佳实践
+
+**多环境配置策略**:
+
+```bash
+# 项目结构
+.
+├── .env.example          # 示例配置(提交到Git)
+├── .env.development      # 开发环境(不提交)
+├── .env.staging          # 测试环境(不提交)
+├── .env.production       # 生产环境(不提交)
+├── docker-compose.yml    # 基础配置
+├── docker-compose.dev.yml
+├── docker-compose.prod.yml
+└── .gitignore           # 忽略所有.env文件
+```
+
+**.env.example**:
+
+```bash
+# 应用配置
+NODE_ENV=production
+LOG_LEVEL=info
+PORT=8080
+
+# 数据库配置
+DATABASE_URL=postgresql://user:password@db:5432/dbname
+DB_POOL_MIN=2
+DB_POOL_MAX=10
+
+# Redis配置
+REDIS_URL=redis://redis:6379/0
+
+# 外部服务
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=secret...
+
+# 秘钥(生产环境使用Docker Secrets或Vault)
+JWT_SECRET=change_me_in_production
+API_KEY=change_me_in_production
+```
+
+**.env.development**:
+
+```bash
+NODE_ENV=development
+LOG_LEVEL=debug
+PORT=8080
+
+DATABASE_URL=postgresql://dev:dev123@localhost:5432/dev_db
+REDIS_URL=redis://localhost:6379/0
+
+JWT_SECRET=dev_jwt_secret
+API_KEY=dev_api_key
+```
+
+**.env.production**:
+
+```bash
+NODE_ENV=production
+LOG_LEVEL=warn
+PORT=8080
+
+# 生产环境使用Docker Secrets
+DATABASE_URL_FILE=/run/secrets/database_url
+REDIS_URL_FILE=/run/secrets/redis_url
+JWT_SECRET_FILE=/run/secrets/jwt_secret
+API_KEY_FILE=/run/secrets/api_key
+
+# AWS使用IAM角色,无需硬编码密钥
+AWS_REGION=us-east-1
+```
+
+**优先级规则**:
+
+```python
+# config.py - 统一配置加载
+import os
+from pathlib import Path
+
+def read_secret(name):
+    """读取秘钥(支持文件和环境变量)"""
+    # 1. 优先从文件读取(Docker Secrets/Vault)
+    file_path = os.getenv(f'{name}_FILE')
+    if file_path and Path(file_path).exists():
+        with open(file_path, 'r') as f:
+            return f.read().strip()
+
+    # 2. 从环境变量读取
+    value = os.getenv(name)
+    if value:
+        return value
+
+    # 3. 从.env文件读取(开发环境)
+    from dotenv import load_dotenv
+    load_dotenv()
+    value = os.getenv(name)
+    if value:
+        return value
+
+    # 4. 抛出异常
+    raise ValueError(f'Missing required config: {name}')
+
+class Config:
+    """应用配置"""
+    # 基础配置
+    NODE_ENV = os.getenv('NODE_ENV', 'development')
+    LOG_LEVEL = os.getenv('LOG_LEVEL', 'info')
+    PORT = int(os.getenv('PORT', 8080))
+
+    # 秘钥配置
+    DATABASE_URL = read_secret('DATABASE_URL')
+    REDIS_URL = read_secret('REDIS_URL')
+    JWT_SECRET = read_secret('JWT_SECRET')
+    API_KEY = read_secret('API_KEY')
+
+    @classmethod
+    def is_production(cls):
+        return cls.NODE_ENV == 'production'
+
+    @classmethod
+    def is_development(cls):
+        return cls.NODE_ENV == 'development'
+
+# 使用
+config = Config()
+print(f'Running in {config.NODE_ENV} mode')
+print(f'Database: {config.DATABASE_URL}')
+```
+
+---
+
+## 13.6 生产部署最佳实践
+
+### 13.6.1 部署清单(Checklist)
+
+```yaml
+# 生产部署检查清单
+
+## 安全性
+- [ ] 所有秘钥使用Docker Secrets或Vault管理
+- [ ] 删除默认账号和密码
+- [ ] 启用HTTPS和TLS 1.2+
+- [ ] 配置防火墙规则
+- [ ] 使用非root用户运行容器
+- [ ] 扫描镜像漏洞(Trivy/Clair)
+- [ ] 限制容器权限(drop capabilities)
+- [ ] 配置内部网络隔离
+
+## 高可用性
+- [ ] 至少3个Manager节点(Swarm)
+- [ ] 跨可用区分布服务副本
+- [ ] 配置健康检查和自动重启
+- [ ] 实现优雅关闭(SIGTERM处理)
+- [ ] 配置资源limits和reservations
+- [ ] 数据库主从/集群部署
+- [ ] 负载均衡器高可用(HAProxy+Keepalived)
+
+## 数据持久化
+- [ ] 数据卷使用NFS/云存储
+- [ ] 配置自动备份(每日/每周)
+- [ ] 测试备份恢复流程
+- [ ] 数据库binlog/WAL归档
+- [ ] 重要数据多地域备份
+
+## 监控告警
+- [ ] 部署Prometheus+Grafana
+- [ ] 配置关键指标告警规则
+- [ ] 集成PagerDuty/钉钉/企业微信
+- [ ] 日志集中收集(ELK/Loki)
+- [ ] APM性能监控
+- [ ] 业务指标监控
+
+## 性能优化
+- [ ] 容器资源限制优化
+- [ ] 数据库连接池配置
+- [ ] Redis缓存策略
+- [ ] CDN加速静态资源
+- [ ] Gzip压缩启用
+- [ ] HTTP/2启用
+- [ ] 数据库索引优化
+
+## 部署流程
+- [ ] 使用声明式部署(Stack)
+- [ ] 配置滚动更新策略
+- [ ] 设置健康检查探针
+- [ ] 实现蓝绿/金丝雀部署
+- [ ] 自动化CI/CD流程
+- [ ] 版本标签规范(semver)
+- [ ] 回滚预案
+
+## 文档和培训
+- [ ] 部署架构图
+- [ ] 运维手册(SOP)
+- [ ] 故障排查手册
+- [ ] 应急响应流程
+- [ ] 团队培训完成
+```
+
+---
+
+### 13.6.2 部署脚本示例
+
+```bash
+#!/bin/bash
+# deploy.sh - 生产环境部署脚本
+
+set -euo pipefail  # 遇到错误立即退出
+
+# ========================================
+# 配置
+# ========================================
+
+STACK_NAME="myapp"
+ENVIRONMENT="production"
+DOCKER_REGISTRY="registry.company.com"
+VERSION="${1:-latest}"
+
+# 颜色输出
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'  # No Color
+
+# ========================================
+# 函数定义
+# ========================================
+
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+check_prerequisites() {
+    log_info "Checking prerequisites..."
+
+    # 检查Docker
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker not found"
+        exit 1
+    fi
+
+    # 检查Swarm模式
+    if ! docker info | grep -q "Swarm: active"; then
+        log_error "Docker Swarm is not active"
+        exit 1
+    fi
+
+    # 检查Manager节点
+    MANAGER_COUNT=$(docker node ls --filter "role=manager" --format "{{.ID}}" | wc -l)
+    if [ "$MANAGER_COUNT" -lt 3 ]; then
+        log_warn "Only $MANAGER_COUNT manager nodes (recommended: 3+)"
+    fi
+
+    log_info "✅ Prerequisites check passed"
+}
+
+pull_images() {
+    log_info "Pulling Docker images..."
+
+    docker pull "${DOCKER_REGISTRY}/${STACK_NAME}:${VERSION}"
+    docker pull postgres:15-alpine
+    docker pull redis:7-alpine
+    docker pull nginx:alpine
+
+    log_info "✅ Images pulled successfully"
+}
+
+create_secrets() {
+    log_info "Creating Docker secrets..."
+
+    # 检查秘钥是否已存在
+    if ! docker secret ls | grep -q "db_password"; then
+        echo "$DB_PASSWORD" | docker secret create db_password -
+        log_info "Created secret: db_password"
+    else
+        log_info "Secret already exists: db_password"
+    fi
+
+    if ! docker secret ls | grep -q "jwt_secret"; then
+        openssl rand -base64 32 | docker secret create jwt_secret -
+        log_info "Created secret: jwt_secret"
+    else
+        log_info "Secret already exists: jwt_secret"
+    fi
+}
+
+deploy_stack() {
+    log_info "Deploying stack: ${STACK_NAME}"
+
+    # 导出环境变量
+    export VERSION
+    export ENVIRONMENT
+
+    # 部署Stack
+    docker stack deploy \
+      -c docker-compose.yml \
+      -c docker-compose.${ENVIRONMENT}.yml \
+      --with-registry-auth \
+      ${STACK_NAME}
+
+    log_info "✅ Stack deployed"
+}
+
+wait_for_services() {
+    log_info "Waiting for services to become healthy..."
+
+    local max_wait=300  # 5分钟超时
+    local elapsed=0
+
+    while [ $elapsed -lt $max_wait ]; do
+        local total=$(docker stack services ${STACK_NAME} --format "{{.Name}}" | wc -l)
+        local ready=$(docker stack services ${STACK_NAME} --format "{{.Name}} {{.Replicas}}" | \
+                     grep -E " [0-9]+/\1 " | wc -l)
+
+        if [ "$ready" -eq "$total" ]; then
+            log_info "✅ All services are ready ($ready/$total)"
+            return 0
+        fi
+
+        log_info "Waiting... ($ready/$total services ready)"
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
+
+    log_error "Timeout waiting for services"
+    return 1
+}
+
+run_health_check() {
+    log_info "Running health checks..."
+
+    # 检查应用健康
+    if curl -f -s http://localhost/health > /dev/null; then
+        log_info "✅ Application health check passed"
+    else
+        log_error "Application health check failed"
+        return 1
+    fi
+
+    # 检查数据库连接
+    if docker exec -it $(docker ps -q -f name=${STACK_NAME}_db) \
+       pg_isready -U appuser > /dev/null 2>&1; then
+        log_info "✅ Database health check passed"
+    else
+        log_error "Database health check failed"
+        return 1
+    fi
+}
+
+show_deployment_info() {
+    log_info "Deployment Information:"
+    echo ""
+    echo "Stack Name: ${STACK_NAME}"
+    echo "Environment: ${ENVIRONMENT}"
+    echo "Version: ${VERSION}"
+    echo ""
+    echo "Services:"
+    docker stack services ${STACK_NAME}
+    echo ""
+    echo "Access URLs:"
+    echo "  Application: https://app.example.com"
+    echo "  API: https://api.example.com"
+    echo "  Monitoring: https://grafana.example.com"
+}
+
+cleanup_old_images() {
+    log_info "Cleaning up old images..."
+    docker image prune -f --filter "until=72h"
+    log_info "✅ Cleanup completed"
+}
+
+# ========================================
+# 主流程
+# ========================================
+
+main() {
+    log_info "Starting deployment process..."
+    log_info "============================================"
+
+    # 1. 前置检查
+    check_prerequisites
+
+    # 2. 拉取镜像
+    pull_images
+
+    # 3. 创建秘钥
+    create_secrets
+
+    # 4. 部署Stack
+    deploy_stack
+
+    # 5. 等待服务就绪
+    if ! wait_for_services; then
+        log_error "Deployment failed"
+        log_info "Rolling back..."
+        docker stack rm ${STACK_NAME}
+        exit 1
+    fi
+
+    # 6. 健康检查
+    if ! run_health_check; then
+        log_error "Health check failed"
+        exit 1
+    fi
+
+    # 7. 显示部署信息
+    show_deployment_info
+
+    # 8. 清理旧镜像
+    cleanup_old_images
+
+    log_info "============================================"
+    log_info "✅ Deployment completed successfully!"
+}
+
+# 执行主流程
+main "$@"
+```
+
+**使用部署脚本**:
+
+```bash
+# 赋予执行权限
+$ chmod +x deploy.sh
+
+# 部署指定版本
+$ ./deploy.sh v1.2.3
+
+# 部署latest
+$ ./deploy.sh
+
+# 输出示例:
+[INFO] Starting deployment process...
+[INFO] ============================================
+[INFO] Checking prerequisites...
+[INFO] ✅ Prerequisites check passed
+[INFO] Pulling Docker images...
+[INFO] ✅ Images pulled successfully
+[INFO] Creating Docker secrets...
+[INFO] Created secret: db_password
+[INFO] ✅ Stack deployed
+[INFO] Waiting for services to become healthy...
+[INFO] Waiting... (3/5 services ready)
+[INFO] Waiting... (4/5 services ready)
+[INFO] ✅ All services are ready (5/5)
+[INFO] Running health checks...
+[INFO] ✅ Application health check passed
+[INFO] ✅ Database health check passed
+[INFO] Deployment Information:
+
+Stack Name: myapp
+Environment: production
+Version: v1.2.3
+
+Services:
+ID        NAME           MODE        REPLICAS  IMAGE
+abc123    myapp_app      replicated  6/6       registry.company.com/myapp:v1.2.3
+def456    myapp_db       replicated  1/1       postgres:15-alpine
+...
+
+[INFO] ✅ Deployment completed successfully!
+```
+
+---
+
+## 13.7 本章总结
+
+**核心要点**:
+
+- ✅ **部署架构**: 根据规模选择单机/Swarm/K8s
+- ✅ **服务发现**: Swarm内置DNS + Consul高级特性
+- ✅ **负载均衡**: HAProxy(稳定) vs Traefik(现代化)
+- ✅ **API网关**: Nginx实现认证、限流、缓存
+- ✅ **秘钥管理**: Docker Secrets(简单) vs Vault(企业级)
+- ✅ **配置管理**: 环境变量 + 文件 + 优先级规则
+- ✅ **部署流程**: 自动化脚本 + 健康检查 + 回滚预案
+
+**架构对比**:
+
+| 特性 | 单机 | Swarm | Kubernetes |
+|------|------|-------|-----------|
+| 适用规模 | <10容器 | 10-100节点 | 100+节点 |
+| 复杂度 | ⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+| 高可用 | ❌ | ✅ | ✅ |
+| 自动扩缩容 | ❌ | 手动 | ✅ HPA |
+| 生态系统 | 基础 | 够用 | 丰富 |
+
+---
+
+---
+
+---
+
+# 第14章:高可用性与灾难恢复
+
+## 14.1 高可用架构设计
+
+### 14.1.1 高可用基本原则
+
+**SLA与可用性级别**:
+
+```bash
+# 可用性等级对照表
+┌─────────┬─────────────┬─────────────┬──────────────────┐
+│  级别   │  可用性%    │ 年停机时间  │      适用场景     │
+├─────────┼─────────────┼─────────────┼──────────────────┤
+│  99%    │  Two Nines  │  3.65天     │ 内部工具          │
+│  99.9%  │  Three 9s   │  8.76小时   │ 一般业务系统      │
+│  99.99% │  Four 9s    │  52.56分钟  │ 重要业务系统      │
+│  99.999%│  Five 9s    │  5.26分钟   │ 金融、电商核心    │
+│ 99.9999%│  Six 9s     │  31.5秒     │ 电信运营商        │
+└─────────┴─────────────┴─────────────┴──────────────────┘
+
+# SLA计算公式
+可用性% = (总时间 - 停机时间) / 总时间 × 100%
+
+# 示例: 达到99.99%可用性
+年允许停机时间 = 365天 × 24小时 × 60分钟 × (1 - 0.9999)
+                = 525,600分钟 × 0.0001
+                = 52.56分钟/年
+                ≈ 4.38分钟/月
+```
+
+**高可用设计原则**:
+
+```yaml
+# 1. 消除单点故障(SPOF - Single Point of Failure)
+原则: 任何组件都不应该成为单点故障
+实践:
+  - 所有服务至少2个副本
+  - 数据库主从/集群部署
+  - 负载均衡器双活
+  - 存储冗余(RAID/分布式存储)
+
+# 2. 故障检测与自动恢复
+原则: 快速检测故障并自动恢复
+实践:
+  - 健康检查机制(HTTP/TCP探针)
+  - 自动重启策略
+  - 服务自动注册/注销
+  - 熔断器模式
+
+# 3. 冗余与备份
+原则: 关键数据和服务多副本
+实践:
+  - 数据库实时复制
+  - 定期备份(全量+增量)
+  - 跨可用区部署
+  - 异地灾备
+
+# 4. 降级与限流
+原则: 保证核心功能可用
+实践:
+  - 功能降级开关
+  - 限流保护
+  - 熔断机制
+  - 优雅降级
+
+# 5. 监控与告警
+原则: 实时监控,快速响应
+实践:
+  - 全链路监控
+  - 实时告警
+  - 自动化运维
+  - 事件溯源
+```
+
+---
+
+### 14.1.2 多层级高可用架构
+
+**完整高可用架构图**:
+
+```bash
+# 三层高可用架构
+┌──────────────────────────────────────────────────────────┐
+│                      DNS层(多地域)                        │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│   │  Route53 US  │  │  Route53 EU  │  │  Route53 AS  │  │
+│   │   (主DNS)    │  │   (备DNS)    │  │   (备DNS)    │  │
+│   └──────────────┘  └──────────────┘  └──────────────┘  │
+└──────────────────────────────────────────────────────────┘
+                         │
+┌──────────────────────────────────────────────────────────┐
+│                  CDN/WAF层(边缘加速)                      │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│   │ CloudFlare 1 │  │ CloudFlare 2 │  │ CloudFlare 3 │  │
+│   │   (北美)     │  │   (欧洲)     │  │   (亚太)     │  │
+│   └──────────────┘  └──────────────┘  └──────────────┘  │
+└──────────────────────────────────────────────────────────┘
+                         │
+┌──────────────────────────────────────────────────────────┐
+│              负载均衡层(跨可用区)                         │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│   │  VIP (AZ-A)  │  │  VIP (AZ-B)  │  │  VIP (AZ-C)  │  │
+│   │  HAProxy+    │  │  HAProxy+    │  │  HAProxy+    │  │
+│   │  Keepalived  │  │  Keepalived  │  │  Keepalived  │  │
+│   └──────────────┘  └──────────────┘  └──────────────┘  │
+└──────────────────────────────────────────────────────────┘
+                         │
+┌──────────────────────────────────────────────────────────┐
+│              应用层(Swarm集群)                            │
+│   ┌──────────────────────────────────────────────────┐  │
+│   │  Manager节点(3个,跨AZ)                           │  │
+│   │  ┌─────────┐  ┌─────────┐  ┌─────────┐          │  │
+│   │  │Manager1 │  │Manager2 │  │Manager3 │          │  │
+│   │  │  (AZ-A) │  │  (AZ-B) │  │  (AZ-C) │          │  │
+│   │  └─────────┘  └─────────┘  └─────────┘          │  │
+│   └──────────────────────────────────────────────────┘  │
+│   ┌──────────────────────────────────────────────────┐  │
+│   │  Worker节点(N个,跨AZ)                            │  │
+│   │  ┌────┐┌────┐┌────┐┌────┐┌────┐┌────┐          │  │
+│   │  │W-1 ││W-2 ││W-3 ││W-4 ││W-5 ││W-N │  ...     │  │
+│   │  │AZ-A││AZ-B││AZ-C││AZ-A││AZ-B││AZ-C│          │  │
+│   │  └────┘└────┘└────┘└────┘└────┘└────┘          │  │
+│   └──────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+                         │
+┌──────────────────────────────────────────────────────────┐
+│              数据层(主从+集群)                            │
+│   ┌──────────────────────────────────────────────────┐  │
+│   │  PostgreSQL主从集群                              │  │
+│   │  ┌─────────┐  ┌─────────┐  ┌─────────┐          │  │
+│   │  │ Master  │→→│ Slave1  │  │ Slave2  │          │  │
+│   │  │  (AZ-A) │  │  (AZ-B) │  │  (AZ-C) │          │  │
+│   │  └─────────┘  └─────────┘  └─────────┘          │  │
+│   └──────────────────────────────────────────────────┘  │
+│   ┌──────────────────────────────────────────────────┐  │
+│   │  Redis Sentinel集群                              │  │
+│   │  ┌─────────┐  ┌─────────┐  ┌─────────┐          │  │
+│   │  │ Master  │  │Sentinel1│  │Sentinel2│          │  │
+│   │  │  (AZ-A) │  │  (AZ-B) │  │  (AZ-C) │          │  │
+│   │  └─────────┘  └─────────┘  └─────────┘          │  │
+│   └──────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+                         │
+┌──────────────────────────────────────────────────────────┐
+│              存储层(分布式存储)                           │
+│   ┌──────────────────────────────────────────────────┐  │
+│   │  Ceph/GlusterFS分布式存储                        │  │
+│   │  ┌─────────┐  ┌─────────┐  ┌─────────┐          │  │
+│   │  │  OSD 1  │  │  OSD 2  │  │  OSD 3  │  ...    │  │
+│   │  │  (AZ-A) │  │  (AZ-B) │  │  (AZ-C) │          │  │
+│   │  └─────────┘  └─────────┘  └─────────┘          │  │
+│   └──────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 14.1.3 跨可用区部署实践
+
+**可用区标签配置**:
+
+```bash
+# ========================================
+# 为节点打可用区标签
+# ========================================
+
+# Manager节点
+$ docker node update --label-add zone=us-east-1a manager1
+$ docker node update --label-add zone=us-east-1b manager2
+$ docker node update --label-add zone=us-east-1c manager3
+
+# Worker节点
+$ docker node update --label-add zone=us-east-1a worker1
+$ docker node update --label-add zone=us-east-1a worker2
+$ docker node update --label-add zone=us-east-1b worker3
+$ docker node update --label-add zone=us-east-1b worker4
+$ docker node update --label-add zone=us-east-1c worker5
+$ docker node update --label-add zone=us-east-1c worker6
+
+# 验证标签
+$ docker node ls --format "table {{.Hostname}}\t{{.ManagerStatus}}\t{{.Availability}}"
+HOSTNAME    MANAGER STATUS  AVAILABILITY
+manager1    Leader          Active
+manager2    Reachable       Active
+manager3    Reachable       Active
+worker1                     Active
+worker2                     Active
+worker3                     Active
+
+$ docker node inspect manager1 --format '{{.Spec.Labels.zone}}'
+us-east-1a
+```
+
+**跨可用区服务部署**:
+
+```yaml
+# stack-ha.yml - 高可用Stack配置
+version: '3.8'
+
+services:
+  # ========================================
+  # Web应用(跨AZ分布)
+  # ========================================
+  app:
+    image: myapp:latest
+    deploy:
+      replicas: 9  # 每个AZ至少3个副本
+      placement:
+        max_replicas_per_node: 2  # 单节点最多2个副本
+        constraints:
+          - node.role == worker
+        preferences:
+          - spread: node.labels.zone  # 跨AZ均匀分布
+      update_config:
+        parallelism: 3  # 每次更新3个副本(每个AZ 1个)
+        delay: 10s
+        failure_action: rollback
+        order: start-first  # 先启动新副本再停止旧副本
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    networks:
+      - frontend
+      - backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 40s
+
+  # ========================================
+  # 数据库(主从复制,跨AZ)
+  # ========================================
+  db-master:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_DB: appdb
+      # 主库配置
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+    secrets:
+      - db_password
+    volumes:
+      - db-master-data:/var/lib/postgresql/data
+      - ./postgres/master/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./postgres/master/pg_hba.conf:/etc/postgresql/pg_hba.conf
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.zone == us-east-1a  # 主库固定在AZ-A
+          - node.labels.ssd == true
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  db-slave-1:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      # 从库配置
+      POSTGRES_MASTER_HOST: db-master
+      POSTGRES_MASTER_PORT: 5432
+    secrets:
+      - db_password
+    volumes:
+      - db-slave-1-data:/var/lib/postgresql/data
+      - ./postgres/slave/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./postgres/slave/recovery.conf:/var/lib/postgresql/data/recovery.conf
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1b  # 从库1在AZ-B
+          - node.labels.ssd == true
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    depends_on:
+      - db-master
+
+  db-slave-2:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_MASTER_HOST: db-master
+      POSTGRES_MASTER_PORT: 5432
+    secrets:
+      - db_password
+    volumes:
+      - db-slave-2-data:/var/lib/postgresql/data
+      - ./postgres/slave/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./postgres/slave/recovery.conf:/var/lib/postgresql/data/recovery.conf
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1c  # 从库2在AZ-C
+          - node.labels.ssd == true
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    depends_on:
+      - db-master
+
+  # ========================================
+  # Redis Sentinel高可用
+  # ========================================
+  redis-master:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --appendonly yes
+      --replica-announce-ip redis-master
+    volumes:
+      - redis-master-data:/data
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1a
+
+  redis-sentinel-1:
+    image: redis:7-alpine
+    command: >
+      redis-sentinel /etc/redis/sentinel.conf
+      --sentinel announce-ip redis-sentinel-1
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1a
+
+  redis-sentinel-2:
+    image: redis:7-alpine
+    command: >
+      redis-sentinel /etc/redis/sentinel.conf
+      --sentinel announce-ip redis-sentinel-2
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1b
+
+  redis-sentinel-3:
+    image: redis:7-alpine
+    command: >
+      redis-sentinel /etc/redis/sentinel.conf
+      --sentinel announce-ip redis-sentinel-3
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1c
+
+networks:
+  frontend:
+    driver: overlay
+    attachable: true
+  backend:
+    driver: overlay
+    internal: true
+    attachable: true
+
+volumes:
+  db-master-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=nfs-az-a.example.com,rw
+      device: ":/export/db-master"
+
+  db-slave-1-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=nfs-az-b.example.com,rw
+      device: ":/export/db-slave-1"
+
+  db-slave-2-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=nfs-az-c.example.com,rw
+      device: ":/export/db-slave-2"
+
+  redis-master-data:
+    driver: local
+
+secrets:
+  db_password:
+    external: true
+```
+
+**PostgreSQL主从配置**:
+
+```bash
+# postgres/master/postgresql.conf
+# 主库配置
+
+# 基本设置
+listen_addresses = '*'
+port = 5432
+max_connections = 200
+
+# WAL配置(Write-Ahead Logging)
+wal_level = replica  # 启用流复制
+max_wal_senders = 10  # 最多10个从库
+wal_keep_size = 1GB   # 保留1GB WAL日志
+hot_standby = on      # 启用热备
+
+# 归档配置
+archive_mode = on
+archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+
+# 同步复制(可选,保证数据一致性)
+synchronous_commit = on
+synchronous_standby_names = 'slave1,slave2'
+
+# 性能调优
+shared_buffers = 2GB
+effective_cache_size = 6GB
+maintenance_work_mem = 512MB
+checkpoint_completion_target = 0.9
+wal_buffers = 16MB
+default_statistics_target = 100
+random_page_cost = 1.1
+effective_io_concurrency = 200
+work_mem = 10MB
+min_wal_size = 1GB
+max_wal_size = 4GB
+```
+
+```bash
+# postgres/master/pg_hba.conf
+# 主库访问控制
+
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+# 本地连接
+local   all             all                                     trust
+
+# IPv4本地连接
+host    all             all             127.0.0.1/32            md5
+
+# 允许Swarm网络访问
+host    all             all             10.0.0.0/8              md5
+
+# 允许从库复制
+host    replication     replicator      10.0.0.0/8              md5
+```
+
+```bash
+# postgres/slave/recovery.conf
+# 从库复制配置
+
+# 声明为备库
+standby_mode = 'on'
+
+# 主库连接信息
+primary_conninfo = 'host=db-master port=5432 user=replicator password=ReplicatorPassword123 application_name=slave1'
+
+# 恢复目标时间线
+recovery_target_timeline = 'latest'
+
+# 触发文件(用于手动提升为主库)
+trigger_file = '/tmp/postgresql.trigger'
+
+# 归档恢复
+restore_command = 'cp /archive/%f %p'
+```
+
+**Redis Sentinel配置**:
+
+```bash
+# redis/sentinel.conf
+# Redis Sentinel配置
+
+# 端口
+port 26379
+
+# 工作目录
+dir /tmp
+
+# 监控主库
+# sentinel monitor <master-name> <ip> <port> <quorum>
+sentinel monitor mymaster redis-master 6379 2
+
+# 主库密码
+sentinel auth-pass mymaster ${REDIS_PASSWORD}
+
+# 主库多久无响应视为下线(毫秒)
+sentinel down-after-milliseconds mymaster 5000
+
+# 故障转移超时时间
+sentinel failover-timeout mymaster 60000
+
+# 并行同步的从库数量
+sentinel parallel-syncs mymaster 1
+
+# 通知脚本(可选)
+# sentinel notification-script mymaster /etc/redis/notify.sh
+
+# 客户端重新配置脚本(可选)
+# sentinel client-reconfig-script mymaster /etc/redis/reconfig.sh
+
+# 日志
+logfile "/var/log/redis/sentinel.log"
+loglevel notice
+```
+
+---
+
+## 14.2 故障转移与自动恢复
+
+### 14.2.1 应用层故障转移
+
+**Swarm自动故障转移**:
+
+```bash
+# ========================================
+# Swarm自动故障转移演示
+# ========================================
+
+# 查看服务初始状态
+$ docker service ps myapp_app
+ID      NAME          NODE     DESIRED STATE  CURRENT STATE
+abc123  myapp_app.1   worker1  Running        Running 10 minutes ago
+def456  myapp_app.2   worker2  Running        Running 10 minutes ago
+ghi789  myapp_app.3   worker3  Running        Running 10 minutes ago
+
+# 模拟worker1节点故障(关机)
+$ ssh worker1 "sudo shutdown -h now"
+
+# Swarm自动检测到节点故障
+$ docker node ls
+ID        HOSTNAME    STATUS   AVAILABILITY  MANAGER STATUS
+abc123    manager1    Ready    Active        Leader
+...
+xyz789    worker1     Down     Active
+...
+
+# 服务自动在其他节点重启
+$ docker service ps myapp_app
+ID      NAME              NODE     DESIRED STATE  CURRENT STATE
+abc123  myapp_app.1       worker1  Shutdown       Failed 1 minute ago
+jkl012  \_ myapp_app.1    worker4  Running        Running 30 seconds ago  # ✅ 自动迁移
+def456  myapp_app.2       worker2  Running        Running 10 minutes ago
+ghi789  myapp_app.3       worker3  Running        Running 10 minutes ago
+
+# 节点恢复后,容器不会自动迁移回去(保持稳定)
+$ ssh worker1 "sudo systemctl start docker"
+$ docker node update --availability active worker1
+```
+
+**健康检查与自动重启**:
+
+```yaml
+# 完善的健康检查配置
+services:
+  app:
+    image: myapp:latest
+    healthcheck:
+      # 健康检查命令
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      # 启动宽限期(容器启动后等待40秒再开始检查)
+      start_period: 40s
+      # 检查间隔
+      interval: 10s
+      # 超时时间
+      timeout: 3s
+      # 连续失败3次才视为不健康
+      retries: 3
+    deploy:
+      replicas: 6
+      # 更新配置
+      update_config:
+        # 先启动新容器,健康检查通过后再停止旧容器
+        order: start-first
+        # 每次更新1个副本
+        parallelism: 1
+        # 等待10秒
+        delay: 10s
+        # 失败后自动回滚
+        failure_action: rollback
+        # 监控窗口60秒
+        monitor: 60s
+      # 回滚配置
+      rollback_config:
+        parallelism: 2
+        delay: 5s
+      # 重启策略
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+```
+
+**应用层健康检查实现**:
+
+```python
+# app.py - Flask应用健康检查
+from flask import Flask, jsonify
+import psycopg2
+import redis
+import os
+
+app = Flask(__name__)
+
+# 数据库连接池
+db_pool = None
+redis_client = None
+
+def check_database():
+    """检查数据库连接"""
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv('DB_HOST', 'db-master'),
+            port=5432,
+            user='appuser',
+            password=os.getenv('DB_PASSWORD'),
+            connect_timeout=3
+        )
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Database check failed: {e}")
+        return False
+
+def check_redis():
+    """检查Redis连接"""
+    try:
+        r = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'redis-master'),
+            port=6379,
+            password=os.getenv('REDIS_PASSWORD'),
+            socket_connect_timeout=3
+        )
+        r.ping()
+        return True
+    except Exception as e:
+        print(f"Redis check failed: {e}")
+        return False
+
+@app.route('/health')
+def health():
+    """健康检查端点"""
+    checks = {
+        'status': 'healthy',
+        'database': check_database(),
+        'redis': check_redis(),
+    }
+
+    # 任何依赖失败都返回503
+    if not all(checks.values()):
+        checks['status'] = 'unhealthy'
+        return jsonify(checks), 503
+
+    return jsonify(checks), 200
+
+@app.route('/ready')
+def ready():
+    """就绪检查端点(Kubernetes用)"""
+    # 检查应用是否已完全启动
+    # 可以包含更复杂的逻辑,如缓存预热、配置加载等
+    return jsonify({'status': 'ready'}), 200
+
+@app.route('/live')
+def live():
+    """存活检查端点(Kubernetes用)"""
+    # 简单检查应用进程是否存活
+    return jsonify({'status': 'alive'}), 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+```
+
+---
+
+### 14.2.2 数据库故障转移
+
+**PostgreSQL自动故障转移(使用Patroni)**:
+
+```yaml
+# patroni-stack.yml - PostgreSQL高可用方案
+version: '3.8'
+
+services:
+  # ========================================
+  # etcd集群(Patroni依赖的分布式配置存储)
+  # ========================================
+  etcd-1:
+    image: quay.io/coreos/etcd:v3.5.10
+    environment:
+      ETCD_NAME: etcd-1
+      ETCD_INITIAL_CLUSTER: etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: patroni-cluster
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-1:2379
+    networks:
+      - db-net
+    volumes:
+      - etcd-1-data:/etcd-data
+    deploy:
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1a
+
+  etcd-2:
+    image: quay.io/coreos/etcd:v3.5.10
+    environment:
+      ETCD_NAME: etcd-2
+      ETCD_INITIAL_CLUSTER: etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: patroni-cluster
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-2:2379
+    networks:
+      - db-net
+    volumes:
+      - etcd-2-data:/etcd-data
+    deploy:
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1b
+
+  etcd-3:
+    image: quay.io/coreos/etcd:v3.5.10
+    environment:
+      ETCD_NAME: etcd-3
+      ETCD_INITIAL_CLUSTER: etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: patroni-cluster
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd-3:2379
+    networks:
+      - db-net
+    volumes:
+      - etcd-3-data:/etcd-data
+    deploy:
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1c
+
+  # ========================================
+  # Patroni PostgreSQL节点
+  # ========================================
+  patroni-1:
+    image: patroni/patroni:3.2.0
+    hostname: patroni-1
+    environment:
+      PATRONI_NAME: patroni-1
+      PATRONI_SCOPE: postgres-cluster
+      PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+      PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+      PATRONI_POSTGRESQL_DATA_DIR: /var/lib/postgresql/data
+      PATRONI_ETCD3_HOSTS: etcd-1:2379,etcd-2:2379,etcd-3:2379
+      PATRONI_POSTGRESQL_PGPASS: /tmp/pgpass
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD}
+    volumes:
+      - patroni-1-data:/var/lib/postgresql/data
+      - ./patroni/patroni.yml:/etc/patroni/patroni.yml
+    networks:
+      - db-net
+    ports:
+      - "5432:5432"  # PostgreSQL
+      - "8008:8008"  # Patroni REST API
+    deploy:
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1a
+          - node.labels.ssd == true
+
+  patroni-2:
+    image: patroni/patroni:3.2.0
+    hostname: patroni-2
+    environment:
+      PATRONI_NAME: patroni-2
+      PATRONI_SCOPE: postgres-cluster
+      PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+      PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+      PATRONI_POSTGRESQL_DATA_DIR: /var/lib/postgresql/data
+      PATRONI_ETCD3_HOSTS: etcd-1:2379,etcd-2:2379,etcd-3:2379
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD}
+    volumes:
+      - patroni-2-data:/var/lib/postgresql/data
+      - ./patroni/patroni.yml:/etc/patroni/patroni.yml
+    networks:
+      - db-net
+    deploy:
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1b
+          - node.labels.ssd == true
+
+  patroni-3:
+    image: patroni/patroni:3.2.0
+    hostname: patroni-3
+    environment:
+      PATRONI_NAME: patroni-3
+      PATRONI_SCOPE: postgres-cluster
+      PATRONI_RESTAPI_LISTEN: 0.0.0.0:8008
+      PATRONI_POSTGRESQL_LISTEN: 0.0.0.0:5432
+      PATRONI_POSTGRESQL_DATA_DIR: /var/lib/postgresql/data
+      PATRONI_ETCD3_HOSTS: etcd-1:2379,etcd-2:2379,etcd-3:2379
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: ${REPLICATION_PASSWORD}
+    volumes:
+      - patroni-3-data:/var/lib/postgresql/data
+      - ./patroni/patroni.yml:/etc/patroni/patroni.yml
+    networks:
+      - db-net
+    deploy:
+      placement:
+        constraints:
+          - node.labels.zone == us-east-1c
+          - node.labels.ssd == true
+
+  # ========================================
+  # HAProxy(数据库负载均衡)
+  # ========================================
+  haproxy-db:
+    image: haproxy:2.9-alpine
+    ports:
+      - "5433:5432"  # 主库端口
+      - "5434:5433"  # 从库端口(读负载均衡)
+      - "7000:7000"  # HAProxy统计页面
+    volumes:
+      - ./haproxy/haproxy-db.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - db-net
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.role == manager
+
+networks:
+  db-net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  etcd-1-data:
+  etcd-2-data:
+  etcd-3-data:
+  patroni-1-data:
+  patroni-2-data:
+  patroni-3-data:
+```
+
+**Patroni配置文件**:
+
+```yaml
+# patroni/patroni.yml
+scope: postgres-cluster
+namespace: /service/
+name: ${PATRONI_NAME}
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: ${PATRONI_NAME}:8008
+
+etcd3:
+  hosts: etcd-1:2379,etcd-2:2379,etcd-3:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        max_connections: 200
+        shared_buffers: 2GB
+        effective_cache_size: 6GB
+        maintenance_work_mem: 512MB
+        checkpoint_completion_target: 0.9
+        wal_buffers: 16MB
+        default_statistics_target: 100
+        random_page_cost: 1.1
+        effective_io_concurrency: 200
+        work_mem: 10MB
+        min_wal_size: 1GB
+        max_wal_size: 4GB
+        max_worker_processes: 8
+        max_parallel_workers_per_gather: 4
+        max_parallel_workers: 8
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+  pg_hba:
+    - host replication replicator 0.0.0.0/0 md5
+    - host all all 0.0.0.0/0 md5
+
+  users:
+    admin:
+      password: ${ADMIN_PASSWORD}
+      options:
+        - createrole
+        - createdb
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: ${PATRONI_NAME}:5432
+  data_dir: /var/lib/postgresql/data
+  pgpass: /tmp/pgpass
+  authentication:
+    replication:
+      username: replicator
+      password: ${REPLICATION_PASSWORD}
+    superuser:
+      username: postgres
+      password: ${POSTGRES_PASSWORD}
+  parameters:
+    unix_socket_directories: '/var/run/postgresql'
+
+tags:
+    nofailover: false
+    noloadbalance: false
+    clonefrom: false
+    nosync: false
+```
+
+**HAProxy数据库负载均衡配置**:
+
+```bash
+# haproxy/haproxy-db.cfg
+global
+    log stdout format raw local0 info
+    maxconn 100
+
+defaults
+    log global
+    mode tcp
+    retries 2
+    timeout client 30m
+    timeout connect 4s
+    timeout server 30m
+    timeout check 5s
+
+# 统计页面
+listen stats
+    bind *:7000
+    mode http
+    stats enable
+    stats uri /
+    stats refresh 5s
+
+# 主库(写)
+listen postgres-master
+    bind *:5432
+    mode tcp
+    option httpchk GET /master
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+
+    server patroni-1 patroni-1:5432 check port 8008
+    server patroni-2 patroni-2:5432 check port 8008
+    server patroni-3 patroni-3:5432 check port 8008
+
+# 从库(读,负载均衡)
+listen postgres-replicas
+    bind *:5433
+    mode tcp
+    balance roundrobin
+    option httpchk GET /replica
+    http-check expect status 200
+    default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+
+    server patroni-1 patroni-1:5432 check port 8008
+    server patroni-2 patroni-2:5432 check port 8008
+    server patroni-3 patroni-3:5432 check port 8008
+```
+
+**故障转移测试**:
+
+```bash
+# ========================================
+# 模拟主库故障
+# ========================================
+
+# 查看当前主库
+$ curl -s http://patroni-1:8008/patroni | jq .role
+"master"
+
+$ curl -s http://patroni-2:8008/patroni | jq .role
+"replica"
+
+$ curl -s http://patroni-3:8008/patroni | jq .role
+"replica"
+
+# 停止主库容器(模拟故障)
+$ docker stop $(docker ps -q -f name=patroni-1)
+
+# Patroni自动检测故障并选举新主库(约15-30秒)
+# 查看新主库
+$ curl -s http://patroni-2:8008/patroni | jq .role
+"master"  # ✅ patroni-2已提升为主库
+
+$ curl -s http://patroni-3:8008/patroni | jq .role
+"replica"
+
+# 恢复旧主库
+$ docker start $(docker ps -aq -f name=patroni-1)
+
+# 旧主库自动变为从库
+$ curl -s http://patroni-1:8008/patroni | jq .role
+"replica"  # ✅ patroni-1降级为从库
+
+# 验证数据一致性
+$ docker exec -it $(docker ps -q -f name=patroni-2) \
+  psql -U postgres -c "SELECT pg_current_wal_lsn();"
+ pg_current_wal_lsn
+--------------------
+ 0/5000000
+
+$ docker exec -it $(docker ps -q -f name=patroni-1) \
+  psql -U postgres -c "SELECT pg_last_wal_replay_lsn();"
+ pg_last_wal_replay_lsn
+------------------------
+ 0/5000000  # ✅ 数据已同步
+```
+
+---
+
+### 14.2.3 Redis故障转移(Sentinel)
+
+**Redis Sentinel工作原理**:
+
+```bash
+# Redis Sentinel架构
+┌────────────────────────────────────────────────┐
+│              Redis Sentinel集群                │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐│
+│  │ Sentinel 1  │ │ Sentinel 2  │ │ Sentinel 3  ││
+│  │   (AZ-A)    │ │   (AZ-B)    │ │   (AZ-C)    ││
+│  │ Port: 26379 │ │ Port: 26379 │ │ Port: 26379 ││
+│  └─────────────┘ └─────────────┘ └─────────────┘│
+│         │               │               │        │
+│         └───────────────┼───────────────┘        │
+│                         │                        │
+└─────────────────────────┼────────────────────────┘
+                          │ 监控
+┌─────────────────────────┼────────────────────────┐
+│                Redis数据节点                     │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐│
+│  │   Master    │→│   Replica1  │ │   Replica2  ││
+│  │   (AZ-A)    │ │   (AZ-B)    │ │   (AZ-C)    ││
+│  │ Port: 6379  │ │ Port: 6379  │ │ Port: 6379  ││
+│  └─────────────┘ └─────────────┘ └─────────────┘│
+└──────────────────────────────────────────────────┘
+
+# 故障转移流程:
+1. Sentinel定期PING主库
+2. 超过down-after-milliseconds无响应,标记为主观下线(SDOWN)
+3. 达到quorum个Sentinel确认,标记为客观下线(ODOWN)
+4. Sentinel Leader选举(Raft算法)
+5. Leader发起故障转移:
+   a. 从所有从库中选出新主库(优先级/复制偏移量/RunID)
+   b. 向新主库发送SLAVEOF NO ONE(提升为主库)
+   c. 向其他从库发送SLAVEOF <new-master>
+   d. 更新配置,通知客户端
+```
+
+**应用集成Sentinel**:
+
+```python
+# app.py - Python应用使用Redis Sentinel
+from redis.sentinel import Sentinel
+import os
+
+# Sentinel配置
+SENTINEL_HOSTS = [
+    ('redis-sentinel-1', 26379),
+    ('redis-sentinel-2', 26379),
+    ('redis-sentinel-3', 26379)
+]
+MASTER_NAME = 'mymaster'
+REDIS_PASSWORD = os.getenv('REDIS_PASSWORD')
+
+# 创建Sentinel连接
+sentinel = Sentinel(
+    SENTINEL_HOSTS,
+    socket_timeout=0.5,
+    password=REDIS_PASSWORD
+)
+
+# 获取主库连接(写操作)
+def get_master():
+    return sentinel.master_for(
+        MASTER_NAME,
+        socket_timeout=0.5,
+        password=REDIS_PASSWORD,
+        db=0
+    )
+
+# 获取从库连接(读操作)
+def get_slave():
+    return sentinel.slave_for(
+        MASTER_NAME,
+        socket_timeout=0.5,
+        password=REDIS_PASSWORD,
+        db=0
+    )
+
+# 使用示例
+def set_value(key, value):
+    """写操作(使用主库)"""
+    master = get_master()
+    master.set(key, value)
+    print(f"✅ Set {key}={value} to master")
+
+def get_value(key):
+    """读操作(使用从库)"""
+    slave = get_slave()
+    value = slave.get(key)
+    print(f"✅ Get {key}={value} from slave")
+    return value
+
+# 测试
+if __name__ == '__main__':
+    # 写入数据
+    set_value('user:1001', 'John Doe')
+
+    # 读取数据
+    user = get_value('user:1001')
+    print(f"User: {user}")
+
+    # 查看当前主库信息
+    master_addr = sentinel.discover_master(MASTER_NAME)
+    print(f"Current master: {master_addr}")
+
+    # 查看从库列表
+    slaves = sentinel.discover_slaves(MASTER_NAME)
+    print(f"Slaves: {slaves}")
+```
+
+**故障转移测试**:
+
+```bash
+# ========================================
+# 测试Redis Sentinel故障转移
+# ========================================
+
+# 查看当前主库
+$ docker exec redis-sentinel-1 \
+  redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
+1) "redis-master"
+2) "6379"
+
+# 查看主库信息
+$ docker exec redis-sentinel-1 \
+  redis-cli -p 26379 sentinel master mymaster
+name: mymaster
+ip: redis-master
+port: 6379
+runid: abc123...
+flags: master
+num-slaves: 2
+num-other-sentinels: 2
+
+# 模拟主库故障(暂停容器)
+$ docker pause $(docker ps -q -f name=redis-master)
+
+# Sentinel检测故障并开始选举(约5-10秒)
+$ docker logs -f $(docker ps -q -f name=redis-sentinel-1)
++sdown master mymaster redis-master 6379  # 主观下线
++odown master mymaster redis-master 6379 #quorum 2/2  # 客观下线
++failover-triggered master mymaster redis-master 6379  # 触发故障转移
++failover-state-select-slave master mymaster redis-master 6379  # 选择新主库
++selected-slave slave redis-replica-1:6379 redis-replica-1 6379 @ mymaster redis-master 6379  # 选中replica-1
++failover-state-send-slaveof-noone slave redis-replica-1:6379 redis-replica-1 6379 @ mymaster redis-master 6379  # 提升为主库
++failover-state-reconf-slaves master mymaster redis-master 6379  # 重新配置从库
++slave-reconf-sent slave redis-replica-2:6379 redis-replica-2 6379 @ mymaster redis-master 6379
++failover-end master mymaster redis-master 6379  # 故障转移完成
++switch-master mymaster redis-master 6379 redis-replica-1 6379  # 切换主库
+
+# 验证新主库
+$ docker exec redis-sentinel-1 \
+  redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
+1) "redis-replica-1"  # ✅ 新主库
+2) "6379"
+
+# 恢复旧主库
+$ docker unpause $(docker ps -q -f name=redis-master)
+
+# 旧主库自动变为从库
+$ docker exec $(docker ps -q -f name=redis-master) \
+  redis-cli -a ${REDIS_PASSWORD} info replication | grep role
+role:slave  # ✅ 已降级为从库
+```
+
+---
+
+## 14.3 数据备份策略
+
+### 14.3.1 数据库备份方案
+
+**PostgreSQL完整备份策略**:
+
+```bash
+#!/bin/bash
+# backup-postgres.sh - PostgreSQL自动备份脚本
+
+set -euo pipefail
+
+# ========================================
+# 配置
+# ========================================
+
+BACKUP_DIR="/backup/postgres"
+DB_HOST="${DB_HOST:-db-master}"
+DB_PORT="${DB_PORT:-5432}"
+DB_USER="${DB_USER:-postgres}"
+DB_NAME="${DB_NAME:-appdb}"
+PGPASSWORD="${PGPASSWORD}"
+
+# 备份保留策略
+DAILY_RETENTION=7    # 保留7天的每日备份
+WEEKLY_RETENTION=4   # 保留4周的每周备份
+MONTHLY_RETENTION=12 # 保留12个月的月度备份
+
+DATE=$(date +%Y%m%d)
+TIME=$(date +%H%M%S)
+BACKUP_TYPE="${1:-full}"  # full/incremental
+
+# ========================================
+# 函数定义
+# ========================================
+
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# 全量备份
+full_backup() {
+    local backup_file="${BACKUP_DIR}/full/pg_dump_${DB_NAME}_${DATE}_${TIME}.sql.gz"
+
+    log "Starting full backup to $backup_file"
+
+    # 创建目录
+    mkdir -p "${BACKUP_DIR}/full"
+
+    # 使用pg_dump进行全量备份
+    pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -Fc -Z 9 \
+      --verbose --file="${backup_file%.gz}" "$DB_NAME" 2>&1 | \
+      tee -a "${BACKUP_DIR}/backup.log"
+
+    # 压缩
+    gzip -9 "${backup_file%.gz}"
+
+    # 验证备份
+    if [ -f "$backup_file" ]; then
+        local size=$(du -h "$backup_file" | cut -f1)
+        log "✅ Full backup completed: $backup_file ($size)"
+
+        # 记录备份元数据
+        cat > "${backup_file}.meta" <<EOF
+Backup Date: $(date)
+Database: $DB_NAME
+Type: Full
+Size: $size
+Host: $DB_HOST
+EOF
+    else
+        log "❌ Backup failed!"
+        exit 1
+    fi
+}
+
+# WAL归档备份(增量)
+wal_backup() {
+    local wal_dir="${BACKUP_DIR}/wal"
+    mkdir -p "$wal_dir"
+
+    log "Archiving WAL files to $wal_dir"
+
+    # 触发WAL归档
+    psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -c "SELECT pg_switch_wal();" "$DB_NAME"
+
+    # 复制WAL文件
+    rsync -avz --progress \
+      "${DB_HOST}:/var/lib/postgresql/data/pg_wal/" \
+      "$wal_dir/" \
+      2>&1 | tee -a "${BACKUP_DIR}/backup.log"
+
+    log "✅ WAL backup completed"
+}
+
+# 基础备份(PITR - Point-In-Time Recovery)
+base_backup() {
+    local backup_dir="${BACKUP_DIR}/basebackup/${DATE}"
+
+    log "Starting base backup to $backup_dir"
+
+    mkdir -p "$backup_dir"
+
+    # 使用pg_basebackup
+    pg_basebackup -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" \
+      -D "$backup_dir" -Ft -z -Xs -P \
+      2>&1 | tee -a "${BACKUP_DIR}/backup.log"
+
+    log "✅ Base backup completed"
+}
+
+# 清理旧备份
+cleanup_old_backups() {
+    log "Cleaning up old backups..."
+
+    # 删除超过保留期的每日备份
+    find "${BACKUP_DIR}/full" -name "*.sql.gz" -mtime +${DAILY_RETENTION} -delete
+
+    # 每周备份(保留每周日的备份)
+    # TODO: 实现周备份逻辑
+
+    # 每月备份(保留每月1号的备份)
+    # TODO: 实现月备份逻辑
+
+    log "✅ Cleanup completed"
+}
+
+# 备份到远程存储
+upload_to_s3() {
+    local backup_file="$1"
+
+    log "Uploading backup to S3..."
+
+    # 使用AWS CLI上传到S3
+    aws s3 cp "$backup_file" \
+      "s3://my-backup-bucket/postgres/${DATE}/" \
+      --storage-class STANDARD_IA \
+      2>&1 | tee -a "${BACKUP_DIR}/backup.log"
+
+    log "✅ Upload completed"
+}
+
+# ========================================
+# 主流程
+# ========================================
+
+main() {
+    log "========================================="
+    log "PostgreSQL Backup Started"
+    log "Type: $BACKUP_TYPE"
+    log "========================================="
+
+    # 检查数据库连接
+    if ! pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" > /dev/null 2>&1; then
+        log "❌ Database is not ready!"
+        exit 1
+    fi
+
+    case "$BACKUP_TYPE" in
+        full)
+            full_backup
+            ;;
+        incremental)
+            wal_backup
+            ;;
+        base)
+            base_backup
+            ;;
+        *)
+            log "❌ Unknown backup type: $BACKUP_TYPE"
+            exit 1
+            ;;
+    esac
+
+    # 清理旧备份
+    cleanup_old_backups
+
+    # 上传到S3(可选)
+    if [ -n "${AWS_S3_BUCKET:-}" ]; then
+        upload_to_s3 "${BACKUP_DIR}/full/pg_dump_${DB_NAME}_${DATE}_${TIME}.sql.gz"
+    fi
+
+    log "========================================="
+    log "✅ Backup process completed successfully"
+    log "========================================="
+}
+
+# 执行
+main "$@"
+```
+
+**定时备份Cron配置**:
+
+```yaml
+# backup-cron-stack.yml
+version: '3.8'
+
+services:
+  backup-cron:
+    image: postgres:15-alpine
+    environment:
+      DB_HOST: db-master
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_NAME: appdb
+      PGPASSWORD_FILE: /run/secrets/db_password
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET: my-backup-bucket
+    secrets:
+      - db_password
+    volumes:
+      - backup-data:/backup
+      - ./scripts/backup-postgres.sh:/scripts/backup-postgres.sh:ro
+    networks:
+      - backend
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    command: >
+      sh -c "
+        apk add --no-cache aws-cli rsync &&
+        chmod +x /scripts/backup-postgres.sh &&
+        echo '0 2 * * * /scripts/backup-postgres.sh full >> /backup/cron.log 2>&1' > /etc/crontabs/root &&
+        echo '0 */6 * * * /scripts/backup-postgres.sh incremental >> /backup/cron.log 2>&1' >> /etc/crontabs/root &&
+        crond -f -l 2
+      "
+
+networks:
+  backend:
+    external: true
+
+volumes:
+  backup-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=backup-nfs.example.com,rw
+      device: ":/export/backups"
+
+secrets:
+  db_password:
+    external: true
+```
+
+**数据恢复脚本**:
+
+```bash
+#!/bin/bash
+# restore-postgres.sh - PostgreSQL恢复脚本
+
+set -euo pipefail
+
+BACKUP_FILE="$1"
+DB_HOST="${DB_HOST:-db-master}"
+DB_PORT="${DB_PORT:-5432}"
+DB_USER="${DB_USER:-postgres}"
+DB_NAME="${DB_NAME:-appdb}"
+PGPASSWORD="${PGPASSWORD}"
+
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "========================================="
+log "PostgreSQL Restore Started"
+log "Backup file: $BACKUP_FILE"
+log "========================================="
+
+# 验证备份文件存在
+if [ ! -f "$BACKUP_FILE" ]; then
+    log "❌ Backup file not found: $BACKUP_FILE"
+    exit 1
+fi
+
+# 停止应用服务(避免连接)
+log "Stopping application services..."
+docker service scale myapp_app=0
+
+# 删除现有数据库
+log "Dropping existing database..."
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -c "DROP DATABASE IF EXISTS ${DB_NAME};"
+
+# 创建新数据库
+log "Creating new database..."
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -c "CREATE DATABASE ${DB_NAME};"
+
+# 恢复备份
+log "Restoring backup..."
+if [[ "$BACKUP_FILE" == *.gz ]]; then
+    gunzip -c "$BACKUP_FILE" | pg_restore -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" --verbose
+else
+    pg_restore -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" --verbose "$BACKUP_FILE"
+fi
+
+# 验证恢复
+log "Verifying restore..."
+TABLE_COUNT=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public';")
+log "Restored $TABLE_COUNT tables"
+
+# 重启应用服务
+log "Restarting application services..."
+docker service scale myapp_app=6
+
+log "========================================="
+log "✅ Restore completed successfully"
+log "========================================="
+```
+
+---
+
+### 14.3.2 文件系统备份
+
+**Docker Volume备份**:
+
+```bash
+#!/bin/bash
+# backup-volumes.sh - Docker Volume备份脚本
+
+set -euo pipefail
+
+VOLUME_NAME="$1"
+BACKUP_DIR="/backup/volumes"
+DATE=$(date +%Y%m%d)
+
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+}
+
+# 创建备份目录
+mkdir -p "$BACKUP_DIR"
+
+# 备份Volume
+backup_volume() {
+    local volume="$1"
+    local backup_file="${BACKUP_DIR}/${volume}_${DATE}.tar.gz"
+
+    log "Backing up volume: $volume"
+
+    # 使用临时容器挂载Volume并打包
+    docker run --rm \
+      -v "${volume}:/data:ro" \
+      -v "${BACKUP_DIR}:/backup" \
+      alpine \
+      tar czf "/backup/$(basename $backup_file)" -C /data .
+
+    if [ -f "$backup_file" ]; then
+        local size=$(du -h "$backup_file" | cut -f1)
+        log "✅ Volume backup completed: $backup_file ($size)"
+    else
+        log "❌ Backup failed!"
+        exit 1
+    fi
+}
+
+# 恢复Volume
+restore_volume() {
+    local volume="$1"
+    local backup_file="$2"
+
+    log "Restoring volume: $volume from $backup_file"
+
+    # 创建新Volume(如果不存在)
+    docker volume create "$volume"
+
+    # 使用临时容器解压到Volume
+    docker run --rm \
+      -v "${volume}:/data" \
+      -v "$(dirname $backup_file):/backup:ro" \
+      alpine \
+      tar xzf "/backup/$(basename $backup_file)" -C /data
+
+    log "✅ Volume restored: $volume"
+}
+
+# 列出所有Volume
+list_volumes() {
+    log "Docker Volumes:"
+    docker volume ls --format "table {{.Name}}\t{{.Driver}}\t{{.Mountpoint}}"
+}
+
+# 主流程
+case "${2:-backup}" in
+    backup)
+        backup_volume "$VOLUME_NAME"
+        ;;
+    restore)
+        restore_volume "$VOLUME_NAME" "$3"
+        ;;
+    list)
+        list_volumes
+        ;;
+    *)
+        echo "Usage: $0 <volume-name> [backup|restore|list] [backup-file]"
+        exit 1
+        ;;
+esac
+```
+
+**使用Restic进行增量备份**:
+
+```yaml
+# restic-backup-stack.yml
+version: '3.8'
+
+services:
+  restic-backup:
+    image: restic/restic:latest
+    environment:
+      # Restic仓库配置
+      RESTIC_REPOSITORY: s3:s3.amazonaws.com/my-backup-bucket/restic
+      RESTIC_PASSWORD_FILE: /run/secrets/restic_password
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    secrets:
+      - restic_password
+    volumes:
+      # 需要备份的Volume
+      - app-data:/data/app:ro
+      - db-data:/data/db:ro
+      - redis-data:/data/redis:ro
+    networks:
+      - backend
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    command: >
+      sh -c "
+        # 初始化仓库(仅首次)
+        restic snapshots || restic init &&
+        # 每天凌晨2点执行备份
+        while true; do
+          restic backup /data \
+            --tag daily \
+            --exclude '*.tmp' \
+            --exclude '*.log' &&
+          restic forget \
+            --keep-daily 7 \
+            --keep-weekly 4 \
+            --keep-monthly 12 \
+            --prune &&
+          sleep 86400
+        done
+      "
+
+secrets:
+  restic_password:
+    external: true
+
+networks:
+  backend:
+    external: true
+```
+
+**Restic备份管理**:
+
+```bash
+# ========================================
+# Restic常用命令
+# ========================================
+
+# 查看所有快照
+$ docker exec restic-backup restic snapshots
+ID        Time                 Host        Tags        Paths
+----------------------------------------------------------------------
+abc123    2023-12-04 02:00:01  restic-1    daily       /data
+def456    2023-12-05 02:00:01  restic-1    daily       /data
+ghi789    2023-12-06 02:00:01  restic-1    daily       /data
+
+# 比较两个快照的差异
+$ docker exec restic-backup restic diff abc123 def456
++    /data/app/new-file.txt
+M    /data/db/database.db
+-    /data/redis/old-cache.rdb
+
+# 恢复特定快照
+$ docker exec restic-backup restic restore abc123 \
+  --target /restore \
+  --path /data/app
+
+# 恢复特定文件
+$ docker exec restic-backup restic restore latest \
+  --target /restore \
+  --include /data/app/config.yaml
+
+# 验证备份完整性
+$ docker exec restic-backup restic check
+
+# 查看备份仓库统计
+$ docker exec restic-backup restic stats
+Total File Count:   12345
+Total Size:         10.5 GiB
+```
+
+---
+
+## 14.4 灾难恢复演练
+
+### 14.4.1 灾难恢复计划(DRP)
+
+**RTO与RPO定义**:
+
+```bash
+# 灾难恢复关键指标
+┌───────────────────────────────────────────────────┐
+│                                                   │
+│  正常运行  →  故障发生  →  检测故障  →  恢复完成  │
+│             ↑          ↑            ↑            │
+│             │          │            │            │
+│          故障时间      │         恢复时间        │
+│                     检测时间                      │
+│             ←──────────────────────→             │
+│                      RTO                         │
+│             ←──────────────→                     │
+│                  RPO                             │
+└───────────────────────────────────────────────────┘
+
+# RTO (Recovery Time Objective) - 恢复时间目标
+定义: 从故障发生到系统恢复正常的最大可接受时间
+示例:
+  - Tier 1: RTO < 5分钟   (关键业务)
+  - Tier 2: RTO < 1小时   (重要业务)
+  - Tier 3: RTO < 24小时  (一般业务)
+
+# RPO (Recovery Point Objective) - 恢复点目标
+定义: 系统可接受的最大数据丢失量
+示例:
+  - Tier 1: RPO = 0       (实时同步,零数据丢失)
+  - Tier 2: RPO < 15分钟  (5分钟一次增量备份)
+  - Tier 3: RPO < 24小时  (每日全量备份)
+```
+
+**灾难恢复等级**:
+
+```yaml
+# 灾难恢复等级划分
+Tier 0: 无灾备
+  - RTO: 无限制
+  - RPO: 最后一次备份
+  - 成本: 最低
+  - 适用: 非关键系统
+
+Tier 1: 冷备份
+  - RTO: 24-72小时
+  - RPO: 24小时
+  - 方案: 定期离线备份
+  - 成本: 低
+  - 适用: 内部工具
+
+Tier 2: 温备份
+  - RTO: 4-12小时
+  - RPO: 1-4小时
+  - 方案: 定期在线备份 + 异地存储
+  - 成本: 中等
+  - 适用: 一般业务系统
+
+Tier 3: 热备份
+  - RTO: 1-4小时
+  - RPO: 15分钟-1小时
+  - 方案: 实时复制 + 异地备机
+  - 成本: 较高
+  - 适用: 重要业务系统
+
+Tier 4: 双活(主备)
+  - RTO: 10-30分钟
+  - RPO: 几分钟
+  - 方案: 主备数据库 + 自动故障转移
+  - 成本: 高
+  - 适用: 核心业务
+
+Tier 5: 多活(异地多活)
+  - RTO: < 5分钟
+  - RPO: 几秒(准实时)
+  - 方案: 多数据中心同时提供服务
+  - 成本: 非常高
+  - 适用: 金融、电商核心
+```
+
+---
+
+### 14.4.2 灾难场景演练
+
+**场景1: 单节点故障**:
+
+```bash
+# ========================================
+# 演练步骤
+# ========================================
+
+# 1. 记录初始状态
+$ docker service ps myapp_app
+ID      NAME          NODE     DESIRED STATE  CURRENT STATE
+abc123  myapp_app.1   worker1  Running        Running 1 hour ago
+def456  myapp_app.2   worker2  Running        Running 1 hour ago
+ghi789  myapp_app.3   worker3  Running        Running 1 hour ago
+
+# 2. 模拟worker1节点故障
+$ ssh worker1 "sudo systemctl stop docker"
+
+# 3. 观察Swarm自动恢复
+$ watch -n 1 'docker service ps myapp_app'
+# 约30秒后,容器自动在worker4启动
+
+# 4. 验证服务可用性
+$ for i in {1..100}; do
+    curl -s http://app.example.com/health || echo "FAIL"
+  done | grep -c FAIL
+0  # ✅ 无失败请求
+
+# 5. 检查数据一致性
+$ curl http://app.example.com/api/users/count
+{"count": 10000}  # ✅ 数据无丢失
+
+# 6. 恢复节点
+$ ssh worker1 "sudo systemctl start docker"
+
+# 7. 记录恢复时间
+RTO实际: 约35秒
+RPO实际: 0(无数据丢失)
+```
+
+**场景2: 数据库主库故障**:
+
+```bash
+# ========================================
+# 演练步骤
+# ========================================
+
+# 1. 记录当前主库
+$ curl http://patroni-1:8008/patroni | jq .role
+"master"
+
+# 2. 记录最后一笔交易
+$ psql -h db-master -U postgres -d appdb -c \
+  "SELECT MAX(id) FROM transactions;"
+ max
+-------
+ 100000
+
+# 3. 模拟主库故障
+$ docker stop patroni-1
+
+# 4. 观察自动故障转移
+$ watch -n 1 'curl -s http://patroni-2:8008/patroni | jq .role'
+# 约15秒后变为"master"
+
+# 5. 验证数据一致性
+$ psql -h patroni-2 -U postgres -d appdb -c \
+  "SELECT MAX(id) FROM transactions;"
+ max
+-------
+ 100000  # ✅ 数据一致
+
+# 6. 验证应用仍可写入
+$ curl -X POST http://app.example.com/api/transactions \
+  -d '{"amount": 100}'
+{"id": 100001, "status": "success"}  # ✅ 写入成功
+
+# 7. 恢复旧主库
+$ docker start patroni-1
+
+# 8. 验证旧主库降级为从库
+$ curl -s http://patroni-1:8008/patroni | jq .role
+"replica"  # ✅ 已降级
+
+# 9. 记录恢复时间
+检测时间: 约5秒
+故障转移时间: 约15秒
+RTO实际: 约20秒
+RPO实际: 0(同步复制,无数据丢失)
+```
+
+**场景3: 可用区故障(AZ-A完全不可用)**:
+
+```bash
+# ========================================
+# 演练步骤
+# ========================================
+
+# 1. 记录AZ-A的资源
+$ docker node ls --filter "node.labels.zone=us-east-1a"
+ID        HOSTNAME    STATUS  AVAILABILITY
+abc123    manager1    Ready   Active
+def456    worker1     Ready   Active
+ghi789    worker2     Ready   Active
+
+# 2. 模拟AZ-A完全故障(网络隔离)
+$ for node in manager1 worker1 worker2; do
+    ssh $node "sudo iptables -A INPUT -j DROP"
+    ssh $node "sudo iptables -A OUTPUT -j DROP"
+  done
+
+# 3. 观察Manager Leader切换
+$ docker node ls
+ID        HOSTNAME    STATUS   AVAILABILITY  MANAGER STATUS
+abc123    manager1    Unknown  Active        Unreachable
+xyz789    manager2    Ready    Active        Leader  # ✅ 新Leader
+...
+
+# 4. 观察服务自动重新调度
+$ docker service ps myapp_app
+# AZ-A的容器全部迁移到AZ-B和AZ-C
+
+# 5. 验证数据库主库状态
+# 如果主库在AZ-A,Patroni会自动选举AZ-B或AZ-C的从库为主库
+
+# 6. 验证服务可用性
+$ for i in {1..1000}; do
+    curl -s -o /dev/null -w "%{http_code}\n" http://app.example.com/
+  done | grep -v 200 | wc -l
+5  # ✅ 仅5个请求失败(0.5%错误率)
+
+# 7. 恢复AZ-A
+$ for node in manager1 worker1 worker2; do
+    ssh $node "sudo iptables -F"
+  done
+
+# 8. 记录恢复时间
+检测时间: 约10秒
+服务迁移时间: 约60秒
+RTO实际: 约70秒
+RPO实际: 0(数据库主从同步)
+受影响请求: 5/1000 (0.5%)
+```
+
+**场景4: 完整灾难恢复(从备份恢复)**:
+
+```bash
+# ========================================
+# 演练步骤
+# ========================================
+
+# 1. 模拟灾难(删除所有数据)
+$ docker stack rm myapp
+$ docker volume rm postgres-data redis-data
+
+# 2. 从最新备份恢复
+LATEST_BACKUP=$(ls -t /backup/postgres/full/*.sql.gz | head -1)
+echo "Restoring from: $LATEST_BACKUP"
+
+# 3. 重新部署基础设施
+$ docker stack deploy -c stack.yml myapp
+
+# 4. 等待数据库就绪
+$ docker exec -it $(docker ps -q -f name=myapp_db) \
+  pg_isready -U appuser
+/var/run/postgresql:5432 - accepting connections
+
+# 5. 恢复数据库
+$ ./restore-postgres.sh "$LATEST_BACKUP"
+
+# 6. 恢复Redis数据
+$ docker run --rm \
+  -v redis-data:/data \
+  -v /backup/redis:/backup:ro \
+  redis:7-alpine \
+  sh -c "redis-cli --rdb /backup/dump.rdb > /data/dump.rdb"
+
+# 7. 验证数据完整性
+$ psql -h db-master -U postgres -d appdb -c \
+  "SELECT COUNT(*) FROM users;"
+ count
+--------
+ 10000  # ✅ 数据恢复成功
+
+# 8. 重启应用服务
+$ docker service scale myapp_app=6
+
+# 9. 验证服务可用
+$ curl http://app.example.com/health
+{"status": "healthy"}  # ✅ 服务正常
+
+# 10. 记录恢复时间
+基础设施部署: 约5分钟
+数据库恢复: 约10分钟
+服务启动: 约2分钟
+RTO实际: 约17分钟
+RPO实际: 约6小时(最后一次备份)
+```
+
+---
+
+## 14.5 本章总结
+
+**核心要点**:
+
+- ✅ **高可用原则**: 消除SPOF、自动恢复、跨AZ部署、降级限流
+- ✅ **故障转移**: Swarm自动调度、Patroni数据库HA、Redis Sentinel
+- ✅ **备份策略**: 全量+增量、定期+实时、本地+异地、自动化备份
+- ✅ **灾难恢复**: RTO/RPO目标、定期演练、自动化恢复、多级容灾
+
+**高可用检查清单**:
+
+```yaml
+应用层:
+  - [x] 服务至少3个副本
+  - [x] 跨可用区分布
+  - [x] 健康检查配置
+  - [x] 自动重启策略
+  - [x] 滚动更新配置
+
+负载均衡层:
+  - [x] HAProxy/Traefik高可用
+  - [x] Keepalived VIP漂移
+  - [x] 健康检查探针
+  - [x] 会话保持(如需要)
+
+数据库层:
+  - [x] 主从复制/Patroni集群
+  - [x] 自动故障转移
+  - [x] 数据同步复制
+  - [x] 定期备份
+  - [x] PITR能力
+
+存储层:
+  - [x] 分布式存储(NFS/Ceph)
+  - [x] 数据冗余(RAID/副本)
+  - [x] 快照备份
+  - [x] 异地备份
+
+监控告警:
+  - [x] 全链路监控
+  - [x] 实时告警
+  - [x] 故障自愈
+  - [x] 事件溯源
+```
+
+**SLA达成策略**:
+
+| 目标SLA | 架构要求 | 备份策略 | 预计成本 |
+|---------|---------|---------|---------|
+| 99.9%   | 单AZ,主从 | 每日备份 | 基准 |
+| 99.99%  | 跨AZ,集群 | 每小时备份 | 2-3x |
+| 99.999% | 多数据中心 | 实时同步 | 5-10x |
+
+---
+
+📝 **下一章预告**: Prometheus监控部署、Grafana可视化、AlertManager告警、APM性能监控
+
+---
+
+*（第14章完成,约1400行。已完成14章,剩余5章...）*
