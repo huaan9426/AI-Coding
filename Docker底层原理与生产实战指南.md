@@ -14385,4 +14385,2668 @@ RPO实际: 约6小时(最后一次备份)
 
 ---
 
-*（第14章完成,约1400行。已完成14章,剩余5章...）*
+*（第14章完成,约2100行。已完成14章,剩余5章...）*
+
+---
+
+# 第十五章: 监控告警体系
+
+> **本章目标**: 掌握Docker生产环境完整监控方案,包括Prometheus+Grafana+AlertManager的企业级部署、自定义告警规则设计、分布式追踪系统集成,以及APM性能监控实践。
+
+---
+
+## 15.1 监控体系架构设计
+
+### 15.1.1 监控层次模型
+
+**完整监控金字塔**:
+
+```yaml
+┌─────────────────────────────────────────────┐
+│         业务监控 (Business Metrics)          │  ← 核心业务指标
+│  - 订单成功率、用户活跃度、转化率            │
+├─────────────────────────────────────────────┤
+│         应用监控 (Application Metrics)       │  ← APM、慢查询、异常
+│  - QPS、延迟、错误率、调用链                │
+├─────────────────────────────────────────────┤
+│         中间件监控 (Middleware Metrics)      │  ← Redis、MySQL、MQ
+│  - 连接数、缓存命中率、队列深度              │
+├─────────────────────────────────────────────┤
+│         容器监控 (Container Metrics)         │  ← Docker运行时
+│  - CPU、内存、网络IO、磁盘IO                │
+├─────────────────────────────────────────────┤
+│         主机监控 (Host Metrics)              │  ← 操作系统层
+│  - 系统负载、磁盘空间、网卡流量              │
+└─────────────────────────────────────────────┘
+```
+
+**监控数据流架构**:
+
+```yaml
+[应用服务] ──metrics──> [Prometheus Exporter]
+    │                          │
+    │                          ├──> [Prometheus Server] ──> [Grafana]
+    │                          │           │
+    │                          │           └──> [AlertManager] ──> [钉钉/邮件/PagerDuty]
+    │                          │
+    ├──traces──> [Jaeger Collector] ──> [Jaeger Query UI]
+    │
+    └──logs────> [Fluentd] ──> [Elasticsearch] ──> [Kibana]
+
+[Grafana] ←──查询──┐
+                   ├── [Prometheus]
+                   ├── [Jaeger]
+                   └── [Elasticsearch]
+```
+
+### 15.1.2 监控指标分类(四大黄金信号)
+
+**Google SRE四大黄金信号**:
+
+| 信号类型 | 指标名称 | 采集方式 | 告警阈值示例 |
+|---------|---------|---------|-------------|
+| **Latency(延迟)** | http_request_duration_seconds | Histogram | P95 > 1s |
+| **Traffic(流量)** | http_requests_total | Counter | QPS < 100(流量骤降) |
+| **Errors(错误率)** | http_requests_failed_total | Counter | 错误率 > 1% |
+| **Saturation(饱和度)** | container_memory_usage_percent | Gauge | 内存 > 80% |
+
+**实际案例: Web服务监控指标**:
+
+```python
+# app.py - 应用埋点示例
+from prometheus_client import Counter, Histogram, Gauge
+import time
+
+# 1. Traffic: 请求总数
+http_requests_total = Counter(
+    'http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status']
+)
+
+# 2. Latency: 请求延迟分布
+http_request_duration_seconds = Histogram(
+    'http_request_duration_seconds',
+    'HTTP request latency',
+    ['method', 'endpoint'],
+    buckets=[0.01, 0.05, 0.1, 0.5, 1.0, 5.0]  # 自定义分位桶
+)
+
+# 3. Errors: 错误计数
+http_requests_failed_total = Counter(
+    'http_requests_failed_total',
+    'Total failed HTTP requests',
+    ['method', 'endpoint', 'error_type']
+)
+
+# 4. Saturation: 当前并发连接数
+active_connections = Gauge(
+    'active_connections',
+    'Number of active connections'
+)
+
+# 业务指标
+order_total = Counter('order_total', 'Total orders', ['status'])
+order_amount = Histogram('order_amount', 'Order amount distribution')
+
+@app.route('/api/order', methods=['POST'])
+def create_order():
+    start_time = time.time()
+    active_connections.inc()
+
+    try:
+        # 业务逻辑
+        order = process_order(request.json)
+
+        # 记录指标
+        order_total.labels(status='success').inc()
+        order_amount.observe(order['amount'])
+        http_requests_total.labels(
+            method='POST',
+            endpoint='/api/order',
+            status='200'
+        ).inc()
+
+        return jsonify(order), 200
+
+    except Exception as e:
+        http_requests_failed_total.labels(
+            method='POST',
+            endpoint='/api/order',
+            error_type=type(e).__name__
+        ).inc()
+        http_requests_total.labels(
+            method='POST',
+            endpoint='/api/order',
+            status='500'
+        ).inc()
+        raise
+
+    finally:
+        # 记录延迟
+        duration = time.time() - start_time
+        http_request_duration_seconds.labels(
+            method='POST',
+            endpoint='/api/order'
+        ).observe(duration)
+        active_connections.dec()
+```
+
+---
+
+## 15.2 Prometheus完整部署
+
+### 15.2.1 Prometheus高可用架构
+
+**生产环境架构图**:
+
+```yaml
+                    ┌─────────────────┐
+                    │   Grafana       │
+                    │   (读取数据)     │
+                    └────────┬────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+    ┌─────▼─────┐      ┌─────▼─────┐      ┌─────▼─────┐
+    │Prometheus1│      │Prometheus2│      │Prometheus3│
+    │  (主)     │      │  (主)     │      │  (主)     │
+    └─────┬─────┘      └─────┬─────┘      └─────┬─────┘
+          │                  │                  │
+          └──────────────────┼──────────────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  Thanos Sidecar │ ← 长期存储方案
+                    │  (对象存储)      │
+                    └─────────────────┘
+                             │
+                    ┌────────▼────────┐
+                    │   S3/MinIO      │
+                    │  (历史数据)      │
+                    └─────────────────┘
+
+特点:
+- 多个Prometheus并行抓取(避免单点)
+- Thanos提供全局视图和长期存储
+- 数据保留策略: 本地15天 + 对象存储永久
+```
+
+### 15.2.2 Prometheus Stack部署
+
+**目录结构**:
+
+```bash
+monitoring/
+├── prometheus/
+│   ├── prometheus.yml          # 主配置
+│   ├── rules/
+│   │   ├── alerts.yml         # 告警规则
+│   │   ├── recording.yml      # 预聚合规则
+│   │   └── docker.yml         # Docker专用规则
+│   └── targets/
+│       ├── nodes.yml          # 节点发现
+│       └── containers.yml     # 容器发现
+├── grafana/
+│   ├── provisioning/
+│   │   ├── datasources/       # 数据源配置
+│   │   └── dashboards/        # 看板配置
+│   └── dashboards/
+│       ├── docker.json
+│       ├── postgres.json
+│       └── app.json
+├── alertmanager/
+│   └── alertmanager.yml       # 告警路由配置
+└── stack.yml                  # Docker Compose配置
+```
+
+**1. Prometheus主配置文件**:
+
+```yaml
+# prometheus/prometheus.yml
+global:
+  scrape_interval: 15s          # 默认抓取间隔
+  scrape_timeout: 10s
+  evaluation_interval: 15s      # 规则评估间隔
+
+  external_labels:
+    cluster: 'docker-swarm-prod'
+    region: 'us-west-2'
+    environment: 'production'
+
+# 告警管理器配置
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+      timeout: 10s
+      api_version: v2
+
+# 加载告警规则
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
+
+# 抓取配置
+scrape_configs:
+  # ========================================
+  # 1. Prometheus自身监控
+  # ========================================
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+          - localhost:9090
+        labels:
+          service: 'prometheus'
+
+  # ========================================
+  # 2. Node Exporter(主机监控)
+  # ========================================
+  - job_name: 'node-exporter'
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/targets/nodes.yml'
+        refresh_interval: 30s
+    relabel_configs:
+      # 从__meta_标签提取实例名
+      - source_labels: [__meta_instance]
+        target_label: instance
+      - source_labels: [__meta_datacenter]
+        target_label: datacenter
+
+  # ========================================
+  # 3. cAdvisor(容器监控)
+  # ========================================
+  - job_name: 'cadvisor'
+    dns_sd_configs:
+      - names:
+          - 'tasks.cadvisor'  # Swarm服务发现
+        type: 'A'
+        port: 8080
+        refresh_interval: 30s
+    relabel_configs:
+      # 仅保留Docker容器指标
+      - source_labels: [container_label_com_docker_swarm_service_name]
+        action: keep
+        regex: .+
+      # 添加服务名标签
+      - source_labels: [container_label_com_docker_swarm_service_name]
+        target_label: service
+      - source_labels: [container_label_com_docker_swarm_task_name]
+        target_label: task
+
+  # ========================================
+  # 4. Docker Engine Metrics
+  # ========================================
+  - job_name: 'docker-engine'
+    static_configs:
+      - targets:
+          - 'node1:9323'
+          - 'node2:9323'
+          - 'node3:9323'
+    metrics_path: '/metrics'
+
+  # ========================================
+  # 5. PostgreSQL Exporter
+  # ========================================
+  - job_name: 'postgres'
+    static_configs:
+      - targets:
+          - 'postgres-exporter:9187'
+        labels:
+          database: 'appdb'
+          role: 'master'
+
+  # ========================================
+  # 6. Redis Exporter
+  # ========================================
+  - job_name: 'redis'
+    static_configs:
+      - targets:
+          - 'redis-exporter:9121'
+        labels:
+          cache: 'main'
+
+  # ========================================
+  # 7. 应用自定义指标
+  # ========================================
+  - job_name: 'app-metrics'
+    dns_sd_configs:
+      - names:
+          - 'tasks.myapp'
+        type: 'A'
+        port: 8000
+        refresh_interval: 15s
+    metrics_path: '/metrics'
+    relabel_configs:
+      - source_labels: [__meta_dockerswarm_service_label_app]
+        target_label: app
+      - source_labels: [__meta_dockerswarm_service_label_version]
+        target_label: version
+
+  # ========================================
+  # 8. Blackbox Exporter(黑盒探测)
+  # ========================================
+  - job_name: 'blackbox-http'
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - https://api.example.com/health
+          - https://app.example.com
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  # ========================================
+  # 9. NGINX Exporter
+  # ========================================
+  - job_name: 'nginx'
+    static_configs:
+      - targets:
+          - 'nginx-exporter:9113'
+        labels:
+          proxy: 'main'
+
+# 存储配置
+storage:
+  tsdb:
+    path: /prometheus
+    retention:
+      time: 15d              # 本地保留15天
+      size: 50GB             # 最大磁盘用量
+    wal_compression: true    # WAL压缩(节省30%空间)
+
+# 远程写入(可选,用于长期存储)
+remote_write:
+  - url: http://thanos-receiver:19291/api/v1/receive
+    queue_config:
+      max_samples_per_send: 10000
+      batch_send_deadline: 10s
+      max_retries: 3
+```
+
+**2. 节点发现配置**:
+
+```yaml
+# prometheus/targets/nodes.yml
+- targets:
+    - '192.168.1.10:9100'
+  labels:
+    instance: 'swarm-manager-1'
+    datacenter: 'dc1'
+    zone: 'us-west-2a'
+
+- targets:
+    - '192.168.1.11:9100'
+  labels:
+    instance: 'swarm-manager-2'
+    datacenter: 'dc1'
+    zone: 'us-west-2b'
+
+- targets:
+    - '192.168.1.12:9100'
+  labels:
+    instance: 'swarm-manager-3'
+    datacenter: 'dc1'
+    zone: 'us-west-2c'
+
+- targets:
+    - '192.168.1.21:9100'
+    - '192.168.1.22:9100'
+    - '192.168.1.23:9100'
+  labels:
+    datacenter: 'dc1'
+    role: 'worker'
+```
+
+**3. Docker Compose Stack配置**:
+
+```yaml
+# monitoring/stack.yml
+version: '3.8'
+
+services:
+  # ========================================
+  # Prometheus Server
+  # ========================================
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--storage.tsdb.retention.size=50GB'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'              # 允许热重载
+      - '--web.enable-admin-api'              # 启用管理API
+      - '--query.max-concurrency=50'          # 最大并发查询
+      - '--query.timeout=2m'                  # 查询超时
+    volumes:
+      - prometheus-data:/prometheus
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - ./prometheus/targets:/etc/prometheus/targets:ro
+    networks:
+      - monitoring
+    ports:
+      - "9090:9090"
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ========================================
+  # AlertManager
+  # ========================================
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--cluster.advertise-address=0.0.0.0:9093'
+      - '--web.external-url=http://alertmanager.example.com'
+    volumes:
+      - alertmanager-data:/alertmanager
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks:
+      - monitoring
+    ports:
+      - "9093:9093"
+    deploy:
+      mode: replicated
+      replicas: 3  # 高可用部署
+      placement:
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ========================================
+  # Node Exporter(每个节点)
+  # ========================================
+  node-exporter:
+    image: prom/node-exporter:v1.6.1
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+      - '--collector.netclass.ignored-devices=^(veth.*|br-.*|docker.*)$$'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - monitoring
+    ports:
+      - "9100:9100"
+    deploy:
+      mode: global  # 每个节点一个实例
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 128M
+
+  # ========================================
+  # cAdvisor(容器监控)
+  # ========================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.0
+    command:
+      - '--docker_only=true'
+      - '--housekeeping_interval=30s'
+      - '--disable_metrics=disk,network,tcp,udp,percpu,sched,process'
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    networks:
+      - monitoring
+    ports:
+      - "8080:8080"
+    deploy:
+      mode: global
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 256M
+
+  # ========================================
+  # Postgres Exporter
+  # ========================================
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.13.2
+    environment:
+      DATA_SOURCE_NAME: "postgresql://exporter:${POSTGRES_EXPORTER_PASSWORD}@postgres:5432/appdb?sslmode=disable"
+    networks:
+      - monitoring
+      - backend
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  # ========================================
+  # Redis Exporter
+  # ========================================
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.52.0
+    environment:
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+    networks:
+      - monitoring
+      - backend
+    deploy:
+      mode: replicated
+      replicas: 1
+
+  # ========================================
+  # Blackbox Exporter(探测)
+  # ========================================
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.24.0
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    networks:
+      - monitoring
+    ports:
+      - "9115:9115"
+    deploy:
+      mode: replicated
+      replicas: 2
+
+networks:
+  monitoring:
+    driver: overlay
+    attachable: true
+  backend:
+    external: true
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+```
+
+**4. 启用Docker Engine Metrics**:
+
+```bash
+# /etc/docker/daemon.json - 所有节点
+{
+  "metrics-addr": "0.0.0.0:9323",
+  "experimental": true
+}
+
+# 重启Docker
+$ sudo systemctl restart docker
+
+# 验证
+$ curl http://localhost:9323/metrics | grep engine_daemon
+# engine_daemon_container_actions_seconds_count{action="start"} 1234
+```
+
+### 15.2.3 告警规则配置
+
+**1. Docker容器告警规则**:
+
+```yaml
+# prometheus/rules/docker.yml
+groups:
+  - name: docker_containers
+    interval: 30s
+    rules:
+      # ========================================
+      # 容器状态告警
+      # ========================================
+      - alert: ContainerDown
+        expr: |
+          up{job="cadvisor"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "容器 {{ $labels.instance }} 已下线"
+          description: "容器 {{ $labels.container_label_com_docker_swarm_service_name }} 在节点 {{ $labels.instance }} 上无法访问超过1分钟"
+
+      - alert: ContainerRestarting
+        expr: |
+          rate(container_last_seen{name!=""}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          category: stability
+        annotations:
+          summary: "容器频繁重启"
+          description: "容器 {{ $labels.name }} 在过去5分钟内重启了 {{ $value | humanize }} 次"
+
+      # ========================================
+      # CPU告警
+      # ========================================
+      - alert: ContainerCpuUsageHigh
+        expr: |
+          (sum(rate(container_cpu_usage_seconds_total{name!=""}[5m])) by (name, instance)
+          /
+          sum(container_spec_cpu_quota{name!=""}/container_spec_cpu_period{name!=""}) by (name, instance))
+          * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "容器CPU使用率过高"
+          description: "容器 {{ $labels.name }} 在节点 {{ $labels.instance }} 上CPU使用率为 {{ $value | humanizePercentage }},已持续10分钟"
+
+      - alert: ContainerCpuThrottling
+        expr: |
+          rate(container_cpu_cfs_throttled_seconds_total{name!=""}[5m]) > 0.3
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "容器CPU被限流"
+          description: "容器 {{ $labels.name }} CPU被限流时间占比 {{ $value | humanizePercentage }},建议增加CPU配额"
+
+      # ========================================
+      # 内存告警
+      # ========================================
+      - alert: ContainerMemoryUsageHigh
+        expr: |
+          (container_memory_usage_bytes{name!=""}
+          /
+          container_spec_memory_limit_bytes{name!=""})
+          * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "容器内存使用率过高"
+          description: "容器 {{ $labels.name }} 内存使用率为 {{ $value | humanizePercentage }}"
+
+      - alert: ContainerMemoryOOM
+        expr: |
+          container_memory_failcnt{name!=""} > 0
+        for: 1m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "容器发生OOM"
+          description: "容器 {{ $labels.name }} 发生内存溢出,failcnt={{ $value }}"
+
+      # ========================================
+      # 网络告警
+      # ========================================
+      - alert: ContainerNetworkReceiveErrors
+        expr: |
+          rate(container_network_receive_errors_total{name!=""}[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+          category: network
+        annotations:
+          summary: "容器网络接收错误率高"
+          description: "容器 {{ $labels.name }} 网络接收错误率 {{ $value | humanize }} errors/s"
+
+      # ========================================
+      # 磁盘告警
+      # ========================================
+      - alert: ContainerDiskUsageHigh
+        expr: |
+          (container_fs_usage_bytes{name!=""}
+          /
+          container_fs_limit_bytes{name!=""})
+          * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+          category: storage
+        annotations:
+          summary: "容器磁盘使用率过高"
+          description: "容器 {{ $labels.name }} 磁盘使用率 {{ $value | humanizePercentage }}"
+
+  # ========================================
+  # Swarm集群告警
+  # ========================================
+  - name: docker_swarm
+    interval: 60s
+    rules:
+      - alert: SwarmNodeDown
+        expr: |
+          swarm_node_status{state="ready"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: infrastructure
+        annotations:
+          summary: "Swarm节点下线"
+          description: "节点 {{ $labels.node_name }} 状态异常"
+
+      - alert: SwarmManagerQuorumLost
+        expr: |
+          count(swarm_manager_is_leader) < 2
+        for: 1m
+        labels:
+          severity: critical
+          category: infrastructure
+        annotations:
+          summary: "Swarm Manager仲裁丢失"
+          description: "当前仅有 {{ $value }} 个Manager节点,集群无法正常工作"
+
+      - alert: SwarmServiceReplicasDown
+        expr: |
+          (swarm_service_replicas_desired - swarm_service_replicas_running) > 0
+        for: 5m
+        labels:
+          severity: warning
+          category: availability
+        annotations:
+          summary: "服务副本数不足"
+          description: "服务 {{ $labels.service_name }} 期望副本数 {{ $labels.desired }},实际运行 {{ $labels.running }}"
+```
+
+**2. 主机监控告警规则**:
+
+```yaml
+# prometheus/rules/alerts.yml
+groups:
+  - name: host_alerts
+    interval: 30s
+    rules:
+      # CPU告警
+      - alert: HostCpuUsageHigh
+        expr: |
+          100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "主机CPU使用率过高"
+          description: "主机 {{ $labels.instance }} CPU使用率 {{ $value | humanizePercentage }}"
+
+      # 内存告警
+      - alert: HostMemoryUsageHigh
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "主机内存使用率过高"
+          description: "主机 {{ $labels.instance }} 内存使用率 {{ $value | humanizePercentage }}"
+
+      # 磁盘空间告警
+      - alert: HostDiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes{fstype=~"ext4|xfs"}
+          /
+          node_filesystem_size_bytes{fstype=~"ext4|xfs"})
+          * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "主机磁盘空间不足"
+          description: "主机 {{ $labels.instance }} 挂载点 {{ $labels.mountpoint }} 剩余空间仅 {{ $value | humanizePercentage }}"
+
+      # 磁盘IO告警
+      - alert: HostDiskIOUtilizationHigh
+        expr: |
+          rate(node_disk_io_time_seconds_total[5m]) * 100 > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "主机磁盘IO利用率高"
+          description: "主机 {{ $labels.instance }} 磁盘 {{ $labels.device }} IO利用率 {{ $value | humanizePercentage }}"
+
+      # 网络带宽告警(假设千兆网卡)
+      - alert: HostNetworkBandwidthSaturated
+        expr: |
+          rate(node_network_receive_bytes_total{device!~"lo|veth.*|br-.*"}[5m]) * 8 / 1000000000 > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "主机网络带宽接近饱和"
+          description: "主机 {{ $labels.instance }} 网卡 {{ $labels.device }} 接收带宽 {{ $value | humanize }} Gbps"
+```
+
+**3. 应用层告警规则**:
+
+```yaml
+# prometheus/rules/app.yml
+groups:
+  - name: application_alerts
+    interval: 15s
+    rules:
+      # ========================================
+      # 四大黄金信号
+      # ========================================
+
+      # 1. Latency: 延迟告警
+      - alert: ApiLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint)
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "API延迟过高"
+          description: "接口 {{ $labels.endpoint }} P95延迟为 {{ $value | humanizeDuration }}"
+
+      # 2. Traffic: 流量异常
+      - alert: ApiTrafficDrop
+        expr: |
+          (rate(http_requests_total[5m])
+          /
+          rate(http_requests_total[5m] offset 1h)) < 0.5
+        for: 10m
+        labels:
+          severity: warning
+          category: business
+        annotations:
+          summary: "API流量骤降"
+          description: "接口 {{ $labels.endpoint }} 流量相比1小时前下降 {{ $value | humanizePercentage }}"
+
+      # 3. Errors: 错误率告警
+      - alert: ApiErrorRateHigh
+        expr: |
+          (sum(rate(http_requests_total{status=~"5.."}[5m])) by (endpoint)
+          /
+          sum(rate(http_requests_total[5m])) by (endpoint))
+          * 100 > 1
+        for: 5m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "API错误率过高"
+          description: "接口 {{ $labels.endpoint }} 5xx错误率 {{ $value | humanizePercentage }}"
+
+      # 4. Saturation: 饱和度告警
+      - alert: ApiConcurrencyHigh
+        expr: |
+          active_connections > 1000
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "API并发连接数过高"
+          description: "当前并发连接数 {{ $value }},接近系统上限"
+
+      # ========================================
+      # 数据库告警
+      # ========================================
+      - alert: PostgresConnectionPoolExhausted
+        expr: |
+          (pg_stat_database_numbackends / pg_settings_max_connections) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL连接池接近耗尽"
+          description: "数据库 {{ $labels.datname }} 连接使用率 {{ $value | humanizePercentage }}"
+
+      - alert: PostgresSlowQueries
+        expr: |
+          rate(pg_stat_statements_mean_time_seconds[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL慢查询增多"
+          description: "平均查询时间 {{ $value | humanizeDuration }}"
+
+      # ========================================
+      # Redis告警
+      # ========================================
+      - alert: RedisCacheHitRateLow
+        expr: |
+          (redis_keyspace_hits_total / (redis_keyspace_hits_total + redis_keyspace_misses_total)) * 100 < 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis缓存命中率低"
+          description: "当前命中率 {{ $value | humanizePercentage }},建议检查缓存策略"
+
+      - alert: RedisMemoryUsageHigh
+        expr: |
+          (redis_memory_used_bytes / redis_memory_max_bytes) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis内存使用率过高"
+          description: "内存使用率 {{ $value | humanizePercentage }}"
+```
+
+**4. Recording Rules(预聚合规则)**:
+
+```yaml
+# prometheus/rules/recording.yml
+groups:
+  - name: recording_rules
+    interval: 30s
+    rules:
+      # 预聚合常用查询(提高查询性能)
+
+      # 容器CPU使用率(按服务聚合)
+      - record: service:container_cpu_usage:rate5m
+        expr: |
+          sum(rate(container_cpu_usage_seconds_total{name!=""}[5m])) by (
+            container_label_com_docker_swarm_service_name
+          )
+
+      # 容器内存使用率(按服务聚合)
+      - record: service:container_memory_usage:percent
+        expr: |
+          sum(container_memory_usage_bytes{name!=""}) by (
+            container_label_com_docker_swarm_service_name
+          )
+          /
+          sum(container_spec_memory_limit_bytes{name!=""}) by (
+            container_label_com_docker_swarm_service_name
+          )
+          * 100
+
+      # API请求QPS(按endpoint聚合)
+      - record: endpoint:http_requests:rate1m
+        expr: |
+          sum(rate(http_requests_total[1m])) by (endpoint, method)
+
+      # API P95延迟(按endpoint聚合)
+      - record: endpoint:http_request_duration:p95
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint)
+          )
+
+      # API错误率(按endpoint聚合)
+      - record: endpoint:http_errors:rate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (endpoint)
+          /
+          sum(rate(http_requests_total[5m])) by (endpoint)
+```
+
+### 15.2.4 部署与验证
+
+```bash
+# ========================================
+# 1. 准备配置文件
+# ========================================
+$ cd monitoring
+
+# 验证Prometheus配置语法
+$ docker run --rm \
+  -v $(pwd)/prometheus:/etc/prometheus \
+  prom/prometheus:v2.47.0 \
+  promtool check config /etc/prometheus/prometheus.yml
+# ✅ SUCCESS: /etc/prometheus/prometheus.yml is valid prometheus config file syntax
+
+# 验证告警规则语法
+$ docker run --rm \
+  -v $(pwd)/prometheus:/etc/prometheus \
+  prom/prometheus:v2.47.0 \
+  promtool check rules /etc/prometheus/rules/*.yml
+# ✅ SUCCESS: 45 rules found
+
+# ========================================
+# 2. 部署Stack
+# ========================================
+$ docker stack deploy -c stack.yml monitoring
+
+# 查看服务状态
+$ docker stack services monitoring
+ID         NAME                      MODE      REPLICAS   IMAGE
+abc123     monitoring_prometheus     replicated   1/1     prom/prometheus:v2.47.0
+def456     monitoring_alertmanager   replicated   3/3     prom/alertmanager:v0.26.0
+ghi789     monitoring_node-exporter  global       6/6     prom/node-exporter:v1.6.1
+jkl012     monitoring_cadvisor       global       6/6     gcr.io/cadvisor/cadvisor:v0.47.0
+
+# ========================================
+# 3. 访问Prometheus UI
+# ========================================
+$ open http://prometheus.example.com:9090
+
+# 验证Target状态
+# 访问: http://prometheus.example.com:9090/targets
+# 确认所有Target状态为UP
+
+# ========================================
+# 4. 测试PromQL查询
+# ========================================
+
+# 查询容器CPU使用率TOP 10
+$ curl -G 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=topk(10, service:container_cpu_usage:rate5m)'
+
+# 查询API错误率
+$ curl -G 'http://localhost:9090/api/v1/query' \
+  --data-urlencode 'query=endpoint:http_errors:rate5m > 0.01'
+
+# ========================================
+# 5. 热重载配置(无需重启)
+# ========================================
+$ curl -X POST http://localhost:9090/-/reload
+# ✅ 配置已重载
+
+# ========================================
+# 6. 验证告警规则
+# ========================================
+$ curl http://localhost:9090/api/v1/rules | jq '.data.groups[] | .name'
+"docker_containers"
+"docker_swarm"
+"host_alerts"
+"application_alerts"
+
+# 查看当前触发的告警
+$ curl http://localhost:9090/api/v1/alerts | jq '.data.alerts[] | select(.state=="firing")'
+```
+
+---
+
+## 15.3 Grafana可视化看板
+
+### 15.3.1 Grafana部署与配置
+
+**1. Grafana Stack配置**:
+
+```yaml
+# monitoring/stack.yml (添加到现有配置)
+services:
+  grafana:
+    image: grafana/grafana:10.1.0
+    environment:
+      # 基础配置
+      GF_SERVER_ROOT_URL: "http://grafana.example.com"
+      GF_SERVER_DOMAIN: "grafana.example.com"
+
+      # 安全配置
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_SECURITY_SECRET_KEY__FILE: /run/secrets/grafana_secret_key
+
+      # 数据库配置(使用PostgreSQL而非默认SQLite)
+      GF_DATABASE_TYPE: postgres
+      GF_DATABASE_HOST: postgres:5432
+      GF_DATABASE_NAME: grafana
+      GF_DATABASE_USER: grafana
+      GF_DATABASE_PASSWORD__FILE: /run/secrets/grafana_db_password
+
+      # 用户认证
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_BASIC_ENABLED: "true"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+
+      # SMTP邮件告警(可选)
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: "smtp.example.com:587"
+      GF_SMTP_USER: "alerts@example.com"
+      GF_SMTP_PASSWORD__FILE: /run/secrets/smtp_password
+      GF_SMTP_FROM_ADDRESS: "alerts@example.com"
+      GF_SMTP_FROM_NAME: "Grafana Alerts"
+
+      # 性能优化
+      GF_DATAPROXY_TIMEOUT: "300"
+      GF_DATAPROXY_MAX_IDLE_CONNS: "100"
+
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    secrets:
+      - grafana_admin_password
+      - grafana_db_password
+      - grafana_secret_key
+      - smtp_password
+    networks:
+      - monitoring
+      - backend
+    ports:
+      - "3000:3000"
+    deploy:
+      mode: replicated
+      replicas: 2  # 高可用部署
+      placement:
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+      restart_policy:
+        condition: on-failure
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+secrets:
+  grafana_admin_password:
+    external: true
+  grafana_db_password:
+    external: true
+  grafana_secret_key:
+    external: true
+  smtp_password:
+    external: true
+
+volumes:
+  grafana-data:
+```
+
+**2. 创建Secrets**:
+
+```bash
+# 创建Grafana管理员密码
+$ echo "YourStrongPassword123!" | docker secret create grafana_admin_password -
+
+# 创建数据库密码
+$ echo "GrafanaDBPass456" | docker secret create grafana_db_password -
+
+# 创建密钥(用于Cookie加密)
+$ openssl rand -base64 32 | docker secret create grafana_secret_key -
+
+# 创建SMTP密码
+$ echo "smtp-password" | docker secret create smtp_password -
+```
+
+**3. 数据源自动配置**:
+
+```yaml
+# grafana/provisioning/datasources/prometheus.yml
+apiVersion: 1
+
+datasources:
+  # Prometheus主数据源
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: "30s"
+      queryTimeout: "300s"
+      httpMethod: POST  # 使用POST发送长查询
+      customQueryParameters: ""
+      manageAlerts: true
+      prometheusType: Prometheus
+      prometheusVersion: 2.47.0
+      cacheLevel: 'High'
+      incrementalQuerying: true
+      incrementalQueryOverlapWindow: "10m"
+      disableRecordingRules: false
+
+  # Alertmanager数据源
+  - name: Alertmanager
+    type: alertmanager
+    access: proxy
+    url: http://alertmanager:9093
+    editable: false
+    jsonData:
+      implementation: prometheus
+```
+
+**4. 看板自动加载配置**:
+
+```yaml
+# grafana/provisioning/dashboards/default.yml
+apiVersion: 1
+
+providers:
+  - name: 'Default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true
+```
+
+### 15.3.2 生产级Dashboard设计
+
+**1. Docker Swarm集群监控面板**:
+
+```json
+{
+  "dashboard": {
+    "title": "Docker Swarm Cluster Overview",
+    "tags": ["docker", "swarm", "infrastructure"],
+    "timezone": "browser",
+    "refresh": "30s",
+    "time": {
+      "from": "now-6h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "集群健康状态",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "count(swarm_node_status{state=\"ready\"})",
+            "legendFormat": "在线节点"
+          },
+          {
+            "expr": "count(swarm_node_status) - count(swarm_node_status{state=\"ready\"})",
+            "legendFormat": "离线节点"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 3, "color": "green"}
+              ]
+            },
+            "unit": "short"
+          }
+        },
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "服务运行状态",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "count(swarm_service_replicas_running == swarm_service_replicas_desired)",
+            "legendFormat": "健康服务"
+          },
+          {
+            "expr": "count(swarm_service_replicas_running != swarm_service_replicas_desired)",
+            "legendFormat": "异常服务"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "集群CPU使用率",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+            "legendFormat": "平均CPU使用率"
+          },
+          {
+            "expr": "100 - (rate(node_cpu_seconds_total{mode=\"idle\"}[5m]) * 100)",
+            "legendFormat": "{{ instance }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "max": 100, "min": 0}
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}
+      },
+      {
+        "id": 4,
+        "title": "集群内存使用率",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+            "legendFormat": "{{ instance }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "max": 100, "min": 0}
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}
+      },
+      {
+        "id": 5,
+        "title": "容器运行数量",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "count(container_last_seen{name!=\"\"}) by (instance)",
+            "legendFormat": "{{ instance }}"
+          }
+        ],
+        "gridPos": {"h": 6, "w": 8, "x": 0, "y": 12}
+      },
+      {
+        "id": 6,
+        "title": "网络流量",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(container_network_receive_bytes_total[5m])) by (instance)",
+            "legendFormat": "{{ instance }} 接收"
+          },
+          {
+            "expr": "sum(rate(container_network_transmit_bytes_total[5m])) by (instance) * -1",
+            "legendFormat": "{{ instance }} 发送"
+          }
+        ],
+        "yaxes": [
+          {"format": "Bps"}
+        ],
+        "gridPos": {"h": 6, "w": 8, "x": 8, "y": 12}
+      },
+      {
+        "id": 7,
+        "title": "磁盘IO",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(node_disk_read_bytes_total[5m])) by (instance)",
+            "legendFormat": "{{ instance }} 读"
+          },
+          {
+            "expr": "sum(rate(node_disk_written_bytes_total[5m])) by (instance) * -1",
+            "legendFormat": "{{ instance }} 写"
+          }
+        ],
+        "yaxes": [
+          {"format": "Bps"}
+        ],
+        "gridPos": {"h": 6, "w": 8, "x": 16, "y": 12}
+      }
+    ]
+  }
+}
+```
+
+**将上述JSON保存为**: `grafana/dashboards/docker-swarm.json`
+
+**2. 应用性能监控面板(APM)**:
+
+```json
+{
+  "dashboard": {
+    "title": "Application Performance Monitoring",
+    "tags": ["apm", "application", "performance"],
+    "panels": [
+      {
+        "id": 1,
+        "title": "请求速率(QPS)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total[1m])) by (endpoint)",
+            "legendFormat": "{{ endpoint }}"
+          }
+        ],
+        "yaxes": [{"format": "reqps"}],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "请求延迟分布",
+        "type": "heatmap",
+        "targets": [
+          {
+            "expr": "sum(rate(http_request_duration_seconds_bucket[5m])) by (le)",
+            "format": "heatmap",
+            "legendFormat": "{{ le }}"
+          }
+        ],
+        "dataFormat": "tsbuckets",
+        "yAxis": {"format": "s"},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "错误率(%)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "(sum(rate(http_requests_total{status=~\"5..\"}[5m])) by (endpoint) / sum(rate(http_requests_total[5m])) by (endpoint)) * 100",
+            "legendFormat": "{{ endpoint }}"
+          }
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [1], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "60s",
+          "handler": 1,
+          "name": "API错误率告警",
+          "noDataState": "no_data",
+          "notifications": [
+            {"uid": "alertmanager"}
+          ]
+        },
+        "yaxes": [{"format": "percent"}],
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "id": 4,
+        "title": "P95/P99延迟",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint))",
+            "legendFormat": "P95 - {{ endpoint }}"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint))",
+            "legendFormat": "P99 - {{ endpoint }}"
+          }
+        ],
+        "yaxes": [{"format": "s"}],
+        "gridPos": {"h": 6, "w": 12, "x": 12, "y": 8}
+      },
+      {
+        "id": 5,
+        "title": "并发连接数",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "active_connections",
+            "legendFormat": "当前连接"
+          }
+        ],
+        "gridPos": {"h": 6, "w": 8, "x": 0, "y": 14}
+      },
+      {
+        "id": 6,
+        "title": "数据库连接池",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "pg_stat_database_numbackends",
+            "legendFormat": "{{ datname }}"
+          },
+          {
+            "expr": "pg_settings_max_connections",
+            "legendFormat": "最大连接数"
+          }
+        ],
+        "gridPos": {"h": 6, "w": 8, "x": 8, "y": 14}
+      },
+      {
+        "id": 7,
+        "title": "Redis命中率",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "(redis_keyspace_hits_total / (redis_keyspace_hits_total + redis_keyspace_misses_total)) * 100"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 80, "color": "yellow"},
+                {"value": 95, "color": "green"}
+              ]
+            },
+            "unit": "percent"
+          }
+        },
+        "gridPos": {"h": 6, "w": 8, "x": 16, "y": 14}
+      }
+    ]
+  }
+}
+```
+
+**保存为**: `grafana/dashboards/apm.json`
+
+**3. 导入社区优质Dashboard**:
+
+```bash
+# 推荐的社区Dashboard ID列表:
+
+# Docker & Container监控
+- 893   # Docker & System Monitoring
+- 179   # Docker Prometheus Monitoring
+- 10619 # Docker Swarm & Container Overview
+
+# Node Exporter主机监控
+- 1860  # Node Exporter Full
+- 11074 # Node Exporter for Prometheus Dashboard
+
+# PostgreSQL监控
+- 9628  # PostgreSQL Database
+- 12485 # PostgreSQL Patroni
+
+# Redis监控
+- 11835 # Redis Dashboard for Prometheus
+- 2751  # Prometheus Redis
+
+# Nginx监控
+- 12708 # Nginx Prometheus Exporter
+```
+
+**导入方式**:
+
+```bash
+# 方法1: Grafana UI导入
+# 访问: http://grafana.example.com
+# Dashboard → Import → 输入ID → Load
+
+# 方法2: API导入
+$ curl -X POST http://admin:password@grafana.example.com/api/dashboards/import \
+  -H "Content-Type: application/json" \
+  -d '{
+    "dashboard": {
+      "id": null,
+      "uid": null,
+      "title": "Node Exporter Full"
+    },
+    "inputs": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "pluginId": "prometheus",
+        "value": "Prometheus"
+      }
+    ],
+    "overwrite": true,
+    "folderId": 0
+  }'
+```
+
+### 15.3.3 告警通知配置
+
+**Grafana原生告警(Unified Alerting)**:
+
+```yaml
+# grafana/provisioning/alerting/contact-points.yml
+apiVersion: 1
+
+contactPoints:
+  # 钉钉通知
+  - orgId: 1
+    name: dingtalk
+    receivers:
+      - uid: dingtalk-webhook
+        type: webhook
+        settings:
+          url: https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN
+          httpMethod: POST
+          maxAlerts: 10
+        disableResolveMessage: false
+
+  # 邮件通知
+  - orgId: 1
+    name: email
+    receivers:
+      - uid: email-ops
+        type: email
+        settings:
+          addresses: ops-team@example.com
+          singleEmail: false
+        disableResolveMessage: false
+
+  # Slack通知
+  - orgId: 1
+    name: slack
+    receivers:
+      - uid: slack-alerts
+        type: slack
+        settings:
+          url: https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+          recipient: '#alerts'
+          username: Grafana
+        disableResolveMessage: false
+
+  # PagerDuty(生产事故)
+  - orgId: 1
+    name: pagerduty
+    receivers:
+      - uid: pagerduty-critical
+        type: pagerduty
+        settings:
+          integrationKey: YOUR_PAGERDUTY_KEY
+          severity: critical
+        disableResolveMessage: false
+```
+
+```yaml
+# grafana/provisioning/alerting/notification-policies.yml
+apiVersion: 1
+
+policies:
+  - orgId: 1
+    receiver: dingtalk  # 默认接收者
+    group_by: ['alertname', 'severity']
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+    routes:
+      # Critical告警 → PagerDuty + 钉钉
+      - receiver: pagerduty
+        continue: true
+        matchers:
+          - severity = critical
+        group_wait: 10s
+        repeat_interval: 1h
+
+      # 数据库告警 → 专门的DBA团队
+      - receiver: email-dba
+        matchers:
+          - category = database
+        group_interval: 10m
+
+      # 业务告警 → 业务团队
+      - receiver: slack-business
+        matchers:
+          - category = business
+        group_interval: 15m
+```
+
+---
+
+## 15.4 AlertManager告警路由
+
+### 15.4.1 AlertManager配置
+
+```yaml
+# alertmanager/alertmanager.yml
+global:
+  # SMTP配置
+  smtp_smarthost: 'smtp.example.com:587'
+  smtp_from: 'alertmanager@example.com'
+  smtp_auth_username: 'alertmanager@example.com'
+  smtp_auth_password: 'smtp-password'
+  smtp_require_tls: true
+
+  # Slack全局配置
+  slack_api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+
+  # 钉钉Webhook
+  http_config:
+    proxy_url: ''
+
+# 路由树
+route:
+  receiver: 'default-receiver'
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 30s        # 分组等待时间(收集同组告警)
+  group_interval: 5m     # 分组发送间隔
+  repeat_interval: 4h    # 重复告警间隔
+
+  # 子路由
+  routes:
+    # ========================================
+    # 1. Critical告警 → 立即通知多个渠道
+    # ========================================
+    - receiver: 'critical-alerts'
+      continue: true  # 继续匹配其他路由
+      matchers:
+        - severity = critical
+      group_wait: 10s
+      group_interval: 5m
+      repeat_interval: 30m
+
+    # ========================================
+    # 2. 基础设施告警 → 运维团队
+    # ========================================
+    - receiver: 'infra-team'
+      matchers:
+        - category = infrastructure
+      group_by: ['alertname', 'instance']
+      group_interval: 10m
+
+    # ========================================
+    # 3. 数据库告警 → DBA团队
+    # ========================================
+    - receiver: 'dba-team'
+      matchers:
+        - category = database
+      group_by: ['alertname', 'instance', 'datname']
+
+    # ========================================
+    # 4. 应用告警 → 开发团队
+    # ========================================
+    - receiver: 'dev-team'
+      matchers:
+        - category =~ "performance|availability"
+      group_by: ['alertname', 'service', 'endpoint']
+
+    # ========================================
+    # 5. 工作时间外的非Critical告警 → 抑制
+    # ========================================
+    - receiver: 'null'  # 黑洞接收者
+      matchers:
+        - severity != critical
+      time_intervals:
+        - offhours
+
+    # ========================================
+    # 6. 测试环境告警 → 单独渠道
+    # ========================================
+    - receiver: 'test-env'
+      matchers:
+        - environment = test
+      group_interval: 1h
+      repeat_interval: 24h
+
+# 接收者配置
+receivers:
+  # ========================================
+  # 默认接收者(钉钉)
+  # ========================================
+  - name: 'default-receiver'
+    webhook_configs:
+      - url: 'http://dingtalk-webhook:8060/dingtalk/webhook1/send'
+        send_resolved: true
+        http_config:
+          proxy_url: ''
+
+  # ========================================
+  # Critical告警(多渠道通知)
+  # ========================================
+  - name: 'critical-alerts'
+    # 钉钉(带@所有人)
+    webhook_configs:
+      - url: 'http://dingtalk-webhook:8060/dingtalk/webhook-critical/send'
+        send_resolved: true
+
+    # 邮件
+    email_configs:
+      - to: 'ops-oncall@example.com,cto@example.com'
+        from: 'alertmanager@example.com'
+        smarthost: 'smtp.example.com:587'
+        auth_username: 'alertmanager@example.com'
+        auth_password: 'smtp-password'
+        headers:
+          Subject: '🚨 [CRITICAL] {{ .GroupLabels.alertname }}'
+        html: |
+          <!DOCTYPE html>
+          <html>
+          <body>
+            <h2 style="color: red;">🚨 严重告警</h2>
+            <table border="1" cellpadding="5">
+              <tr><th>告警名称</th><td>{{ .GroupLabels.alertname }}</td></tr>
+              <tr><th>严重级别</th><td>{{ .GroupLabels.severity }}</td></tr>
+              <tr><th>触发时间</th><td>{{ .StartsAt.Format "2006-01-02 15:04:05" }}</td></tr>
+              <tr><th>告警数量</th><td>{{ len .Alerts }}</td></tr>
+            </table>
+            <h3>详细信息:</h3>
+            <ul>
+            {{ range .Alerts }}
+              <li>
+                <strong>{{ .Labels.alertname }}</strong><br>
+                {{ .Annotations.summary }}<br>
+                <em>{{ .Annotations.description }}</em>
+              </li>
+            {{ end }}
+            </ul>
+            <a href="{{ .ExternalURL }}">查看AlertManager</a>
+          </body>
+          </html>
+        send_resolved: true
+
+    # Slack
+    slack_configs:
+      - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+        channel: '#critical-alerts'
+        username: 'AlertManager'
+        color: 'danger'
+        title: '🚨 CRITICAL ALERT'
+        text: |
+          *Alert:* {{ .GroupLabels.alertname }}
+          *Severity:* {{ .GroupLabels.severity }}
+          *Summary:* {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
+        send_resolved: true
+
+    # PagerDuty(仅Critical)
+    pagerduty_configs:
+      - service_key: 'YOUR_PAGERDUTY_SERVICE_KEY'
+        description: '{{ .GroupLabels.alertname }}: {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+        severity: 'critical'
+        details:
+          firing: '{{ .Alerts.Firing | len }}'
+          resolved: '{{ .Alerts.Resolved | len }}'
+
+  # ========================================
+  # 运维团队
+  # ========================================
+  - name: 'infra-team'
+    webhook_configs:
+      - url: 'http://dingtalk-webhook:8060/dingtalk/infra/send'
+        send_resolved: true
+    email_configs:
+      - to: 'infra-team@example.com'
+        html: '{{ template "email.html" . }}'
+
+  # ========================================
+  # DBA团队
+  # ========================================
+  - name: 'dba-team'
+    webhook_configs:
+      - url: 'http://dingtalk-webhook:8060/dingtalk/dba/send'
+        send_resolved: true
+    email_configs:
+      - to: 'dba-team@example.com'
+        html: '{{ template "email.html" . }}'
+
+  # ========================================
+  # 开发团队
+  # ========================================
+  - name: 'dev-team'
+    slack_configs:
+      - channel: '#dev-alerts'
+        title: '⚠️ Application Alert'
+        text: |
+          *Service:* {{ .GroupLabels.service }}
+          *Endpoint:* {{ .GroupLabels.endpoint }}
+          {{ range .Alerts }}
+          • {{ .Annotations.summary }}
+          {{ end }}
+        send_resolved: true
+
+  # ========================================
+  # 测试环境
+  # ========================================
+  - name: 'test-env'
+    webhook_configs:
+      - url: 'http://dingtalk-webhook:8060/dingtalk/test/send'
+        send_resolved: false  # 测试环境不发送恢复通知
+
+  # ========================================
+  # 黑洞接收者(抑制告警)
+  # ========================================
+  - name: 'null'
+
+# 抑制规则
+inhibit_rules:
+  # ========================================
+  # 1. 节点Down时,抑制该节点上的所有容器告警
+  # ========================================
+  - source_matchers:
+      - alertname = HostDown
+    target_matchers:
+      - alertname = ContainerDown
+    equal:
+      - instance
+
+  # ========================================
+  # 2. 服务Down时,抑制该服务的性能告警
+  # ========================================
+  - source_matchers:
+      - severity = critical
+      - alertname = ServiceDown
+    target_matchers:
+      - severity = warning
+      - category = performance
+    equal:
+      - service
+
+  # ========================================
+  # 3. 数据库主库故障时,抑制从库告警
+  # ========================================
+  - source_matchers:
+      - alertname = PostgresMasterDown
+    target_matchers:
+      - alertname =~ "Postgres.*"
+      - role = slave
+    equal:
+      - cluster
+
+# 时间段定义
+time_intervals:
+  # 工作时间外(晚上22:00 - 早上08:00, 周末全天)
+  - name: offhours
+    time_intervals:
+      - times:
+          - start_time: '22:00'
+            end_time: '08:00'
+      - weekdays: ['saturday', 'sunday']
+
+  # 仅工作时间
+  - name: workhours
+    time_intervals:
+      - times:
+          - start_time: '09:00'
+            end_time: '18:00'
+        weekdays: ['monday:friday']
+
+# 模板
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+```
+
+### 15.4.2 钉钉Webhook集成
+
+**使用Prometheus Webhook Dingtalk**:
+
+```yaml
+# monitoring/stack.yml (添加到现有配置)
+services:
+  dingtalk-webhook:
+    image: timonwong/prometheus-webhook-dingtalk:v2.1.0
+    command:
+      - '--config.file=/etc/prometheus-webhook-dingtalk/config.yml'
+      - '--web.listen-address=:8060'
+      - '--web.enable-ui'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./dingtalk/config.yml:/etc/prometheus-webhook-dingtalk/config.yml:ro
+      - ./dingtalk/templates:/etc/prometheus-webhook-dingtalk/templates:ro
+    networks:
+      - monitoring
+    ports:
+      - "8060:8060"
+    deploy:
+      mode: replicated
+      replicas: 2
+```
+
+```yaml
+# dingtalk/config.yml
+templates:
+  - /etc/prometheus-webhook-dingtalk/templates/default.tmpl
+
+targets:
+  # 默认Webhook(普通告警)
+  webhook1:
+    url: https://oapi.dingtalk.com/robot/send?access_token=YOUR_ACCESS_TOKEN_1
+    secret: YOUR_SECRET_1  # 钉钉机器人密钥
+    mention:
+      all: false
+
+  # Critical告警Webhook(@所有人)
+  webhook-critical:
+    url: https://oapi.dingtalk.com/robot/send?access_token=YOUR_ACCESS_TOKEN_2
+    secret: YOUR_SECRET_2
+    mention:
+      all: true  # @所有人
+
+  # 基础设施团队
+  infra:
+    url: https://oapi.dingtalk.com/robot/send?access_token=YOUR_ACCESS_TOKEN_3
+    secret: YOUR_SECRET_3
+    mention:
+      mobiles: ['13800138000', '13900139000']  # @指定人
+
+  # DBA团队
+  dba:
+    url: https://oapi.dingtalk.com/robot/send?access_token=YOUR_ACCESS_TOKEN_4
+    secret: YOUR_SECRET_4
+    mention:
+      mobiles: ['13700137000']
+
+  # 测试环境
+  test:
+    url: https://oapi.dingtalk.com/robot/send?access_token=YOUR_ACCESS_TOKEN_5
+    secret: YOUR_SECRET_5
+    mention:
+      all: false
+```
+
+**自定义钉钉消息模板**:
+
+```go
+// dingtalk/templates/default.tmpl
+{{ define "__subject" }}
+[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}] {{ .GroupLabels.SortedPairs.Values | join " " }}
+{{ end }}
+
+{{ define "__alert_list" }}
+{{ range . }}
+---
+**告警名称**: {{ .Labels.alertname }}
+**严重级别**: {{ .Labels.severity }}
+**告警主机**: {{ .Labels.instance }}
+{{ if .Labels.service }}**服务名称**: {{ .Labels.service }}{{ end }}
+{{ if .Labels.endpoint }}**接口路径**: {{ .Labels.endpoint }}{{ end }}
+**告警摘要**: {{ .Annotations.summary }}
+**详细描述**: {{ .Annotations.description }}
+**触发时间**: {{ (.StartsAt.Add 28800e9).Format "2006-01-02 15:04:05" }}
+{{ if gt (len .Labels) 0 }}**所有标签**:
+{{ range .Labels.SortedPairs }}  - {{ .Name }}: {{ .Value }}
+{{ end }}{{ end }}
+{{ end }}
+{{ end }}
+
+{{ define "ding.link.title" }}{{ template "__subject" . }}{{ end }}
+{{ define "ding.link.content" }}
+#### 📊 告警详情
+{{ if gt (len .Alerts.Firing) 0 }}
+**🔥 触发中的告警 ({{ .Alerts.Firing | len }})**
+{{ template "__alert_list" .Alerts.Firing }}
+{{ end }}
+
+{{ if gt (len .Alerts.Resolved) 0 }}
+**✅ 已恢复的告警 ({{ .Alerts.Resolved | len }})**
+{{ template "__alert_list" .Alerts.Resolved }}
+{{ end }}
+
+---
+[🔗 查看AlertManager]({{ .ExternalURL }})
+{{ end }}
+```
+
+### 15.4.3 测试与验证
+
+```bash
+# ========================================
+# 1. 验证AlertManager配置
+# ========================================
+$ docker run --rm \
+  -v $(pwd)/alertmanager:/etc/alertmanager \
+  prom/alertmanager:v0.26.0 \
+  amtool check-config /etc/alertmanager/alertmanager.yml
+# ✅ Checking '/etc/alertmanager/alertmanager.yml'  SUCCESS
+
+# ========================================
+# 2. 部署AlertManager
+# ========================================
+$ docker stack deploy -c monitoring/stack.yml monitoring
+
+# 查看AlertManager集群状态
+$ curl http://localhost:9093/api/v2/status | jq
+{
+  "cluster": {
+    "peers": [
+      {"name": "alertmanager-1", "address": "10.0.1.5:9094"},
+      {"name": "alertmanager-2", "address": "10.0.1.6:9094"},
+      {"name": "alertmanager-3", "address": "10.0.1.7:9094"}
+    ],
+    "status": "ready"
+  },
+  "versionInfo": {"version": "0.26.0"}
+}
+
+# ========================================
+# 3. 模拟告警测试
+# ========================================
+
+# 方法1: 使用amtool手动发送测试告警
+$ docker exec -it $(docker ps -q -f name=monitoring_alertmanager) sh
+
+$ amtool alert add \
+  --alertmanager.url=http://localhost:9093 \
+  --annotation=summary="测试告警摘要" \
+  --annotation=description="这是一条测试告警,请忽略" \
+  alertname="TestAlert" \
+  severity="warning" \
+  instance="test-instance" \
+  service="test-service"
+# ✅ 告警已发送
+
+# 方法2: 通过API发送测试告警
+$ curl -X POST http://localhost:9093/api/v2/alerts \
+  -H "Content-Type: application/json" \
+  -d '[
+    {
+      "labels": {
+        "alertname": "TestDatabaseAlert",
+        "severity": "critical",
+        "category": "database",
+        "instance": "postgres-master"
+      },
+      "annotations": {
+        "summary": "数据库连接数过高",
+        "description": "当前连接数: 950, 最大连接数: 1000"
+      },
+      "startsAt": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+      "endsAt": "'$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)'"
+    }
+  ]'
+
+# 方法3: 触发真实告警(临时修改阈值)
+# 编辑prometheus/rules/alerts.yml, 将某个阈值改得很低
+- alert: ContainerCpuUsageHigh
+  expr: |
+    ... > 1  # 临时改为1%,触发告警
+  for: 1m
+
+# 热重载Prometheus配置
+$ curl -X POST http://localhost:9090/-/reload
+
+# 等待1-2分钟后查看告警
+$ curl http://localhost:9090/api/v1/alerts | jq '.data.alerts[] | select(.state=="firing")'
+
+# ========================================
+# 4. 验证告警路由
+# ========================================
+
+# 查看告警路由树
+$ curl http://localhost:9093/api/v2/status | jq '.config.route'
+
+# 测试告警会匹配到哪个路由
+$ docker exec -it $(docker ps -q -f name=monitoring_alertmanager) sh
+$ amtool config routes test \
+  --alertmanager.url=http://localhost:9093 \
+  severity=critical \
+  category=database
+# dba-team  # ✅ 匹配到DBA团队路由
+
+# ========================================
+# 5. 验证抑制规则
+# ========================================
+
+# 先发送一个HostDown告警
+$ curl -X POST http://localhost:9093/api/v2/alerts -d '[{
+  "labels": {"alertname": "HostDown", "instance": "node1", "severity": "critical"},
+  "annotations": {"summary": "节点node1下线"}
+}]'
+
+# 再发送该节点上的容器告警
+$ curl -X POST http://localhost:9093/api/v2/alerts -d '[{
+  "labels": {"alertname": "ContainerDown", "instance": "node1", "severity": "warning"},
+  "annotations": {"summary": "容器下线"}
+}]'
+
+# 查看告警状态(ContainerDown应该被抑制)
+$ curl http://localhost:9093/api/v2/alerts | jq '.[] | select(.status.state != "suppressed")'
+# 应该只看到HostDown告警
+
+# ========================================
+# 6. 查看告警历史
+# ========================================
+$ curl http://localhost:9093/api/v2/alerts/groups | jq
+
+# ========================================
+# 7. 静默告警(Silence)
+# ========================================
+
+# 创建静默规则(静默1小时)
+$ curl -X POST http://localhost:9093/api/v2/silences \
+  -H "Content-Type: application/json" \
+  -d '{
+    "matchers": [
+      {
+        "name": "instance",
+        "value": "test-instance",
+        "isRegex": false,
+        "isEqual": true
+      }
+    ],
+    "startsAt": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+    "endsAt": "'$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)'",
+    "createdBy": "admin",
+    "comment": "维护窗口,静默test-instance的所有告警"
+  }'
+# {"silenceID": "abc123..."}
+
+# 查看所有静默规则
+$ curl http://localhost:9093/api/v2/silences | jq
+
+# 删除静默规则
+$ curl -X DELETE http://localhost:9093/api/v2/silence/abc123
+
+# ========================================
+# 8. 钉钉告警验证
+# ========================================
+
+# 检查钉钉Webhook服务状态
+$ curl http://localhost:8060/ui
+# 访问Web UI查看配置
+
+# 发送测试告警到钉钉
+$ curl -X POST http://localhost:8060/dingtalk/webhook1/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "version": "4",
+    "groupKey": "{}/{severity=\"warning\"}:{alertname=\"TestAlert\"}",
+    "status": "firing",
+    "receiver": "dingtalk",
+    "groupLabels": {
+      "alertname": "TestAlert",
+      "severity": "warning"
+    },
+    "alerts": [
+      {
+        "status": "firing",
+        "labels": {
+          "alertname": "TestAlert",
+          "severity": "warning",
+          "instance": "test-instance"
+        },
+        "annotations": {
+          "summary": "这是一条测试告警",
+          "description": "用于验证钉钉Webhook集成是否正常"
+        },
+        "startsAt": "'$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'",
+        "endsAt": "0001-01-01T00:00:00Z"
+      }
+    ],
+    "externalURL": "http://alertmanager.example.com"
+  }'
+# ✅ 应该在钉钉群收到消息
+```
+
+---
+
+## 15.5 APM应用性能监控
+
+### 15.5.1 分布式追踪(Jaeger)
+
+**1. Jaeger Stack部署**:
+
+```yaml
+# monitoring/jaeger-stack.yml
+version: '3.8'
+
+services:
+  # ========================================
+  # Jaeger All-in-One(开发/小规模生产)
+  # ========================================
+  jaeger:
+    image: jaegertracing/all-in-one:1.49
+    environment:
+      # 存储后端(生产环境建议使用Elasticsearch/Cassandra)
+      SPAN_STORAGE_TYPE: badger
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
+      BADGER_EPHEMERAL: "false"
+      BADGER_SPAN_STORE_TTL: "168h"  # 保留7天
+
+      # Collector配置
+      COLLECTOR_ZIPKIN_HOST_PORT: ":9411"
+      COLLECTOR_OTLP_ENABLED: "true"
+
+      # Query配置
+      QUERY_BASE_PATH: /jaeger
+
+      # 采样配置
+      SAMPLING_STRATEGIES_FILE: /etc/jaeger/sampling.json
+
+    volumes:
+      - jaeger-badger:/badger
+      - ./jaeger/sampling.json:/etc/jaeger/sampling.json:ro
+    networks:
+      - monitoring
+    ports:
+      - "5775:5775/udp"   # Zipkin compact thrift (deprecated)
+      - "6831:6831/udp"   # Jaeger compact thrift
+      - "6832:6832/udp"   # Jaeger binary thrift
+      - "5778:5778"       # Configs
+      - "16686:16686"     # Jaeger UI
+      - "14268:14268"     # Jaeger collector HTTP
+      - "14250:14250"     # Jaeger collector gRPC
+      - "9411:9411"       # Zipkin compatible endpoint
+      - "4317:4317"       # OTLP gRPC
+      - "4318:4318"       # OTLP HTTP
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # ========================================
+  # Jaeger生产环境部署(使用Elasticsearch)
+  # ========================================
+  jaeger-collector:
+    image: jaegertracing/jaeger-collector:1.49
+    environment:
+      SPAN_STORAGE_TYPE: elasticsearch
+      ES_SERVER_URLS: http://elasticsearch:9200
+      ES_INDEX_PREFIX: jaeger
+      ES_NUM_SHARDS: 5
+      ES_NUM_REPLICAS: 1
+      COLLECTOR_QUEUE_SIZE: 2000
+      COLLECTOR_NUM_WORKERS: 50
+    networks:
+      - monitoring
+      - backend
+    ports:
+      - "14250:14250"
+      - "14268:14268"
+    deploy:
+      mode: replicated
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  jaeger-query:
+    image: jaegertracing/jaeger-query:1.49
+    environment:
+      SPAN_STORAGE_TYPE: elasticsearch
+      ES_SERVER_URLS: http://elasticsearch:9200
+      ES_INDEX_PREFIX: jaeger
+      QUERY_BASE_PATH: /jaeger
+    networks:
+      - monitoring
+      - backend
+    ports:
+      - "16686:16686"
+    deploy:
+      mode: replicated
+      replicas: 2
+
+  jaeger-agent:
+    image: jaegertracing/jaeger-agent:1.49
+    command:
+      - "--reporter.grpc.host-port=jaeger-collector:14250"
+      - "--reporter.type=grpc"
+    networks:
+      - monitoring
+    ports:
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+    deploy:
+      mode: global  # 每个节点一个Agent
+
+networks:
+  monitoring:
+    external: true
+  backend:
+    external: true
+
+volumes:
+  jaeger-badger:
+```
+
+**2. 采样策略配置**:
+
+```json
+// jaeger/sampling.json
+{
+  "default_strategy": {
+    "type": "probabilistic",
+    "param": 0.1  // 默认10%采样率
+  },
+  "service_strategies": [
+    {
+      "service": "critical-api",
+      "type": "probabilistic",
+      "param": 1.0  // 关键服务100%采样
+    },
+    {
+      "service": "high-traffic-api",
+      "type": "ratelimiting",
+      "param": 100  // 高流量服务限速采样(100 traces/s)
+    },
+    {
+      "service": "batch-job",
+      "type": "probabilistic",
+      "param": 0.01  // 批处理任务1%采样
+    }
+  ]
+}
+```
+
+**3. 应用集成Jaeger(Python示例)**:
+
+```python
+# app/tracing.py
+from opentelemetry import trace
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.instrumentation.flask import FlaskInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+
+def init_tracer(app, service_name="myapp"):
+    """初始化分布式追踪"""
+
+    # 创建Resource(标识服务)
+    resource = Resource.create({
+        "service.name": service_name,
+        "service.version": "1.0.0",
+        "deployment.environment": "production",
+        "service.namespace": "default"
+    })
+
+    # 创建TracerProvider
+    tracer_provider = TracerProvider(resource=resource)
+    trace.set_tracer_provider(tracer_provider)
+
+    # 配置Jaeger Exporter
+    jaeger_exporter = JaegerExporter(
+        agent_host_name="jaeger-agent",  # Jaeger Agent地址
+        agent_port=6831,
+        udp_split_oversized_batches=True
+    )
+
+    # 添加Span Processor(批量发送)
+    span_processor = BatchSpanProcessor(
+        jaeger_exporter,
+        max_queue_size=2048,
+        schedule_delay_millis=5000,
+        max_export_batch_size=512
+    )
+    tracer_provider.add_span_processor(span_processor)
+
+    # 自动埋点Flask
+    FlaskInstrumentor().instrument_app(app)
+
+    # 自动埋点HTTP请求
+    RequestsInstrumentor().instrument()
+
+    # 自动埋点SQLAlchemy
+    from app import db
+    SQLAlchemyInstrumentor().instrument(
+        engine=db.engine,
+        enable_commenter=True,  # SQL注释中添加trace_id
+        commenter_options={"db_driver": True}
+    )
+
+    return tracer_provider
+
+# app.py
+from flask import Flask, request, jsonify
+from tracing import init_tracer
+from opentelemetry import trace
+
+app = Flask(__name__)
+init_tracer(app)
+
+tracer = trace.get_tracer(__name__)
+
+@app.route('/api/order', methods=['POST'])
+def create_order():
+    # 自动创建的Span(由FlaskInstrumentor)
+    current_span = trace.get_current_span()
+
+    # 添加自定义属性
+    current_span.set_attribute("user.id", request.json.get('user_id'))
+    current_span.set_attribute("order.amount", request.json.get('amount'))
+
+    # 手动创建子Span
+    with tracer.start_as_current_span("validate_order") as span:
+        span.set_attribute("validation.result", "success")
+        result = validate_order(request.json)
+
+    # 调用其他服务(自动传递trace context)
+    with tracer.start_as_current_span("call_payment_service") as span:
+        import requests
+        response = requests.post(
+            'http://payment-service/api/charge',
+            json={'order_id': 123, 'amount': 99.99}
+        )
+        span.set_attribute("payment.status", response.status_code)
+
+    # 数据库操作(自动追踪)
+    with tracer.start_as_current_span("database_insert") as span:
+        db.session.add(Order(**request.json))
+        db.session.commit()
+
+    return jsonify({"status": "success"}), 201
+
+if __name__ == '__main__':
+    app.run()
+```
+
+**4. 查询Jaeger Traces**:
+
+```bash
+# 访问Jaeger UI
+$ open http://jaeger.example.com:16686
+
+# API查询(查找慢查询)
+$ curl 'http://localhost:16686/api/traces?service=myapp&limit=20&minDuration=1s' | jq
+
+# 查找包含错误的Trace
+$ curl 'http://localhost:16686/api/traces?service=myapp&tags={"error":"true"}' | jq
+
+# 通过TraceID查询完整链路
+$ curl 'http://localhost:16686/api/traces/abc123def456' | jq
+```
+
+### 15.5.2 应用性能指标采集
+
+**Prometheus + StatsD Exporter集成**:
+
+```yaml
+# monitoring/stack.yml (添加)
+services:
+  statsd-exporter:
+    image: prom/statsd-exporter:v0.26.0
+    command:
+      - '--statsd.mapping-config=/etc/statsd/statsd-mapping.yml'
+      - '--statsd.listen-udp=:9125'
+      - '--statsd.listen-tcp=:9125'
+      - '--web.listen-address=:9102'
+    volumes:
+      - ./statsd/statsd-mapping.yml:/etc/statsd/statsd-mapping.yml:ro
+    networks:
+      - monitoring
+    ports:
+      - "9125:9125/udp"
+      - "9102:9102"
+    deploy:
+      mode: global
+```
+
+```yaml
+# statsd/statsd-mapping.yml
+mappings:
+  # HTTP请求计数
+  - match: "app.http.requests.*.*.*"
+    name: "http_requests_total"
+    labels:
+      method: "$1"
+      endpoint: "$2"
+      status: "$3"
+
+  # HTTP请求延迟
+  - match: "app.http.request_duration.*.*"
+    name: "http_request_duration_seconds"
+    timer_type: histogram
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 5]
+    labels:
+      method: "$1"
+      endpoint: "$2"
+
+  # 数据库查询
+  - match: "app.db.query_duration.*"
+    name: "db_query_duration_seconds"
+    timer_type: summary
+    labels:
+      query_type: "$1"
+
+  # 缓存命中率
+  - match: "app.cache.*.*"
+    name: "cache_operations_total"
+    labels:
+      operation: "$1"
+      result: "$2"
+```
+
+**应用代码集成StatsD**:
+
+```python
+# app.py
+from statsd import StatsClient
+import time
+
+statsd = StatsClient(host='statsd-exporter', port=9125, prefix='app')
+
+@app.route('/api/users/<int:user_id>')
+def get_user(user_id):
+    start_time = time.time()
+
+    try:
+        # 增加请求计数
+        statsd.incr(f'http.requests.GET.api_users.200')
+
+        # 检查缓存
+        user = cache.get(f'user:{user_id}')
+        if user:
+            statsd.incr('cache.get.hit')
+        else:
+            statsd.incr('cache.get.miss')
+
+            # 数据库查询
+            query_start = time.time()
+            user = User.query.get(user_id)
+            statsd.timing('db.query_duration.select',
+                         (time.time() - query_start) * 1000)
+
+            cache.set(f'user:{user_id}', user, timeout=300)
+
+        # 记录总延迟
+        statsd.timing(f'http.request_duration.GET.api_users',
+                     (time.time() - start_time) * 1000)
+
+        return jsonify(user.to_dict())
+
+    except Exception as e:
+        statsd.incr(f'http.requests.GET.api_users.500')
+        raise
+```
+
+---
+
+*（第15章完成,约2500行。已完成15章,剩余4章...）*
+
+---
+
+📝 **下一章预告**: ELK Stack日志收集、日志解析与告警、日志查询与分析、日志归档策略
+
+---
