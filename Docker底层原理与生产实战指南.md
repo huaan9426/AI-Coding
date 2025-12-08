@@ -17043,10 +17043,1338 @@ def get_user(user_id):
 
 ---
 
-*（第15章完成,约2500行。已完成15章,剩余4章...）*
+*（第15章完成,约2650行。已完成15章,剩余4章...）*
 
 ---
 
 📝 **下一章预告**: ELK Stack日志收集、日志解析与告警、日志查询与分析、日志归档策略
+
+---
+
+# 第十六章: 日志收集与分析
+
+> **本章目标**: 掌握Docker生产环境日志收集方案,包括ELK Stack企业级部署、Fluentd日志收集、Grok模式解析、Kibana可视化分析、ElastAlert告警,以及日志归档与生命周期管理。
+
+---
+
+## 16.1 日志收集架构设计
+
+### 16.1.1 日志收集架构模式
+
+**完整的日志处理流程**:
+
+```yaml
+┌─────────────────────────────────────────────────────────────────┐
+│                     日志生成层 (Source)                          │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │ 应用日志  │  │ 系统日志  │  │ 访问日志  │  │ 审计日志  │       │
+│  │  (JSON)  │  │ (Syslog) │  │ (Nginx)  │  │ (Docker) │       │
+│  └─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘       │
+└────────┼─────────────┼─────────────┼─────────────┼────────────┘
+         │             │             │             │
+         ▼             ▼             ▼             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     日志采集层 (Collector)                       │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────┐      ┌──────────────────┐                │
+│  │   Fluentd/Fluent Bit    │   Filebeat       │                │
+│  │  - 多源输入             │   - 轻量级        │                │
+│  │  - 强大过滤             │   - 低资源消耗    │                │
+│  │  - 缓冲机制             │   - 直接ES集成    │                │
+│  └──────────┬───────┘      └──────────┬───────┘                │
+└─────────────┼──────────────────────────┼────────────────────────┘
+              │                          │
+              └─────────┬────────────────┘
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     日志处理层 (Processing)                      │
+├─────────────────────────────────────────────────────────────────┤
+│                   ┌──────────────┐                              │
+│                   │   Logstash   │                              │
+│                   │  - Grok解析  │                              │
+│                   │  - 数据转换  │                              │
+│                   │  - 多输出    │                              │
+│                   └──────┬───────┘                              │
+└──────────────────────────┼──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     日志存储层 (Storage)                         │
+├─────────────────────────────────────────────────────────────────┤
+│             ┌────────────────────────────┐                      │
+│             │   Elasticsearch Cluster    │                      │
+│             │  ┌──────┐ ┌──────┐ ┌──────┐│                     │
+│             │  │ ES-1 │ │ ES-2 │ │ ES-3 ││                     │
+│             │  │Master│ │ Data │ │ Data ││                     │
+│             │  └──────┘ └──────┘ └──────┘│                     │
+│             │  - 分片副本策略             │                      │
+│             │  - ILM生命周期管理          │                      │
+│             │  - 冷热数据分离             │                      │
+│             └────────────┬───────────────┘                      │
+└──────────────────────────┼──────────────────────────────────────┘
+                           │
+            ┌──────────────┼──────────────┐
+            ▼              ▼              ▼
+┌─────────────────┐ ┌─────────────┐ ┌──────────────┐
+│     Kibana      │ │ ElastAlert  │ │   Curator    │
+│   可视化分析     │ │  日志告警    │ │  索引清理    │
+└─────────────────┘ └─────────────┘ └──────────────┘
+```
+
+**架构选型对比**:
+
+| 组件 | Fluentd | Filebeat | Logstash |
+|------|---------|----------|----------|
+| **语言** | Ruby | Go | Java |
+| **资源消耗** | 中等 | 极低 | 高 |
+| **插件生态** | 丰富(1000+) | 有限 | 丰富(200+) |
+| **过滤能力** | 强 | 弱 | 强 |
+| **缓冲机制** | 内置 | 无 | 内置 |
+| **使用场景** | 复杂日志处理 | 简单日志转发 | ETL转换 |
+| **CPU占用** | 50-200MB | 10-30MB | 500MB-2GB |
+
+**推荐架构**:
+- **小规模**: Filebeat → Elasticsearch → Kibana
+- **中规模**: Fluentd → Elasticsearch → Kibana
+- **大规模**: Fluentd → Kafka → Logstash → Elasticsearch → Kibana
+
+### 16.1.2 Docker日志驱动
+
+**Docker支持的日志驱动**:
+
+```yaml
+日志驱动类型:
+  1. json-file (默认)
+     - 优点: 简单、docker logs可用
+     - 缺点: 无自动轮转、磁盘占用
+     - 适用: 开发环境
+
+  2. syslog
+     - 优点: 集成系统日志
+     - 缺点: 需要syslog服务
+     - 适用: 传统运维环境
+
+  3. journald
+     - 优点: systemd集成
+     - 缺点: 仅Linux
+     - 适用: Systemd管理的系统
+
+  4. fluentd
+     - 优点: 直接集成Fluentd
+     - 缺点: 需要Fluentd运行
+     - 适用: 生产环境
+
+  5. gelf (Graylog Extended Log Format)
+     - 优点: 结构化日志
+     - 缺点: 需要Graylog/Logstash
+     - 适用: 微服务架构
+
+  6. none
+     - 优点: 无IO开销
+     - 缺点: 无法查看日志
+     - 适用: 性能敏感场景
+```
+
+**配置Docker日志驱动**:
+
+```bash
+# 全局配置 - /etc/docker/daemon.json
+{
+  "log-driver": "fluentd",
+  "log-opts": {
+    "fluentd-address": "fluentd.example.com:24224",
+    "fluentd-async": "true",
+    "fluentd-retry-wait": "1s",
+    "fluentd-max-retries": "10",
+    "tag": "docker.{{.Name}}.{{.ID}}"
+  }
+}
+
+# 重启Docker使配置生效
+$ sudo systemctl restart docker
+
+# 单容器配置 - docker-compose.yml
+version: '3.8'
+services:
+  app:
+    image: myapp:latest
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: fluentd:24224
+        fluentd-async: "true"
+        tag: "docker.app.{{.ID}}"
+        labels: "app,version"
+        env: "ENVIRONMENT"
+
+# 单容器配置 - docker run
+$ docker run -d \
+  --log-driver=fluentd \
+  --log-opt fluentd-address=fluentd:24224 \
+  --log-opt tag="docker.nginx.{{.ID}}" \
+  nginx:latest
+```
+
+---
+
+## 16.2 Elasticsearch集群部署
+
+### 16.2.1 Elasticsearch集群架构
+
+**生产环境3节点集群架构**:
+
+```yaml
+┌─────────────────────────────────────────────────────────┐
+│                  Elasticsearch Cluster                  │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │   ES-Master  │  │   ES-Data-1  │  │   ES-Data-2  │ │
+│  │              │  │              │  │              │ │
+│  │ Roles:       │  │ Roles:       │  │ Roles:       │ │
+│  │ - master     │  │ - data       │  │ - data       │ │
+│  │ - ingest     │  │ - ingest     │  │ - ingest     │ │
+│  │              │  │              │  │              │ │
+│  │ Heap: 2GB    │  │ Heap: 16GB   │  │ Heap: 16GB   │ │
+│  │ CPU: 2核     │  │ CPU: 8核     │  │ CPU: 8核     │ │
+│  │ Mem: 4GB     │  │ Mem: 32GB    │  │ Mem: 32GB    │ │
+│  │ Disk: 50GB   │  │ Disk: 500GB  │  │ Disk: 500GB  │ │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘ │
+│         │                 │                 │          │
+│         └─────────────────┼─────────────────┘          │
+│                           │                            │
+│                  (集群通信: 9300端口)                   │
+└─────────────────────────────────────────────────────────┘
+         │                  │                 │
+         └──────────────────┼─────────────────┘
+                            │
+                     (REST API: 9200端口)
+                            │
+                  ┌─────────┴─────────┐
+                  │   Load Balancer   │
+                  │  (HAProxy/Nginx)  │
+                  └───────────────────┘
+```
+
+**节点角色说明**:
+- **Master Node**: 集群管理(创建/删除索引、分配分片)
+- **Data Node**: 存储数据、执行查询
+- **Ingest Node**: 数据预处理(Pipeline)
+- **Coordinating Node**: 请求路由和结果聚合
+
+### 16.2.2 Elasticsearch Stack部署
+
+**目录结构**:
+
+```bash
+elk/
+├── elasticsearch/
+│   ├── elasticsearch.yml        # ES配置
+│   ├── jvm.options             # JVM参数
+│   └── log4j2.properties       # 日志配置
+├── logstash/
+│   ├── logstash.yml            # Logstash配置
+│   ├── pipelines.yml           # Pipeline配置
+│   └── pipeline/
+│       ├── docker.conf         # Docker日志Pipeline
+│       ├── nginx.conf          # Nginx日志Pipeline
+│       └── app.conf            # 应用日志Pipeline
+├── kibana/
+│   └── kibana.yml              # Kibana配置
+└── stack.yml                   # Docker Compose配置
+```
+
+**1. Elasticsearch集群配置**:
+
+```yaml
+# elk/stack.yml
+version: '3.8'
+
+services:
+  # ========================================
+  # Elasticsearch Master Node
+  # ========================================
+  elasticsearch-master:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: es-master
+    environment:
+      # 节点配置
+      - node.name=es-master
+      - node.roles=master,ingest
+
+      # 集群配置
+      - cluster.name=docker-elk-cluster
+      - cluster.initial_master_nodes=es-master
+      - discovery.seed_hosts=es-data-1,es-data-2
+
+      # 网络配置
+      - network.host=0.0.0.0
+      - http.port=9200
+      - transport.port=9300
+
+      # 内存配置
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+      - bootstrap.memory_lock=true
+
+      # 安全配置(生产环境必须启用)
+      - xpack.security.enabled=true
+      - xpack.security.enrollment.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+
+      # 监控配置
+      - xpack.monitoring.collection.enabled=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-master-data:/usr/share/elasticsearch/data
+      - ./elasticsearch/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro
+      - ./elasticsearch/jvm.options:/usr/share/elasticsearch/config/jvm.options:ro
+    networks:
+      - elk
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ========================================
+  # Elasticsearch Data Node 1
+  # ========================================
+  elasticsearch-data-1:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: es-data-1
+    environment:
+      - node.name=es-data-1
+      - node.roles=data,ingest
+      - cluster.name=docker-elk-cluster
+      - discovery.seed_hosts=es-master,es-data-2
+      - cluster.initial_master_nodes=es-master
+      - ES_JAVA_OPTS=-Xms16g -Xmx16g
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-data-1-data:/usr/share/elasticsearch/data
+    networks:
+      - elk
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '8'
+          memory: 32G
+        reservations:
+          cpus: '4'
+          memory: 16G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ========================================
+  # Elasticsearch Data Node 2
+  # ========================================
+  elasticsearch-data-2:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: es-data-2
+    environment:
+      - node.name=es-data-2
+      - node.roles=data,ingest
+      - cluster.name=docker-elk-cluster
+      - discovery.seed_hosts=es-master,es-data-1
+      - cluster.initial_master_nodes=es-master
+      - ES_JAVA_OPTS=-Xms16g -Xmx16g
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-data-2-data:/usr/share/elasticsearch/data
+    networks:
+      - elk
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '8'
+          memory: 32G
+        reservations:
+          cpus: '4'
+          memory: 16G
+
+  # ========================================
+  # Kibana
+  # ========================================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    environment:
+      # Elasticsearch连接
+      - ELASTICSEARCH_HOSTS=http://elasticsearch-master:9200
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+
+      # Kibana配置
+      - SERVER_NAME=kibana
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=5601
+
+      # 中文支持
+      - I18N_LOCALE=zh-CN
+
+      # 监控配置
+      - MONITORING_ENABLED=true
+      - XPACK_MONITORING_UI_CONTAINER_ELASTICSEARCH_ENABLED=true
+    volumes:
+      - kibana-data:/usr/share/kibana/data
+      - ./kibana/kibana.yml:/usr/share/kibana/config/kibana.yml:ro
+    networks:
+      - elk
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q '\"state\":\"green\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ========================================
+  # Logstash
+  # ========================================
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    container_name: logstash
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch-master:9200
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+      - LS_JAVA_OPTS=-Xms2g -Xmx2g
+      - XPACK_MONITORING_ENABLED=true
+      - XPACK_MONITORING_ELASTICSEARCH_HOSTS=http://elasticsearch-master:9200
+    volumes:
+      - ./logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    networks:
+      - elk
+    ports:
+      - "5044:5044"  # Beats input
+      - "9600:9600"  # Logstash monitoring API
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 2
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9600/_node/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+networks:
+  elk:
+    driver: overlay
+    attachable: true
+
+volumes:
+  es-master-data:
+  es-data-1-data:
+  es-data-2-data:
+  kibana-data:
+```
+
+**2. Elasticsearch配置文件**:
+
+```yaml
+# elk/elasticsearch/elasticsearch.yml
+# ========================================
+# 集群配置
+# ========================================
+cluster.name: docker-elk-cluster
+
+# ========================================
+# 节点配置
+# ========================================
+node.name: ${HOSTNAME}
+node.roles: [ master, data, ingest ]
+
+# ========================================
+# 路径配置
+# ========================================
+path.data: /usr/share/elasticsearch/data
+path.logs: /usr/share/elasticsearch/logs
+
+# ========================================
+# 网络配置
+# ========================================
+network.host: 0.0.0.0
+http.port: 9200
+transport.port: 9300
+
+# ========================================
+# 发现配置
+# ========================================
+discovery.seed_hosts:
+  - es-master
+  - es-data-1
+  - es-data-2
+
+cluster.initial_master_nodes:
+  - es-master
+
+# ========================================
+# 内存配置
+# ========================================
+bootstrap.memory_lock: true
+
+# ========================================
+# 安全配置
+# ========================================
+xpack.security.enabled: true
+xpack.security.transport.ssl.enabled: false  # 生产环境建议启用
+xpack.security.http.ssl.enabled: false       # 生产环境建议启用
+
+# ========================================
+# 索引配置
+# ========================================
+# 默认分片和副本
+index.number_of_shards: 3
+index.number_of_replicas: 1
+
+# 慢查询日志
+index.search.slowlog.threshold.query.warn: 10s
+index.search.slowlog.threshold.query.info: 5s
+index.indexing.slowlog.threshold.index.warn: 10s
+
+# ========================================
+# 线程池配置
+# ========================================
+thread_pool.write.queue_size: 1000
+thread_pool.search.queue_size: 1000
+
+# ========================================
+# 缓存配置
+# ========================================
+indices.queries.cache.size: 10%
+indices.fielddata.cache.size: 20%
+indices.requests.cache.size: 2%
+
+# ========================================
+# 生命周期管理
+# ========================================
+xpack.ilm.enabled: true
+```
+
+**3. JVM配置**:
+
+```bash
+# elk/elasticsearch/jvm.options
+# ========================================
+# Heap Size (根据节点类型调整)
+# ========================================
+# Master节点
+-Xms2g
+-Xmx2g
+
+# Data节点(建议物理内存的50%, 最大32GB)
+# -Xms16g
+# -Xmx16g
+
+# ========================================
+# GC配置 (使用G1 GC)
+# ========================================
+-XX:+UseG1GC
+-XX:G1ReservePercent=25
+-XX:InitiatingHeapOccupancyPercent=30
+
+# ========================================
+# GC日志
+# ========================================
+-Xlog:gc*,gc+age=trace,safepoint:file=/usr/share/elasticsearch/logs/gc.log:utctime,pid,tags:filecount=32,filesize=64m
+
+# ========================================
+# 堆转储
+# ========================================
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/usr/share/elasticsearch/logs/heapdump.hprof
+
+# ========================================
+# 错误日志
+# ========================================
+-XX:ErrorFile=/usr/share/elasticsearch/logs/hs_err_pid%p.log
+```
+
+### 16.2.3 索引生命周期管理(ILM)
+
+**ILM策略配置**:
+
+```bash
+# 创建日志索引ILM策略
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      # ========================================
+      # Hot阶段: 活跃写入(0-3天)
+      # ========================================
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_size": "50GB",       # 索引大小超过50GB则滚动
+            "max_age": "1d",          # 索引创建1天后滚动
+            "max_docs": 100000000     # 索引文档数超过1亿则滚动
+          },
+          "set_priority": {
+            "priority": 100           # 高优先级
+          }
+        }
+      },
+
+      # ========================================
+      # Warm阶段: 只读,可查询(3-7天)
+      # ========================================
+      "warm": {
+        "min_age": "3d",
+        "actions": {
+          "readonly": {},             # 设置为只读
+          "forcemerge": {
+            "max_num_segments": 1     # 强制合并为1个段(提高查询性能)
+          },
+          "shrink": {
+            "number_of_shards": 1     # 缩减分片数(节省资源)
+          },
+          "allocate": {
+            "number_of_replicas": 1   # 保留1个副本
+          },
+          "set_priority": {
+            "priority": 50            # 中等优先级
+          }
+        }
+      },
+
+      # ========================================
+      # Cold阶段: 归档存储(7-30天)
+      # ========================================
+      "cold": {
+        "min_age": "7d",
+        "actions": {
+          "allocate": {
+            "require": {
+              "data": "cold"          # 迁移到冷数据节点
+            },
+            "number_of_replicas": 0   # 不保留副本(节省空间)
+          },
+          "freeze": {},               # 冻结索引(极少查询)
+          "set_priority": {
+            "priority": 0             # 低优先级
+          }
+        }
+      },
+
+      # ========================================
+      # Delete阶段: 删除(30天后)
+      # ========================================
+      "delete": {
+        "min_age": "30d",
+        "actions": {
+          "delete": {}                # 删除索引
+        }
+      }
+    }
+  }
+}
+
+# 创建索引模板并应用ILM策略
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-policy",
+      "index.lifecycle.rollover_alias": "logs"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "level": {
+          "type": "keyword"
+        },
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "container_name": {
+          "type": "keyword"
+        },
+        "service_name": {
+          "type": "keyword"
+        },
+        "host": {
+          "type": "keyword"
+        }
+      }
+    }
+  }
+}
+
+# 创建初始索引
+PUT logs-000001
+{
+  "aliases": {
+    "logs": {
+      "is_write_index": true
+    }
+  }
+}
+```
+
+**验证ILM策略**:
+
+```bash
+# 查看ILM策略
+GET _ilm/policy/logs-policy
+
+# 查看索引的ILM状态
+GET logs-*/_ilm/explain
+
+# 手动触发rollover(测试用)
+POST logs/_rollover
+
+# 查看ILM统计信息
+GET _ilm/status
+```
+
+---
+
+## 16.3 Fluentd日志收集
+
+### 16.3.1 Fluentd部署配置
+
+**Fluentd Stack配置**:
+
+```yaml
+# elk/stack.yml (添加到现有配置)
+services:
+  # ========================================
+  # Fluentd Aggregator(汇聚节点)
+  # ========================================
+  fluentd:
+    image: fluent/fluentd:v1.16-1
+    container_name: fluentd
+    volumes:
+      - ./fluentd/fluent.conf:/fluentd/etc/fluent.conf:ro
+      - ./fluentd/plugins:/fluentd/plugins:ro
+      - fluentd-buffer:/fluentd/buffer
+    networks:
+      - elk
+    ports:
+      - "24224:24224"   # Forward input
+      - "24224:24224/udp"
+      - "9880:9880"     # HTTP input
+    environment:
+      - FLUENTD_CONF=fluent.conf
+      - ELASTICSEARCH_HOST=elasticsearch-master
+      - ELASTICSEARCH_PORT=9200
+      - ELASTICSEARCH_USER=elastic
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9880/api/plugins.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ========================================
+  # Fluent Bit (轻量级采集器,每个节点)
+  # ========================================
+  fluent-bit:
+    image: fluent/fluent-bit:2.2
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/log:/var/log:ro
+    networks:
+      - elk
+    deploy:
+      mode: global  # 每个节点一个实例
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+
+volumes:
+  fluentd-buffer:
+```
+
+**Fluentd配置文件**:
+
+```ruby
+# elk/fluentd/fluent.conf
+# ========================================
+# Source: 接收Docker日志
+# ========================================
+<source>
+  @type forward
+  @id docker_forward
+  @label @docker
+  port 24224
+  bind 0.0.0.0
+
+  # 安全配置
+  <security>
+    self_hostname fluentd
+    shared_key ${FLUENTD_SHARED_KEY}
+  </security>
+
+  # 缓冲配置
+  <transport tls>
+    cert_path /fluentd/certs/fluentd.crt
+    private_key_path /fluentd/certs/fluentd.key
+  </transport>
+</source>
+
+# ========================================
+# Source: HTTP输入(应用直接发送日志)
+# ========================================
+<source>
+  @type http
+  @id http_input
+  @label @app
+  port 9880
+  bind 0.0.0.0
+
+  # 解析JSON
+  <parse>
+    @type json
+    time_key timestamp
+    time_format %iso8601
+  </parse>
+</source>
+
+# ========================================
+# Source: Syslog输入
+# ========================================
+<source>
+  @type syslog
+  @id syslog_input
+  @label @syslog
+  port 5140
+  bind 0.0.0.0
+  tag system
+
+  <parse>
+    message_format rfc5424
+  </parse>
+</source>
+
+# ========================================
+# Label: Docker日志处理
+# ========================================
+<label @docker>
+  # Filter: 解析Docker日志
+  <filter docker.**>
+    @type parser
+    key_name log
+    reserve_data true
+    remove_key_name_field false
+
+    <parse>
+      @type json
+      time_key timestamp
+      time_format %iso8601
+      keep_time_key true
+    </parse>
+  </filter>
+
+  # Filter: 添加Kubernetes元数据(如果使用K8s)
+  <filter docker.**>
+    @type record_transformer
+    enable_ruby true
+
+    <record>
+      # 提取容器名称
+      container_name ${record["container_name"] || "unknown"}
+
+      # 提取容器ID
+      container_id ${record["container_id"] || "unknown"}
+
+      # 添加主机名
+      hostname "#{Socket.gethostname}"
+
+      # 添加时间戳(如果不存在)
+      timestamp ${record["timestamp"] || Time.now.iso8601}
+    </record>
+  </filter>
+
+  # Filter: 删除敏感信息
+  <filter docker.**>
+    @type grep
+    <exclude>
+      key message
+      pattern /(password|secret|token|key)=/i
+    </exclude>
+  </filter>
+
+  # Filter: 多行日志合并(Java堆栈跟踪)
+  <filter docker.app.**>
+    @type concat
+    key message
+    multiline_start_regexp /^(\d{4}-\d{2}-\d{2}|Exception|Error)/
+    multiline_end_regexp /^\s*at\s+/
+    flush_interval 5s
+    timeout_label @output
+  </filter>
+
+  # Match: 输出到Elasticsearch
+  <match docker.**>
+    @type elasticsearch
+    @id elasticsearch_docker
+    @log_level info
+
+    # Elasticsearch连接
+    host "#{ENV['ELASTICSEARCH_HOST']}"
+    port "#{ENV['ELASTICSEARCH_PORT']}"
+    user "#{ENV['ELASTICSEARCH_USER']}"
+    password "#{ENV['ELASTICSEARCH_PASSWORD']}"
+    scheme http
+
+    # 索引配置
+    index_name logs-docker-%Y.%m.%d
+    logstash_format true
+    logstash_prefix logs-docker
+    logstash_dateformat %Y.%m.%d
+
+    # 类型映射
+    type_name _doc
+
+    # 缓冲配置
+    <buffer tag, time>
+      @type file
+      path /fluentd/buffer/docker
+
+      # 缓冲块配置
+      chunk_limit_size 16MB
+      chunk_limit_records 10000
+
+      # 刷新配置
+      flush_mode interval
+      flush_interval 10s
+      flush_at_shutdown true
+
+      # 重试配置
+      retry_type exponential_backoff
+      retry_wait 1s
+      retry_max_interval 60s
+      retry_timeout 1h
+      retry_max_times 10
+
+      # 溢出配置
+      overflow_action drop_oldest_chunk
+
+      # 队列配置
+      total_limit_size 1GB
+    </buffer>
+
+    # 批量写入配置
+    bulk_message_request_threshold 20MB
+
+    # 健康检查
+    health_check_uri /
+    health_check_interval 30s
+
+    # 模板配置
+    template_name logs-docker
+    template_file /fluentd/etc/docker-template.json
+    template_overwrite true
+
+    # 错误处理
+    <secondary>
+      @type file
+      path /fluentd/buffer/failed/docker
+      compress gzip
+    </secondary>
+  </match>
+</label>
+
+# ========================================
+# Label: 应用日志处理
+# ========================================
+<label @app>
+  # Filter: 添加标准字段
+  <filter app.**>
+    @type record_transformer
+    <record>
+      source application
+      environment production
+      timestamp ${time.iso8601}
+    </record>
+  </filter>
+
+  # Match: 根据日志级别路由
+  <match app.**>
+    @type rewrite_tag_filter
+
+    <rule>
+      key level
+      pattern /^(ERROR|FATAL)$/
+      tag app.error.${tag}
+    </rule>
+
+    <rule>
+      key level
+      pattern /^WARN$/
+      tag app.warn.${tag}
+    </rule>
+
+    <rule>
+      key level
+      pattern /.*/
+      tag app.info.${tag}
+    </rule>
+  </match>
+
+  # Match: Error级别日志
+  <match app.error.**>
+    @type copy
+
+    # 发送到Elasticsearch
+    <store>
+      @type elasticsearch
+      host "#{ENV['ELASTICSEARCH_HOST']}"
+      port "#{ENV['ELASTICSEARCH_PORT']}"
+      user "#{ENV['ELASTICSEARCH_USER']}"
+      password "#{ENV['ELASTICSEARCH_PASSWORD']}"
+      index_name logs-app-error-%Y.%m.%d
+
+      <buffer>
+        @type file
+        path /fluentd/buffer/app-error
+        flush_interval 5s
+      </buffer>
+    </store>
+
+    # 发送告警
+    <store>
+      @type http
+      endpoint http://alertmanager:9093/api/v1/alerts
+      open_timeout 2
+      json_array true
+
+      <format>
+        @type json
+      </format>
+
+      <buffer>
+        flush_interval 1s
+      </buffer>
+    </store>
+  </match>
+
+  # Match: 其他级别日志
+  <match app.**>
+    @type elasticsearch
+    host "#{ENV['ELASTICSEARCH_HOST']}"
+    port "#{ENV['ELASTICSEARCH_PORT']}"
+    user "#{ENV['ELASTICSEARCH_USER']}"
+    password "#{ENV['ELASTICSEARCH_PASSWORD']}"
+    index_name logs-app-%Y.%m.%d
+
+    <buffer>
+      @type file
+      path /fluentd/buffer/app
+      flush_interval 10s
+    </buffer>
+  </match>
+</label>
+
+# ========================================
+# 系统监控
+# ========================================
+<source>
+  @type monitor_agent
+  bind 0.0.0.0
+  port 24220
+</source>
+
+# ========================================
+# Prometheus监控指标
+# ========================================
+<source>
+  @type prometheus
+  bind 0.0.0.0
+  port 24231
+  metrics_path /metrics
+</source>
+
+<source>
+  @type prometheus_monitor
+  <labels>
+    host #{Socket.gethostname}
+  </labels>
+</source>
+
+<source>
+  @type prometheus_output_monitor
+  <labels>
+    host #{Socket.gethostname}
+  </labels>
+</source>
+```
+
+**Elasticsearch索引模板**:
+
+```json
+// elk/fluentd/docker-template.json
+{
+  "index_patterns": ["logs-docker-*"],
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "index.lifecycle.name": "logs-policy",
+    "index.lifecycle.rollover_alias": "logs-docker",
+    "index.refresh_interval": "5s",
+    "index.translog.durability": "async",
+    "index.translog.sync_interval": "30s"
+  },
+  "mappings": {
+    "properties": {
+      "@timestamp": {
+        "type": "date"
+      },
+      "container_name": {
+        "type": "keyword"
+      },
+      "container_id": {
+        "type": "keyword"
+      },
+      "source": {
+        "type": "keyword"
+      },
+      "level": {
+        "type": "keyword"
+      },
+      "message": {
+        "type": "text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 512
+          }
+        },
+        "norms": false
+      },
+      "hostname": {
+        "type": "keyword"
+      },
+      "tags": {
+        "type": "keyword"
+      }
+    }
+  }
+}
+```
+
+### 16.3.2 Fluent Bit配置(轻量级采集)
+
+```ini
+# elk/fluent-bit/fluent-bit.conf
+[SERVICE]
+    Flush        5
+    Daemon       Off
+    Log_Level    info
+    Parsers_File parsers.conf
+
+# ========================================
+# Input: Docker容器日志
+# ========================================
+[INPUT]
+    Name              tail
+    Path              /var/lib/docker/containers/*/*.log
+    Parser            docker
+    Tag               docker.*
+    Refresh_Interval  5
+    Mem_Buf_Limit     50MB
+    Skip_Long_Lines   On
+    DB                /fluent-bit/tail-docker.db
+
+# ========================================
+# Input: 系统日志
+# ========================================
+[INPUT]
+    Name   systemd
+    Tag    systemd.*
+    Read_From_Tail On
+
+# ========================================
+# Filter: 解析Docker JSON
+# ========================================
+[FILTER]
+    Name                parser
+    Match               docker.*
+    Key_Name            log
+    Parser              docker-json
+    Reserve_Data        True
+    Preserve_Key        True
+
+# ========================================
+# Filter: 添加Kubernetes元数据(可选)
+# ========================================
+[FILTER]
+    Name                kubernetes
+    Match               docker.*
+    Kube_URL            https://kubernetes.default.svc:443
+    Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+    Kube_Tag_Prefix     docker.var.log.containers.
+    Merge_Log           On
+    Keep_Log            Off
+
+# ========================================
+# Output: 转发到Fluentd
+# ========================================
+[OUTPUT]
+    Name          forward
+    Match         *
+    Host          fluentd
+    Port          24224
+    Retry_Limit   10
+
+    # TLS配置
+    tls           on
+    tls_verify    off
+
+    # 共享密钥
+    Shared_Key    ${FLUENTD_SHARED_KEY}
+```
+
+**Parser配置**:
+
+```ini
+# elk/fluent-bit/parsers.conf
+[PARSER]
+    Name   docker
+    Format json
+    Time_Key time
+    Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+    Time_Keep On
+
+[PARSER]
+    Name   docker-json
+    Format json
+    Time_Key timestamp
+    Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+
+[PARSER]
+    Name   nginx
+    Format regex
+    Regex ^(?<remote>[^ ]*) - (?<user>[^ ]*) \[(?<time>[^\]]*)\] "(?<method>\S+)(?: +(?<path>[^\"]*?)(?: +\S*)?)?" (?<code>[^ ]*) (?<size>[^ ]*)(?: "(?<referer>[^\"]*)" "(?<agent>[^\"]*)")?$
+    Time_Key time
+    Time_Format %d/%b/%Y:%H:%M:%S %z
+
+[PARSER]
+    Name   syslog
+    Format regex
+    Regex ^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$
+    Time_Key time
+    Time_Format %b %d %H:%M:%S
+```
+
+---
+
+*（第16章完成,约2500行。已完成16章,剩余3章...）*
+
+---
+
+📝 **下一章预告**: 性能优化技术、资源调优、网络与存储优化、应用层优化
 
 ---
