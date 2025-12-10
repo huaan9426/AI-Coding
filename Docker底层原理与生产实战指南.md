@@ -20578,6 +20578,1685 @@ log.console.level = info
 
 ---
 
-📝 **下一章预告**: 故障排查方法论、常见问题诊断、性能问题排查、日志分析技巧
+# 第18章: 故障排查
+
+## 18.1 故障排查方法论
+
+### 18.1.1 系统化排查流程
+
+**5步故障排查法**
+```
+┌─────────────────────────────────────────────────────────┐
+│               Docker故障排查标准流程                       │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  [1] 问题定义 (Define)                                   │
+│      ├─ 现象描述 (What)                                  │
+│      ├─ 发生时间 (When)                                  │
+│      ├─ 影响范围 (Scope)                                 │
+│      └─ 业务影响 (Impact)                                │
+│                                                         │
+│  [2] 信息收集 (Gather)                                   │
+│      ├─ 容器状态 (docker ps/inspect)                     │
+│      ├─ 系统资源 (CPU/内存/磁盘/网络)                     │
+│      ├─ 日志信息 (应用日志/系统日志)                      │
+│      └─ 监控数据 (Prometheus/Grafana)                    │
+│                                                         │
+│  [3] 假设验证 (Hypothesize)                              │
+│      ├─ 列出可能原因                                      │
+│      ├─ 按概率排序                                        │
+│      └─ 逐一验证假设                                      │
+│                                                         │
+│  [4] 问题定位 (Isolate)                                  │
+│      ├─ 缩小问题范围                                      │
+│      ├─ 找到根本原因                                      │
+│      └─ 确认触发条件                                      │
+│                                                         │
+│  [5] 解决验证 (Resolve)                                  │
+│      ├─ 实施解决方案                                      │
+│      ├─ 验证问题解决                                      │
+│      ├─ 文档记录                                          │
+│      └─ 预防措施                                          │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+**故障排查决策树**
+```
+容器无法访问
+    │
+    ├─> 容器是否运行? (docker ps)
+    │   ├─ 否 → 18.2.1 容器启动失败
+    │   └─ 是 → 继续
+    │
+    ├─> 容器健康检查? (docker inspect)
+    │   ├─ 失败 → 18.2.2 健康检查失败
+    │   └─ 通过 → 继续
+    │
+    ├─> 端口是否监听? (netstat/ss)
+    │   ├─ 否 → 应用未启动
+    │   └─ 是 → 继续
+    │
+    ├─> 网络连通性? (ping/telnet)
+    │   ├─ 否 → 18.3 网络问题
+    │   └─ 是 → 继续
+    │
+    └─> 应用响应? (curl/http请求)
+        ├─ 超时 → 18.4 性能问题
+        ├─ 错误 → 18.2.4 应用错误
+        └─ 正常 → 负载均衡器/DNS问题
+```
+
+### 18.1.2 快速诊断工具箱
+
+**一键诊断脚本**
+```bash
+#!/bin/bash
+# docker-diagnose.sh - Docker快速诊断工具
+
+CONTAINER=$1
+
+if [ -z "$CONTAINER" ]; then
+    echo "用法: $0 <容器名称或ID>"
+    exit 1
+fi
+
+echo "=========================================="
+echo "Docker容器快速诊断: $CONTAINER"
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "=========================================="
+
+# 1. 容器基本状态
+echo -e "\n[1] 容器状态"
+echo "----------------------------------------"
+docker ps -a --filter "name=$CONTAINER" --format \
+  "状态: {{.Status}}\n创建: {{.CreatedAt}}\n镜像: {{.Image}}\n端口: {{.Ports}}"
+
+# 2. 容器详细信息
+echo -e "\n[2] 容器配置"
+echo "----------------------------------------"
+docker inspect $CONTAINER | jq -r '
+  .[0] | {
+    "运行状态": .State.Status,
+    "启动时间": .State.StartedAt,
+    "退出代码": .State.ExitCode,
+    "OOM被杀": .State.OOMKilled,
+    "重启次数": .RestartCount,
+    "IP地址": .NetworkSettings.IPAddress,
+    "网络模式": .HostConfig.NetworkMode,
+    "CPU配额": .HostConfig.CpuQuota,
+    "内存限制": .HostConfig.Memory
+  }
+' | column -t -s ':'
+
+# 3. 资源使用情况
+echo -e "\n[3] 资源使用"
+echo "----------------------------------------"
+docker stats $CONTAINER --no-stream --format \
+  "CPU: {{.CPUPerc}}\n内存: {{.MemUsage}} ({{.MemPerc}})\n网络: {{.NetIO}}\n磁盘: {{.BlockIO}}"
+
+# 4. 容器进程
+echo -e "\n[4] 容器进程"
+echo "----------------------------------------"
+docker top $CONTAINER
+
+# 5. 最近日志(最后50行)
+echo -e "\n[5] 最近日志(最后50行)"
+echo "----------------------------------------"
+docker logs --tail 50 $CONTAINER 2>&1 | tail -20
+
+# 6. 健康检查
+echo -e "\n[6] 健康检查"
+echo "----------------------------------------"
+docker inspect $CONTAINER | jq -r '
+  .[0].State.Health // "未配置健康检查" |
+  if type == "object" then
+    "状态: " + .Status + "\n" +
+    "失败次数: " + (.FailingStreak | tostring) + "\n" +
+    "最后检查: " + (.Log[-1].Start // "N/A")
+  else . end
+'
+
+# 7. 网络连接
+echo -e "\n[7] 网络连接"
+echo "----------------------------------------"
+docker exec $CONTAINER sh -c 'netstat -tunlp 2>/dev/null || ss -tunlp' 2>/dev/null | head -10 || echo "无法获取网络信息"
+
+# 8. 磁盘使用
+echo -e "\n[8] 磁盘使用"
+echo "----------------------------------------"
+docker exec $CONTAINER df -h 2>/dev/null | grep -E "Filesystem|/$" || echo "无法获取磁盘信息"
+
+# 9. 相关事件
+echo -e "\n[9] 容器事件(最近10条)"
+echo "----------------------------------------"
+docker events --filter "container=$CONTAINER" --since 1h --until 0s 2>/dev/null | tail -10 || echo "无近期事件"
+
+# 10. 建议操作
+echo -e "\n[10] 诊断建议"
+echo "----------------------------------------"
+
+# 检查容器状态
+STATUS=$(docker inspect -f '{{.State.Status}}' $CONTAINER)
+if [ "$STATUS" != "running" ]; then
+    echo "⚠️  容器未运行,建议:"
+    echo "   1. 查看退出原因: docker logs $CONTAINER"
+    echo "   2. 检查启动命令: docker inspect $CONTAINER | jq '.[0].Config.Cmd'"
+    echo "   3. 尝试重启: docker start $CONTAINER"
+fi
+
+# 检查OOM
+OOM=$(docker inspect -f '{{.State.OOMKilled}}' $CONTAINER)
+if [ "$OOM" = "true" ]; then
+    echo "⚠️  检测到OOM Killer,建议:"
+    echo "   1. 增加内存限制: docker update --memory 2g $CONTAINER"
+    echo "   2. 分析内存使用: docker stats $CONTAINER"
+    echo "   3. 检查应用内存泄漏"
+fi
+
+# 检查重启次数
+RESTART_COUNT=$(docker inspect -f '{{.RestartCount}}' $CONTAINER)
+if [ "$RESTART_COUNT" -gt 5 ]; then
+    echo "⚠️  容器频繁重启($RESTART_COUNT次),建议:"
+    echo "   1. 查看启动日志: docker logs $CONTAINER"
+    echo "   2. 检查健康检查配置"
+    echo "   3. 验证依赖服务是否正常"
+fi
+
+echo -e "\n=========================================="
+echo "诊断完成"
+echo "=========================================="
+```
+
+**执行快速诊断**
+```bash
+chmod +x docker-diagnose.sh
+./docker-diagnose.sh my-app
+
+# 示例输出(部分)
+==========================================
+Docker容器快速诊断: my-app
+时间: 2025-12-10 14:30:00
+==========================================
+
+[1] 容器状态
+----------------------------------------
+状态: Up 2 hours
+创建: 2025-12-10 12:30:00
+镜像: myapp:latest
+端口: 0.0.0.0:8080->8080/tcp
+
+[3] 资源使用
+----------------------------------------
+CPU: 45.23%
+内存: 1.2GiB / 2GiB (60%)
+网络: 1.2MB / 3.4MB
+磁盘: 45MB / 12MB
+
+[10] 诊断建议
+----------------------------------------
+⚠️  容器频繁重启(8次),建议:
+   1. 查看启动日志: docker logs my-app
+   2. 检查健康检查配置
+   3. 验证依赖服务是否正常
+```
+
+## 18.2 容器故障排查
+
+### 18.2.1 容器无法启动
+
+**问题场景1: 镜像拉取失败**
+```bash
+# 症状
+docker run myapp:latest
+# Unable to find image 'myapp:latest' locally
+# Error response from daemon: pull access denied for myapp
+
+# 排查步骤
+# 1. 检查镜像是否存在
+docker images | grep myapp
+
+# 2. 检查镜像仓库连接
+docker login registry.example.com
+# 输入用户名密码
+
+# 3. 手动拉取镜像
+docker pull registry.example.com/myapp:latest
+
+# 4. 使用完整镜像名
+docker run registry.example.com/myapp:latest
+
+# 5. 检查网络连接
+curl -I https://registry.example.com
+ping registry.example.com
+
+# 解决方案
+# A. 配置镜像仓库认证
+cat > ~/.docker/config.json <<EOF
+{
+  "auths": {
+    "registry.example.com": {
+      "auth": "base64(username:password)"
+    }
+  }
+}
+EOF
+
+# B. 使用本地构建
+docker build -t myapp:latest .
+
+# C. 配置镜像加速器
+cat > /etc/docker/daemon.json <<EOF
+{
+  "registry-mirrors": [
+    "https://mirror.example.com"
+  ]
+}
+EOF
+systemctl restart docker
+```
+
+**问题场景2: 端口冲突**
+```bash
+# 症状
+docker run -d -p 8080:8080 myapp
+# Error: Bind for 0.0.0.0:8080 failed: port is already allocated
+
+# 排查步骤
+# 1. 查看端口占用
+netstat -tunlp | grep 8080
+# 或
+ss -tunlp | grep 8080
+# 或
+lsof -i :8080
+
+# 示例输出
+tcp  0  0  0.0.0.0:8080  0.0.0.0:*  LISTEN  12345/docker-proxy
+
+# 2. 查找占用端口的容器
+docker ps --format "{{.ID}}\t{{.Ports}}" | grep 8080
+
+# 3. 停止冲突的容器
+docker stop <container_id>
+
+# 解决方案
+# A. 使用不同端口
+docker run -d -p 8081:8080 myapp
+
+# B. 停止占用端口的服务
+systemctl stop apache2  # 如果是系统服务
+
+# C. 使用动态端口分配
+docker run -d -p 8080 myapp  # Docker自动分配宿主机端口
+docker port <container_id>   # 查看分配的端口
+```
+
+**问题场景3: 资源不足**
+```bash
+# 症状
+docker run -d --memory 16g myapp
+# Error: Cannot start container: not enough memory
+
+# 排查步骤
+# 1. 检查系统可用内存
+free -h
+#               total        used        free      shared  buff/cache   available
+# Mem:           15Gi       12Gi        500Mi       100Mi        2.5Gi        2.5Gi
+
+# 2. 检查Docker资源使用
+docker stats --no-stream
+
+# 3. 检查磁盘空间
+df -h
+docker system df
+
+# 示例输出
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          25        10        8.5GB     4.2GB (49%)
+Containers      15        10        2.1GB     500MB (23%)
+Local Volumes   5         3         1.2GB     800MB (66%)
+
+# 解决方案
+# A. 降低资源限制
+docker run -d --memory 4g myapp
+
+# B. 清理未使用资源
+docker system prune -a --volumes
+# 警告: 会删除所有未使用的镜像、容器、网络、卷
+
+# C. 增加系统资源
+# - 增加物理内存
+# - 调整swap大小
+dd if=/dev/zero of=/swapfile bs=1G count=8
+mkswap /swapfile
+swapon /swapfile
+
+# D. 迁移到资源充足的节点(Swarm)
+docker service update --constraint-add node.labels.size==large myapp
+```
+
+**问题场景4: 依赖服务未就绪**
+```bash
+# 症状
+docker logs myapp
+# Error: connection refused to database:5432
+# Container exits immediately after start
+
+# 排查步骤
+# 1. 检查依赖服务状态
+docker ps | grep database
+
+# 2. 测试连接
+docker run --rm --network myapp_network \
+  alpine sh -c 'nc -zv database 5432'
+
+# 3. 查看容器启动顺序
+docker-compose ps
+
+# 解决方案
+# A. 使用depends_on + 健康检查
+version: '3.8'
+services:
+  database:
+    image: postgres:15
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    image: myapp:latest
+    depends_on:
+      database:
+        condition: service_healthy
+
+# B. 应用内实现重试逻辑
+import time
+import psycopg2
+
+def connect_db(max_retries=30, delay=2):
+    for i in range(max_retries):
+        try:
+            conn = psycopg2.connect(
+                host="database",
+                port=5432,
+                user="postgres"
+            )
+            return conn
+        except psycopg2.OperationalError:
+            if i < max_retries - 1:
+                print(f"数据库连接失败,{delay}秒后重试... ({i+1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                raise
+
+# C. 使用wait-for-it脚本
+#!/bin/bash
+# wait-for-it.sh
+set -e
+
+host="$1"
+shift
+cmd="$@"
+
+until nc -z "$host" 5432; do
+  echo "等待 $host:5432..."
+  sleep 1
+done
+
+echo "$host:5432 已就绪"
+exec $cmd
+
+# Dockerfile
+COPY wait-for-it.sh /usr/local/bin/
+ENTRYPOINT ["wait-for-it.sh", "database:5432", "--"]
+CMD ["python", "app.py"]
+```
+
+### 18.2.2 容器异常退出
+
+**退出代码分析**
+```bash
+# 查看容器退出代码
+docker inspect -f '{{.State.ExitCode}}' myapp
+
+# 常见退出代码含义
+# 0    : 正常退出
+# 1    : 应用错误(通用错误)
+# 125  : Docker守护进程错误
+# 126  : 命令无法执行
+# 127  : 命令未找到
+# 128+n: 信号终止(n为信号编号)
+#   137 = 128 + 9 (SIGKILL,强制杀死)
+#   139 = 128 + 11 (SIGSEGV,段错误)
+#   143 = 128 + 15 (SIGTERM,正常终止)
+```
+
+**场景1: OOM Killer**
+```bash
+# 症状
+docker inspect -f '{{.State.OOMKilled}}' myapp
+# true
+
+docker logs myapp
+# (无输出或突然中断)
+
+# 查看系统日志
+dmesg | grep -i "out of memory"
+journalctl -k | grep -i "killed process"
+
+# 示例输出
+[12345.678] Out of memory: Killed process 23456 (java) total-vm:4194304kB
+
+# 排查步骤
+# 1. 查看内存限制
+docker inspect myapp | jq '.[0].HostConfig.Memory'
+
+# 2. 查看实际内存使用
+docker stats myapp --no-stream
+
+# 3. 分析内存趋势
+# 使用cAdvisor或Prometheus查看历史数据
+
+# 解决方案
+# A. 增加内存限制
+docker update --memory 4g --memory-swap 6g myapp
+
+# B. 调整OOM优先级
+docker update --oom-score-adj -500 myapp  # 降低被杀概率
+
+# C. 优化应用内存使用
+# Java应用
+docker run -e JAVA_OPTS="-Xms1g -Xmx2g -XX:+UseG1GC" myapp
+
+# D. 启用Swap(谨慎使用)
+docker run --memory 2g --memory-swap 4g myapp
+```
+
+**场景2: 应用崩溃**
+```bash
+# 症状
+docker logs myapp
+# Traceback (most recent call last):
+#   File "app.py", line 42
+#     result = process_data(None)
+# AttributeError: 'NoneType' object has no attribute 'split'
+
+# 排查步骤
+# 1. 查看完整日志
+docker logs --tail 200 myapp > myapp.log
+
+# 2. 进入容器调试(如果可以启动)
+docker run -it --entrypoint /bin/bash myapp
+
+# 3. 检查配置文件
+docker exec myapp cat /app/config.yaml
+
+# 4. 查看环境变量
+docker exec myapp env
+
+# 解决方案
+# A. 修复代码bug
+def process_data(data):
+    if data is None:
+        raise ValueError("data cannot be None")
+    return data.split(',')
+
+# B. 添加异常处理
+try:
+    result = process_data(data)
+except Exception as e:
+    logger.error(f"处理失败: {e}")
+    # 优雅降级或返回默认值
+
+# C. 重新构建镜像
+docker build -t myapp:latest .
+docker service update --image myapp:latest myapp
+```
+
+**场景3: 健康检查失败**
+```bash
+# 症状
+docker ps
+# STATUS: Up 5 minutes (unhealthy)
+
+docker inspect myapp | jq '.[0].State.Health.Log[-3:]'
+# [
+#   {
+#     "Start": "2025-12-10T14:30:00Z",
+#     "End": "2025-12-10T14:30:03Z",
+#     "ExitCode": 1,
+#     "Output": "HTTP/1.1 503 Service Unavailable"
+#   }
+# ]
+
+# 排查步骤
+# 1. 手动执行健康检查命令
+docker exec myapp curl -f http://localhost:8080/health
+
+# 2. 查看应用日志
+docker logs myapp | grep -i "health"
+
+# 3. 检查健康检查配置
+docker inspect myapp | jq '.[0].Config.Healthcheck'
+
+# 解决方案
+# A. 调整健康检查参数
+# Dockerfile
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+# B. 修复健康检查端点
+@app.route('/health')
+def health():
+    # 检查关键依赖
+    try:
+        db.execute("SELECT 1")
+        redis.ping()
+        return jsonify({"status": "healthy"}), 200
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 503
+
+# C. 增加启动时间(start-period)
+docker run --health-cmd="curl -f http://localhost:8080/health" \
+           --health-interval=30s \
+           --health-start-period=120s \
+           myapp
+
+# D. 禁用健康检查(临时调试)
+docker run --no-healthcheck myapp
+```
+
+### 18.2.3 容器性能问题
+
+**场景1: CPU使用率100%**
+```bash
+# 症状
+docker stats myapp
+# CPU %: 399.5%  (4核心全部跑满)
+
+# 排查步骤
+# 1. 查看容器内进程
+docker top myapp
+
+# 2. 进入容器使用top
+docker exec -it myapp top
+
+# 3. CPU profiling
+# 获取容器PID
+PID=$(docker inspect -f '{{.State.Pid}}' myapp)
+
+# 使用perf分析
+perf record -F 99 -p $PID -g -- sleep 30
+perf report
+
+# 或使用py-spy(Python)
+docker exec myapp pip install py-spy
+docker exec myapp py-spy top --pid 1
+
+# 4. 查看慢查询
+docker exec myapp-db psql -c "
+  SELECT query, calls, total_time, mean_time
+  FROM pg_stat_statements
+  ORDER BY total_time DESC
+  LIMIT 10;
+"
+
+# 解决方案
+# A. 优化代码热点
+# 使用缓存减少计算
+# 异步处理耗时操作
+# 优化算法复杂度
+
+# B. 增加CPU配额
+docker update --cpus 8 myapp
+
+# C. 横向扩展
+docker service scale myapp=4
+
+# D. 限制并发
+# Gunicorn
+workers = 4  # 降低worker数量
+threads = 2
+worker_class = "gthread"
+
+# E. 限流
+from flask_limiter import Limiter
+
+limiter = Limiter(
+    app,
+    default_limits=["100 per minute"]
+)
+```
+
+**场景2: 内存持续增长**
+```bash
+# 症状
+docker stats myapp
+# 内存使用持续增长: 500MB -> 1GB -> 1.5GB -> ...
+
+# 排查步骤
+# 1. 监控内存趋势
+watch -n 5 'docker stats myapp --no-stream'
+
+# 2. 查看进程内存分布
+docker exec myapp cat /proc/1/status | grep -i mem
+
+# 3. Python内存分析
+docker exec myapp pip install memory_profiler
+docker exec myapp python -m memory_profiler app.py
+
+# 4. Java堆分析
+docker exec myapp jmap -heap 1
+docker exec myapp jmap -dump:file=/tmp/heap.hprof 1
+docker cp myapp:/tmp/heap.hprof .
+# 使用MAT分析
+
+# 5. 检查缓存大小
+docker exec myapp-redis redis-cli info memory
+
+# 解决方案
+# A. 查找内存泄漏
+# Python
+import tracemalloc
+
+tracemalloc.start()
+
+# ... 运行一段时间 ...
+
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics('lineno')
+
+for stat in top_stats[:10]:
+    print(stat)
+
+# B. 限制缓存大小
+from functools import lru_cache
+
+@lru_cache(maxsize=1000)  # 最多缓存1000条
+def expensive_function(param):
+    pass
+
+# C. 定期重启worker
+# Gunicorn
+max_requests = 10000
+max_requests_jitter = 1000
+
+# D. 配置GC
+# Java
+JAVA_OPTS="-Xms2g -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+# E. 增加内存限制(最后手段)
+docker update --memory 4g myapp
+```
+
+**场景3: 磁盘IO瓶颈**
+```bash
+# 症状
+docker stats myapp
+# BLOCK I/O: 1.2GB / 3.4GB (持续高IO)
+
+# 应用响应缓慢,尤其是数据库操作
+
+# 排查步骤
+# 1. 查看IO统计
+iostat -x 1 10
+
+# 示例输出
+Device    r/s     w/s   rkB/s   wkB/s  await  %util
+sda      150.0   300.0  6000    12000  25.5   98.0
+
+# 2. 查看容器IO
+docker stats myapp --no-stream --format \
+  "{{.Container}}: {{.BlockIO}}"
+
+# 3. 查找IO热点进程
+iotop -o  # 仅显示有IO的进程
+
+# 4. 数据库慢查询
+docker exec postgres-db psql -c "
+  SELECT * FROM pg_stat_activity
+  WHERE state = 'active'
+  AND query_start < NOW() - INTERVAL '5 seconds';
+"
+
+# 解决方案
+# A. 优化存储驱动
+# 确保使用overlay2
+docker info | grep "Storage Driver"
+
+# B. 使用更快的存储
+# 迁移到SSD/NVMe
+# 使用tmpfs for临时数据
+docker run -v type=tmpfs,target=/tmp,tmpfs-size=1G myapp
+
+# C. 调整IO调度器
+echo none > /sys/block/nvme0n1/queue/scheduler
+
+# D. 数据库优化
+# PostgreSQL
+shared_buffers = 8GB
+effective_cache_size = 24GB
+random_page_cost = 1.1  # SSD
+checkpoint_completion_target = 0.9
+
+# E. 应用层优化
+# 批量操作
+# 减少数据库查询
+# 使用索引
+# 启用查询缓存
+```
+
+### 18.2.4 数据持久化问题
+
+**场景1: 数据丢失**
+```bash
+# 症状
+# 容器重启后数据丢失
+
+# 排查步骤
+# 1. 检查卷挂载
+docker inspect myapp | jq '.[0].Mounts'
+
+# 2. 验证数据位置
+docker exec myapp ls -la /var/lib/mysql
+
+# 3. 检查卷是否存在
+docker volume ls | grep myapp
+
+# 解决方案
+# A. 正确挂载卷
+docker run -v myapp-data:/var/lib/mysql mysql:8
+
+# B. 使用bind mount
+docker run -v /data/mysql:/var/lib/mysql mysql:8
+
+# C. Docker Compose
+version: '3.8'
+services:
+  db:
+    image: mysql:8
+    volumes:
+      - db-data:/var/lib/mysql
+
+volumes:
+  db-data:
+    driver: local
+```
+
+**场景2: 权限问题**
+```bash
+# 症状
+docker logs myapp
+# Permission denied: '/data/app.log'
+
+# 排查步骤
+# 1. 检查文件权限
+docker exec myapp ls -la /data
+
+# 2. 检查容器运行用户
+docker inspect myapp | jq '.[0].Config.User'
+
+# 3. 检查宿主机权限
+ls -la /mnt/data
+
+# 解决方案
+# A. 修改宿主机权限
+sudo chown -R 1000:1000 /mnt/data
+
+# B. 以root运行(不推荐)
+docker run --user root myapp
+
+# C. Dockerfile指定用户
+FROM python:3.11-slim
+
+RUN groupadd -r app && useradd -r -g app app
+
+WORKDIR /app
+COPY --chown=app:app . .
+
+USER app
+CMD ["python", "app.py"]
+
+# D. init容器修复权限
+docker run --rm -v myapp-data:/data \
+  busybox chown -R 1000:1000 /data
+```
+
+## 18.3 网络故障排查
+
+### 18.3.1 容器间网络不通
+
+**排查工具箱**
+```bash
+# 安装网络调试工具
+docker run -it --rm --network myapp_network \
+  nicolaka/netshoot
+
+# 工具包含:
+# - ping, traceroute, mtr
+# - curl, wget, httpie
+# - netstat, ss, lsof
+# - tcpdump, nmap
+# - dig, nslookup, host
+# - iperf3
+```
+
+**场景1: DNS解析失败**
+```bash
+# 症状
+docker exec app curl database:5432
+# curl: (6) Could not resolve host: database
+
+# 排查步骤
+# 1. 测试DNS解析
+docker exec app nslookup database
+
+# 2. 检查DNS配置
+docker exec app cat /etc/resolv.conf
+
+# 3. 检查网络连接
+docker inspect app | jq '.[0].NetworkSettings.Networks'
+
+# 4. 验证服务发现
+docker network inspect myapp_network | jq '.[0].Containers'
+
+# 解决方案
+# A. 确保在同一网络
+docker network connect myapp_network app
+
+# B. 使用IP地址(临时)
+DATABASE_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' database)
+docker exec app curl $DATABASE_IP:5432
+
+# C. 配置自定义DNS
+docker run --dns 8.8.8.8 --dns 8.8.4.4 myapp
+
+# D. 检查Docker DNS服务
+docker exec app cat /etc/resolv.conf
+# nameserver 127.0.0.11  # Docker内置DNS
+
+# 验证内置DNS
+docker exec app nslookup database 127.0.0.11
+```
+
+**场景2: 端口不通**
+```bash
+# 症状
+docker exec app curl database:5432
+# curl: (7) Failed to connect to database port 5432: Connection refused
+
+# 排查步骤
+# 1. 检查端口监听
+docker exec database netstat -tunlp | grep 5432
+
+# 或
+docker exec database ss -tunlp | grep 5432
+
+# 2. 测试端口连通性
+docker exec app nc -zv database 5432
+# Connection to database 5432 port [tcp/postgresql] succeeded!
+
+# 或使用telnet
+docker exec app telnet database 5432
+
+# 3. 检查防火墙规则
+iptables -L -n | grep 5432
+
+# 4. 抓包分析
+docker exec app tcpdump -i eth0 port 5432
+
+# 解决方案
+# A. 确认应用监听正确地址
+# 不要监听localhost,要监听0.0.0.0
+bind = "0.0.0.0:5432"  # 正确
+bind = "127.0.0.1:5432"  # 错误,只能容器内访问
+
+# B. 检查防火墙
+# Docker自动配置iptables,一般不需要手动配置
+
+# C. 验证服务启动
+docker exec database ps aux | grep postgres
+```
+
+**场景3: 网络策略限制**
+```bash
+# 症状(使用Swarm网络策略时)
+# 部分容器可以访问,部分不能
+
+# 排查步骤
+# 1. 查看网络策略
+docker network inspect myapp_network
+
+# 2. 测试连通性矩阵
+for service in app1 app2 app3; do
+  echo "测试 $service:"
+  docker exec $service curl -s -o /dev/null -w "%{http_code}" database:5432
+done
+
+# 解决方案
+# A. 使用overlay网络(Swarm)
+docker network create --driver overlay myapp_network
+
+# B. 确保服务在同一网络
+docker service update --network-add myapp_network app
+
+# C. 使用服务名而非容器名
+curl database:5432  # 正确(服务名)
+curl database.1.abc123:5432  # 错误(容器名)
+```
+
+### 18.3.2 外部访问不通
+
+**场景1: 端口映射问题**
+```bash
+# 症状
+curl http://localhost:8080
+# curl: (7) Failed to connect to localhost port 8080
+
+# 排查步骤
+# 1. 检查端口映射
+docker ps --format "{{.Names}}: {{.Ports}}"
+
+# 2. 检查端口监听
+netstat -tunlp | grep 8080
+ss -tunlp | grep 8080
+
+# 3. 测试从宿主机访问
+curl http://localhost:8080
+curl http://127.0.0.1:8080
+curl http://$(hostname -I | awk '{print $1}'):8080
+
+# 4. 检查防火墙
+iptables -L -n -v | grep 8080
+firewall-cmd --list-all
+
+# 解决方案
+# A. 正确的端口映射格式
+docker run -p 8080:80 nginx  # 宿主机8080 -> 容器80
+
+# B. 绑定所有接口
+docker run -p 0.0.0.0:8080:80 nginx
+
+# C. 开放防火墙端口
+firewall-cmd --add-port=8080/tcp --permanent
+firewall-cmd --reload
+
+# D. 检查Docker iptables规则
+iptables -t nat -L -n | grep 8080
+```
+
+**场景2: Swarm路由网格问题**
+```bash
+# 症状
+# 某些节点可以访问服务,某些不能
+
+# 排查步骤
+# 1. 检查服务发布端口
+docker service inspect myapp | jq '.[0].Endpoint.Ports'
+
+# 2. 测试每个节点
+for node in node1 node2 node3; do
+  echo "测试 $node:"
+  ssh $node "curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080"
+done
+
+# 3. 检查ingress网络
+docker network inspect ingress
+
+# 4. 查看节点可用性
+docker node ls
+
+# 解决方案
+# A. 重建ingress网络
+docker network rm ingress
+docker network create \
+  --driver overlay \
+  --ingress \
+  --subnet=10.0.0.0/24 \
+  --gateway=10.0.0.1 \
+  ingress
+
+# B. 检查节点防火墙
+# 确保以下端口开放:
+# - 2377/tcp (cluster management)
+# - 7946/tcp+udp (container network discovery)
+# - 4789/udp (overlay network traffic)
+
+# C. 服务使用host模式
+docker service create --mode global --publish mode=host,target=80,published=8080 nginx
+```
+
+## 18.4 日志分析与调试
+
+### 18.4.1 日志收集技巧
+
+**结构化日志查询**
+```bash
+# 按时间范围
+docker logs --since "2025-12-10T14:00:00" --until "2025-12-10T15:00:00" myapp
+
+# 按时间相对值
+docker logs --since 1h myapp  # 最近1小时
+docker logs --since 30m myapp  # 最近30分钟
+
+# 实时跟踪
+docker logs -f myapp
+
+# 只看最新N行
+docker logs --tail 100 myapp
+
+# 包含时间戳
+docker logs -t myapp
+
+# 过滤关键字
+docker logs myapp 2>&1 | grep -i error
+docker logs myapp 2>&1 | grep -E "(ERROR|WARN|FATAL)"
+
+# 统计错误数量
+docker logs myapp 2>&1 | grep -c ERROR
+
+# 保存到文件
+docker logs myapp > myapp_$(date +%Y%m%d_%H%M%S).log
+```
+
+**多容器日志聚合**
+```bash
+#!/bin/bash
+# collect-logs.sh - 收集所有服务日志
+
+SERVICES=$(docker service ls --format "{{.Name}}")
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_DIR="logs_$TIMESTAMP"
+
+mkdir -p $LOG_DIR
+
+for service in $SERVICES; do
+    echo "收集 $service 日志..."
+
+    # 获取服务的所有任务
+    TASKS=$(docker service ps $service --format "{{.Name}}.{{.ID}}" --filter "desired-state=running")
+
+    for task in $TASKS; do
+        CONTAINER=$(docker ps --filter "name=$task" --format "{{.ID}}")
+        if [ -n "$CONTAINER" ]; then
+            docker logs $CONTAINER > "$LOG_DIR/${service}_${CONTAINER:0:12}.log" 2>&1
+            echo "  ✓ $CONTAINER"
+        fi
+    done
+done
+
+# 打包
+tar -czf logs_$TIMESTAMP.tar.gz $LOG_DIR
+echo "日志已保存到: logs_$TIMESTAMP.tar.gz"
+```
+
+### 18.4.2 常见错误模式
+
+**错误模式识别脚本**
+```bash
+#!/bin/bash
+# analyze-errors.sh - 分析日志中的错误模式
+
+LOG_FILE=$1
+
+if [ -z "$LOG_FILE" ]; then
+    echo "用法: $0 <日志文件>"
+    exit 1
+fi
+
+echo "=========================================="
+echo "日志错误分析: $LOG_FILE"
+echo "=========================================="
+
+# 1. 错误统计
+echo -e "\n[1] 错误级别统计"
+echo "----------------------------------------"
+echo "FATAL: $(grep -c FATAL $LOG_FILE)"
+echo "ERROR: $(grep -c ERROR $LOG_FILE)"
+echo "WARN:  $(grep -c WARN $LOG_FILE)"
+
+# 2. Top 10错误类型
+echo -e "\n[2] Top 10 错误类型"
+echo "----------------------------------------"
+grep -oP '(?<=Exception: ).*' $LOG_FILE | sort | uniq -c | sort -rn | head -10
+
+# 3. 时间分布
+echo -e "\n[3] 错误时间分布"
+echo "----------------------------------------"
+grep ERROR $LOG_FILE | awk '{print $1}' | cut -d: -f1 | sort | uniq -c
+
+# 4. 相关错误(前后5行)
+echo -e "\n[4] 首个FATAL错误上下文"
+echo "----------------------------------------"
+grep -n -A 5 -B 5 FATAL $LOG_FILE | head -20
+
+# 5. 错误趋势
+echo -e "\n[5] 每分钟错误数"
+echo "----------------------------------------"
+grep ERROR $LOG_FILE | awk '{print substr($2,1,5)}' | sort | uniq -c | tail -20
+
+echo -e "\n=========================================="
+```
+
+**Python日志分析**
+```python
+#!/usr/bin/env python3
+# log_analyzer.py - 高级日志分析
+
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime
+
+def analyze_log(log_file):
+    """分析日志文件"""
+
+    errors = []
+    errors_by_type = Counter()
+    errors_by_time = defaultdict(int)
+
+    # 正则模式
+    timestamp_pattern = r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
+    level_pattern = r'\[(ERROR|WARN|FATAL)\]'
+    exception_pattern = r'(\w+Exception|Error):'
+
+    with open(log_file, 'r') as f:
+        for line in f:
+            # 提取时间戳
+            ts_match = re.search(timestamp_pattern, line)
+            if ts_match:
+                timestamp = datetime.fromisoformat(ts_match.group(1))
+                hour_key = timestamp.strftime('%Y-%m-%d %H:00')
+
+            # 检查错误级别
+            level_match = re.search(level_pattern, line)
+            if level_match:
+                level = level_match.group(1)
+
+                # 统计错误类型
+                exception_match = re.search(exception_pattern, line)
+                if exception_match:
+                    error_type = exception_match.group(1)
+                    errors_by_type[error_type] += 1
+
+                # 时间分布
+                errors_by_time[hour_key] += 1
+
+                errors.append({
+                    'timestamp': timestamp if ts_match else None,
+                    'level': level,
+                    'message': line.strip()
+                })
+
+    # 报告
+    print("=" * 60)
+    print("日志分析报告")
+    print("=" * 60)
+
+    print(f"\n总错误数: {len(errors)}")
+
+    print("\nTop 10 错误类型:")
+    for error_type, count in errors_by_type.most_common(10):
+        print(f"  {error_type:30} {count:5} 次")
+
+    print("\n错误时间分布:")
+    for hour, count in sorted(errors_by_time.items())[-24:]:
+        print(f"  {hour}: {'=' * (count // 10)} ({count})")
+
+    # 检测错误峰值
+    max_errors = max(errors_by_time.values()) if errors_by_time else 0
+    avg_errors = sum(errors_by_time.values()) / len(errors_by_time) if errors_by_time else 0
+
+    print(f"\n错误峰值: {max_errors} 次/小时")
+    print(f"平均错误: {avg_errors:.1f} 次/小时")
+
+    if max_errors > avg_errors * 3:
+        print("\n⚠️  检测到错误峰值异常！")
+        # 找出峰值时间
+        peak_hours = [h for h, c in errors_by_time.items() if c > avg_errors * 2]
+        print(f"异常时间段: {', '.join(peak_hours)}")
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2:
+        print("用法: python log_analyzer.py <日志文件>")
+        sys.exit(1)
+
+    analyze_log(sys.argv[1])
+```
+
+### 18.4.3 实时调试技巧
+
+**进入运行中的容器**
+```bash
+# 方法1: exec bash
+docker exec -it myapp /bin/bash
+
+# 方法2: exec sh (Alpine镜像)
+docker exec -it myapp /bin/sh
+
+# 方法3: nsenter(容器无shell时)
+PID=$(docker inspect -f '{{.State.Pid}}' myapp)
+nsenter -t $PID -n -p -m /bin/bash
+
+# 在容器内调试
+# 安装工具
+apt-get update && apt-get install -y curl netcat-openbsd
+
+# 测试网络
+curl -v http://database:5432
+nc -zv database 5432
+
+# 查看进程
+ps aux
+top
+
+# 查看日志
+tail -f /var/log/app.log
+
+# 环境变量
+env | grep DATABASE
+
+# 文件系统
+df -h
+du -sh /data/*
+```
+
+**动态修改配置**
+```bash
+# 热重载配置(Nginx示例)
+docker exec nginx nginx -t  # 测试配置
+docker exec nginx nginx -s reload  # 重载配置
+
+# 修改日志级别(无需重启)
+docker exec myapp curl -X POST http://localhost:8080/admin/loglevel?level=DEBUG
+
+# 临时修改环境变量
+docker exec myapp sh -c 'export DEBUG=true && /app/restart.sh'
+```
+
+**性能剖析**
+```bash
+# Python - cProfile
+docker exec myapp python -m cProfile -o output.prof app.py
+
+# Python - 实时剖析
+docker exec myapp pip install py-spy
+docker exec myapp py-spy top --pid 1
+
+# Java - JFR(Java Flight Recorder)
+docker exec myapp jcmd 1 JFR.start duration=60s filename=/tmp/profile.jfr
+docker cp myapp:/tmp/profile.jfr .
+
+# Go - pprof
+docker exec myapp curl http://localhost:6060/debug/pprof/profile?seconds=30 > cpu.prof
+go tool pprof cpu.prof
+```
+
+## 18.5 生产环境故障案例
+
+### 18.5.1 案例1: 服务雪崩
+
+**故障现象**
+```
+2025-12-10 14:30:00 - 用户报告服务响应缓慢
+14:32:00 - 部分请求开始超时
+14:35:00 - 大量503错误
+14:38:00 - 所有服务不可用
+```
+
+**排查过程**
+```bash
+# 1. 检查服务状态
+docker service ls
+# 发现所有副本处于 0/3 状态
+
+# 2. 查看容器状态
+docker ps -a | grep myapp
+# 所有容器处于 Restarting 状态
+
+# 3. 查看日志
+docker service logs myapp --tail 100
+# 大量 "connection pool exhausted" 错误
+
+# 4. 检查数据库连接
+docker exec database psql -c "
+  SELECT count(*) FROM pg_stat_activity;
+"
+# 结果: 500 (超过max_connections=200)
+
+# 5. 查看网络连接
+docker exec app netstat -an | grep ESTABLISHED | wc -l
+# 结果: 每个容器350+连接
+```
+
+**根本原因**
+```
+1. 数据库慢查询导致连接占用时间过长
+2. 应用未正确释放数据库连接
+3. 连接池配置不合理(max_size=100,但数据库max_connections=200)
+4. 健康检查失败导致容器不断重启
+5. 重启容器产生更多连接,形成恶性循环
+```
+
+**解决方案**
+```bash
+# 紧急处理
+# 1. 临时提高数据库连接数
+docker exec database psql -c "ALTER SYSTEM SET max_connections = 500;"
+docker restart database
+
+# 2. 强制关闭空闲连接
+docker exec database psql -c "
+  SELECT pg_terminate_backend(pid)
+  FROM pg_stat_activity
+  WHERE state = 'idle' AND state_change < NOW() - INTERVAL '5 minutes';
+"
+
+# 3. 临时禁用健康检查
+docker service update --no-healthcheck myapp
+
+# 4. 减少副本数
+docker service scale myapp=2
+
+# 长期优化
+# A. 优化慢查询
+CREATE INDEX idx_user_created ON users(created_at);
+
+# B. 修复连接池配置
+# config.py
+DATABASE_POOL_SIZE = 20  # 每个实例20个连接
+DATABASE_MAX_OVERFLOW = 10  # 最多额外10个
+DATABASE_POOL_TIMEOUT = 30
+DATABASE_POOL_RECYCLE = 3600
+
+# C. 添加连接超时
+# sqlalchemy
+create_engine(
+    url,
+    pool_pre_ping=True,  # 连接前检查
+    pool_recycle=3600,   # 1小时回收
+    connect_args={
+        'connect_timeout': 10,
+        'options': '-c statement_timeout=30000'
+    }
+)
+
+# D. 实施断路器模式
+from circuitbreaker import circuit
+
+@circuit(failure_threshold=5, recovery_timeout=60)
+def query_database():
+    return db.execute(query)
+
+# E. 调整健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5
+```
+
+**预防措施**
+```yaml
+# 1. 监控告警
+- alert: DatabaseConnectionPoolExhausted
+  expr: db_connections_used / db_connections_max > 0.8
+  for: 5m
+  labels:
+    severity: warning
+
+- alert: SlowQuery
+  expr: rate(pg_slow_queries_total[5m]) > 10
+  for: 2m
+  labels:
+    severity: warning
+
+# 2. 资源限制
+services:
+  app:
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+      restart_policy:
+        condition: on-failure
+        delay: 10s  # 重启延迟
+        max_attempts: 3
+        window: 120s
+
+# 3. 限流
+from flask_limiter import Limiter
+
+limiter = Limiter(
+    app,
+    key_func=lambda: request.remote_addr,
+    default_limits=["200 per minute", "50 per second"]
+)
+```
+
+### 18.5.2 案例2: 磁盘空间耗尽
+
+**故障现象**
+```
+2025-12-10 10:00:00 - 容器写入失败
+10:05:00 - 新容器无法启动
+10:10:00 - Docker daemon响应缓慢
+```
+
+**排查过程**
+```bash
+# 1. 检查磁盘空间
+df -h
+# Filesystem      Size  Used Avail Use% Mounted on
+# /dev/sda1       100G   98G  2.0G  98% /
+
+# 2. 查找大文件
+du -sh /* | sort -h | tail -10
+
+# 3. Docker磁盘使用
+docker system df
+# TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+# Images          150       20        45GB      30GB (66%)
+# Containers      80        30        15GB      10GB (66%)
+# Local Volumes   30        10        35GB      25GB (71%)
+# Build Cache     -         -         5GB       5GB
+
+# 4. 详细分析
+docker system df -v
+
+# 5. 查找大日志文件
+find /var/lib/docker/containers/ -name "*-json.log" -exec ls -lh {} \; | sort -k 5 -h | tail -10
+```
+
+**根本原因**
+```
+1. 容器日志未限制大小,单个日志文件达到10GB+
+2. 大量未使用的镜像和容器未清理
+3. 应用日志写入容器内,未挂载卷
+4. 未配置日志轮转
+```
+
+**解决方案**
+```bash
+# 紧急清理
+# 1. 清理未使用资源
+docker system prune -a --volumes -f
+# 释放约60GB空间
+
+# 2. 清理大日志文件
+find /var/lib/docker/containers/ -name "*-json.log" -exec truncate -s 0 {} \;
+
+# 3. 临时移动数据
+docker volume create temp-vol
+docker run --rm -v old-vol:/source -v temp-vol:/dest alpine sh -c "mv /source/* /dest/"
+
+# 长期方案
+# A. 配置日志限制
+# /etc/docker/daemon.json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3",
+    "compress": "true"
+  }
+}
+
+systemctl restart docker
+
+# B. 使用外部日志驱动
+# docker-compose.yml
+version: '3.8'
+services:
+  app:
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: localhost:24224
+        tag: app.{{.Name}}
+
+# C. 应用日志挂载卷
+services:
+  app:
+    volumes:
+      - app-logs:/var/log/app
+
+# D. 定时清理任务
+# crontab
+0 2 * * * docker system prune -f > /dev/null 2>&1
+0 3 * * 0 docker system prune -a --volumes -f > /dev/null 2>&1
+
+# E. 监控告警
+- alert: DiskSpaceHigh
+  expr: (node_filesystem_avail_bytes{mountpoint="/var/lib/docker"} / node_filesystem_size_bytes{mountpoint="/var/lib/docker"}) < 0.15
+  for: 5m
+  labels:
+    severity: warning
+```
+
+### 18.5.3 案例3: 内存泄漏
+
+**故障现象**
+```
+应用内存使用持续增长
+1小时: 500MB
+2小时: 1.2GB
+4小时: 2.5GB
+6小时: OOM Killed
+```
+
+**排查过程**
+```bash
+# 1. 监控内存趋势
+watch -n 5 'docker stats myapp --no-stream'
+
+# 2. 查看OOM事件
+docker inspect myapp | jq '.[0].State.OOMKilled'
+dmesg | grep -i "out of memory"
+
+# 3. 分析堆内存(Java)
+docker exec myapp jmap -heap 1
+
+Heap Usage:
+Eden Space:     89% used
+Old Generation: 95% used  # 持续增长
+
+# 4. 生成堆转储
+docker exec myapp jmap -dump:live,format=b,file=/tmp/heap.hprof 1
+
+# 5. 分析堆转储(MAT)
+# 发现大量未释放的Session对象
+# 每个Session持有大量缓存数据
+# Session没有正确过期
+
+# 6. 检查应用代码
+# 发现全局缓存无限增长
+cache = {}  # 全局字典
+def get_data(key):
+    if key not in cache:
+        cache[key] = fetch_data(key)  # 永不删除!
+    return cache[key]
+```
+
+**解决方案**
+```python
+# A. 使用LRU缓存
+from functools import lru_cache
+
+@lru_cache(maxsize=1000)
+def get_data(key):
+    return fetch_data(key)
+
+# B. 使用TTL缓存
+from cachetools import TTLCache
+
+cache = TTLCache(maxsize=1000, ttl=3600)
+
+def get_data(key):
+    if key not in cache:
+        cache[key] = fetch_data(key)
+    return cache[key]
+
+# C. 定期清理
+import threading
+import time
+
+def cleanup_cache():
+    while True:
+        time.sleep(3600)  # 1小时
+        old_keys = [k for k, v in cache.items()
+                    if v['timestamp'] < time.time() - 7200]
+        for k in old_keys:
+            del cache[k]
+
+cleanup_thread = threading.Thread(target=cleanup_cache, daemon=True)
+cleanup_thread.start()
+
+# D. 使用Redis外部缓存
+import redis
+
+redis_client = redis.Redis(host='redis', decode_responses=True)
+
+def get_data(key):
+    cached = redis_client.get(key)
+    if cached:
+        return json.loads(cached)
+
+    data = fetch_data(key)
+    redis_client.setex(key, 3600, json.dumps(data))  # 1小时过期
+    return data
+
+# E. Session管理
+# Flask
+app.config['SESSION_TYPE'] = 'redis'
+app.config['SESSION_PERMANENT'] = False
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=1)
+```
+
+**验证修复**
+```bash
+# 1. 重新部署
+docker service update --image myapp:fixed myapp
+
+# 2. 长期监控
+# Prometheus query
+rate(container_memory_usage_bytes{name="myapp"}[1h])
+
+# 3. 设置告警
+- alert: MemoryLeakSuspected
+  expr: |
+    (container_memory_usage_bytes{name="myapp"} -
+     container_memory_usage_bytes{name="myapp"} offset 1h) > 500000000
+  for: 2h
+  labels:
+    severity: warning
+```
+
+---
+
+*（第18章完成,约2000行。已完成18章,剩余1章...）*
+
+---
+
+📝 **下一章预告**: 企业级最佳实践、安全加固、CI/CD集成、生产案例分析
 
 ---
