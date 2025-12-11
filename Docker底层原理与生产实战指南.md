@@ -22257,6 +22257,2018 @@ rate(container_memory_usage_bytes{name="myapp"}[1h])
 
 ---
 
-📝 **下一章预告**: 企业级最佳实践、安全加固、CI/CD集成、生产案例分析
+# 第19章: 最佳实践与案例
+
+本章汇总Docker在企业级生产环境的最佳实践,涵盖安全加固、CI/CD集成、迁移策略和常见避坑指南,帮助您构建稳定、安全、高效的容器化平台。
 
 ---
+
+## 19.1 企业级部署案例
+
+### 19.1.1 电商平台微服务架构
+
+**架构概览**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         外部用户                              │
+└───────────────┬─────────────────────────────────────────────┘
+                │
+         ┌──────▼──────┐
+         │   CloudFlare CDN   │
+         │   (DDoS防护/缓存)   │
+         └──────┬──────┘
+                │
+         ┌──────▼──────┐
+         │   Nginx Ingress    │
+         │   (SSL/WAF/限流)   │
+         └──────┬──────┘
+                │
+    ┌───────────┼───────────┐
+    │           │           │
+┌───▼───┐  ┌───▼───┐  ┌───▼───┐
+│Web前端 │  │API网关 │  │管理后台│
+└───┬───┘  └───┬───┘  └───┬───┘
+    │          │          │
+    └──────┬───┴────┬─────┘
+           │        │
+    ┌──────▼────────▼──────┐
+    │   业务服务层 (Swarm)    │
+    │  ┌────────────────┐  │
+    │  │用户服务  订单服务│  │
+    │  │商品服务  支付服务│  │
+    │  │库存服务  物流服务│  │
+    │  └────────────────┘  │
+    └──────┬────────┬──────┘
+           │        │
+    ┌──────▼────┐  ┌▼──────┐
+    │PostgreSQL │  │ Redis  │
+    │   集群     │  │ 集群   │
+    └───────────┘  └────────┘
+```
+
+**Docker Stack 配置**:
+
+```yaml
+# ecommerce-stack.yml
+version: '3.8'
+
+networks:
+  frontend:
+    driver: overlay
+    attachable: true
+  backend:
+    driver: overlay
+    internal: true
+  db:
+    driver: overlay
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_data:
+
+secrets:
+  db_password:
+    external: true
+  jwt_secret:
+    external: true
+  payment_api_key:
+    external: true
+
+services:
+  # ==================== API网关 ====================
+  api_gateway:
+    image: registry.company.com/api-gateway:v2.3.1
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "8080:8080"
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+      - RATE_LIMIT_RPS=1000
+      - JWT_SECRET_FILE=/run/secrets/jwt_secret
+    secrets:
+      - jwt_secret
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "fluentd.company.com:24224"
+        tag: "api_gateway"
+
+  # ==================== 用户服务 ====================
+  user_service:
+    image: registry.company.com/user-service:v1.5.2
+    deploy:
+      replicas: 3
+      placement:
+        constraints:
+          - node.labels.tier == app
+      update_config:
+        parallelism: 1
+        delay: 10s
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    networks:
+      - backend
+      - db
+    environment:
+      - DB_HOST=postgres-master
+      - DB_PORT=5432
+      - DB_NAME=users
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - REDIS_HOST=redis-master
+      - REDIS_PORT=6379
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: fluentd
+      options:
+        tag: "user_service"
+
+  # ==================== 订单服务 ====================
+  order_service:
+    image: registry.company.com/order-service:v2.1.0
+    deploy:
+      replicas: 5  # 高并发服务
+      placement:
+        constraints:
+          - node.labels.tier == app
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    networks:
+      - backend
+      - db
+    environment:
+      - DB_HOST=postgres-master
+      - DB_NAME=orders
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - REDIS_HOST=redis-master
+      - MQ_HOST=rabbitmq
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ==================== 商品服务 ====================
+  product_service:
+    image: registry.company.com/product-service:v1.8.3
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    networks:
+      - backend
+      - db
+    environment:
+      - DB_HOST=postgres-master
+      - DB_NAME=products
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - REDIS_HOST=redis-master
+      - CACHE_TTL=3600
+    secrets:
+      - db_password
+
+  # ==================== 支付服务 ====================
+  payment_service:
+    image: registry.company.com/payment-service:v1.2.1
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.labels.security == high  # 部署到安全节点
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    networks:
+      - backend
+      - db
+    environment:
+      - DB_HOST=postgres-master
+      - DB_NAME=payments
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - PAYMENT_API_KEY_FILE=/run/secrets/payment_api_key
+      - ENCRYPTION_ENABLED=true
+    secrets:
+      - db_password
+      - payment_api_key
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+
+  # ==================== PostgreSQL主从集群 ====================
+  postgres_master:
+    image: postgres:15-alpine
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.tier == db
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    networks:
+      - db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+      - POSTGRES_INITDB_ARGS=-E UTF8 --locale=en_US.utf8
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Redis集群 ====================
+  redis_master:
+    image: redis:7-alpine
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.tier == cache
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    networks:
+      - db
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --maxmemory 768mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --save 900 1
+      --save 300 10
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ==================== RabbitMQ消息队列 ====================
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.tier == app
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    networks:
+      - backend
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS_FILE=/run/secrets/db_password
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+```
+
+**部署脚本**:
+
+```bash
+#!/bin/bash
+# deploy-ecommerce.sh - 电商平台自动化部署脚本
+
+set -e
+
+STACK_NAME="ecommerce"
+REGISTRY="registry.company.com"
+ENVIRONMENT="production"
+
+echo "=========================================="
+echo "电商平台部署脚本"
+echo "环境: $ENVIRONMENT"
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "=========================================="
+
+# 1. 检查前置条件
+echo -e "\n[1/8] 检查Docker Swarm状态..."
+if ! docker info | grep -q "Swarm: active"; then
+    echo "❌ Docker Swarm未激活"
+    exit 1
+fi
+
+# 检查节点标签
+echo "检查节点标签..."
+NODE_LABELS=$(docker node ls --format "{{.Hostname}}: {{.Labels}}")
+echo "$NODE_LABELS"
+
+# 2. 创建网络
+echo -e "\n[2/8] 创建网络..."
+for network in frontend backend db; do
+    if ! docker network ls | grep -q "${STACK_NAME}_${network}"; then
+        docker network create --driver overlay "${STACK_NAME}_${network}"
+        echo "✓ 创建网络: ${STACK_NAME}_${network}"
+    fi
+done
+
+# 3. 创建Secrets
+echo -e "\n[3/8] 创建Secrets..."
+if [ ! -f .env.production ]; then
+    echo "❌ 缺少 .env.production 文件"
+    exit 1
+fi
+
+source .env.production
+
+echo "$DB_PASSWORD" | docker secret create db_password - 2>/dev/null || echo "Secret已存在: db_password"
+echo "$JWT_SECRET" | docker secret create jwt_secret - 2>/dev/null || echo "Secret已存在: jwt_secret"
+echo "$PAYMENT_API_KEY" | docker secret create payment_api_key - 2>/dev/null || echo "Secret已存在: payment_api_key"
+
+# 4. 拉取最新镜像
+echo -e "\n[4/8] 拉取最新镜像..."
+SERVICES=(
+    "api-gateway:v2.3.1"
+    "user-service:v1.5.2"
+    "order-service:v2.1.0"
+    "product-service:v1.8.3"
+    "payment-service:v1.2.1"
+)
+
+for service in "${SERVICES[@]}"; do
+    echo "拉取: $REGISTRY/$service"
+    docker pull "$REGISTRY/$service"
+done
+
+# 5. 部署数据库初始化任务
+echo -e "\n[5/8] 初始化数据库..."
+docker run --rm \
+    --network ${STACK_NAME}_db \
+    -e DB_HOST=postgres-master \
+    -e DB_PASSWORD="$DB_PASSWORD" \
+    "$REGISTRY/db-migrator:latest" \
+    migrate up
+
+# 6. 部署Stack
+echo -e "\n[6/8] 部署Docker Stack..."
+docker stack deploy -c ecommerce-stack.yml "$STACK_NAME"
+
+# 7. 等待服务启动
+echo -e "\n[7/8] 等待服务启动..."
+for i in {1..30}; do
+    RUNNING=$(docker stack services "$STACK_NAME" --format "{{.Replicas}}" | grep -c "/")
+    EXPECTED=$(docker stack services "$STACK_NAME" --format "{{.Name}}" | wc -l)
+
+    echo "进度: $RUNNING/$EXPECTED 服务运行中..."
+
+    if [ "$RUNNING" -eq "$EXPECTED" ]; then
+        READY=$(docker stack services "$STACK_NAME" --format "{{.Replicas}}" | awk -F'/' '{if($1==$2) print $0}' | wc -l)
+        if [ "$READY" -eq "$EXPECTED" ]; then
+            echo "✓ 所有服务已就绪"
+            break
+        fi
+    fi
+
+    if [ $i -eq 30 ]; then
+        echo "⚠️  服务启动超时,请检查日志"
+    fi
+
+    sleep 10
+done
+
+# 8. 健康检查
+echo -e "\n[8/8] 执行健康检查..."
+API_GATEWAY_URL="http://$(docker node inspect self --format '{{.Status.Addr}}'):8080"
+
+for endpoint in /health /api/v1/users/health /api/v1/orders/health; do
+    echo -n "检查 $endpoint ... "
+    if curl -sf "${API_GATEWAY_URL}${endpoint}" > /dev/null; then
+        echo "✓"
+    else
+        echo "✗"
+    fi
+done
+
+# 9. 显示部署状态
+echo -e "\n=========================================="
+echo "部署完成!"
+echo "=========================================="
+docker stack services "$STACK_NAME"
+
+echo -e "\n查看日志:"
+echo "  docker service logs -f ${STACK_NAME}_api_gateway"
+echo "  docker service logs -f ${STACK_NAME}_order_service"
+
+echo -e "\n访问地址:"
+echo "  API网关: $API_GATEWAY_URL"
+echo "  管理后台: http://$(docker node inspect self --format '{{.Status.Addr}}'):8081"
+```
+
+**性能测试**:
+
+```bash
+#!/bin/bash
+# benchmark.sh - 电商平台性能测试
+
+API_URL="http://api.ecommerce.com"
+
+echo "=========================================="
+echo "电商平台性能基准测试"
+echo "=========================================="
+
+# 1. 商品列表接口 (读多写少)
+echo -e "\n[1] 商品列表API (GET /api/v1/products)"
+ab -n 10000 -c 100 -H "Authorization: Bearer $TOKEN" \
+   "${API_URL}/api/v1/products?page=1&size=20"
+
+# 2. 创建订单接口 (写入密集)
+echo -e "\n[2] 创建订单API (POST /api/v1/orders)"
+ab -n 1000 -c 50 -p order.json -T "application/json" \
+   -H "Authorization: Bearer $TOKEN" \
+   "${API_URL}/api/v1/orders"
+
+# 3. 支付接口 (高安全要求)
+echo -e "\n[3] 支付API (POST /api/v1/payments)"
+ab -n 500 -c 20 -p payment.json -T "application/json" \
+   -H "Authorization: Bearer $TOKEN" \
+   "${API_URL}/api/v1/payments"
+
+# 输出汇总
+echo -e "\n=========================================="
+echo "测试完成"
+echo "=========================================="
+```
+
+### 19.1.2 物联网数据采集平台
+
+**架构特点**:
+- 高并发数据采集 (10万+设备)
+- 时序数据存储 (InfluxDB)
+- 实时数据处理 (Kafka + Flink)
+- 边缘计算节点
+
+**Docker Compose配置**:
+
+```yaml
+# iot-platform.yml
+version: '3.8'
+
+services:
+  # ==================== MQTT Broker (设备连接) ====================
+  emqx:
+    image: emqx/emqx:5.3.0
+    ports:
+      - "1883:1883"    # MQTT
+      - "8883:8883"    # MQTT/SSL
+      - "8083:8083"    # WebSocket
+      - "18083:18083"  # Dashboard
+    environment:
+      - EMQX_NAME=emqx
+      - EMQX_HOST=node1.emqx.io
+      - EMQX_NODE__COOKIE=emqxsecretcookie
+      - EMQX_LISTENER__TCP__EXTERNAL__MAX_CONNECTIONS=100000
+    volumes:
+      - ./emqx/data:/opt/emqx/data
+      - ./emqx/log:/opt/emqx/log
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "emqx", "ping"]
+      interval: 10s
+
+  # ==================== Kafka (消息队列) ====================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_NUM_PARTITIONS: 10
+    depends_on:
+      - zookeeper
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+
+  # ==================== InfluxDB (时序数据库) ====================
+  influxdb:
+    image: influxdb:2.7-alpine
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123456
+      - DOCKER_INFLUXDB_INIT_ORG=iot
+      - DOCKER_INFLUXDB_INIT_BUCKET=sensor_data
+      - DOCKER_INFLUXDB_INIT_RETENTION=30d
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+  # ==================== 数据处理服务 ====================
+  data_processor:
+    image: iot-platform/data-processor:v1.0.0
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
+      - INFLUXDB_ORG=iot
+      - INFLUXDB_BUCKET=sensor_data
+      - PROCESSING_THREADS=8
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    depends_on:
+      - kafka
+      - influxdb
+
+  # ==================== 规则引擎 ====================
+  rule_engine:
+    image: iot-platform/rule-engine:v1.0.0
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
+    deploy:
+      replicas: 2
+
+  # ==================== API服务 ====================
+  api_server:
+    image: iot-platform/api-server:v1.0.0
+    ports:
+      - "8080:8080"
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
+      - REDIS_HOST=redis
+      - JWT_SECRET=${JWT_SECRET}
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ==================== Redis (缓存) ====================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+
+volumes:
+  kafka-data:
+  zookeeper-data:
+  influxdb-data:
+  influxdb-config:
+  redis-data:
+```
+
+**数据处理服务示例**:
+
+```python
+#!/usr/bin/env python3
+# data_processor.py - IoT数据处理服务
+
+import json
+import logging
+from kafka import KafkaConsumer
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+import os
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 配置
+KAFKA_BROKERS = os.getenv('KAFKA_BROKERS', 'localhost:9092')
+KAFKA_TOPIC = 'sensor_data'
+INFLUXDB_URL = os.getenv('INFLUXDB_URL', 'http://localhost:8086')
+INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN')
+INFLUXDB_ORG = os.getenv('INFLUXDB_ORG', 'iot')
+INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET', 'sensor_data')
+
+class DataProcessor:
+    def __init__(self):
+        # Kafka消费者
+        self.consumer = KafkaConsumer(
+            KAFKA_TOPIC,
+            bootstrap_servers=KAFKA_BROKERS.split(','),
+            group_id='data_processor',
+            value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+            auto_offset_reset='latest',
+            enable_auto_commit=True
+        )
+
+        # InfluxDB客户端
+        self.influx_client = InfluxDBClient(
+            url=INFLUXDB_URL,
+            token=INFLUXDB_TOKEN,
+            org=INFLUXDB_ORG
+        )
+        self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
+
+        logger.info("DataProcessor初始化完成")
+
+    def process_message(self, message):
+        """处理单条消息"""
+        try:
+            device_id = message['device_id']
+            sensor_type = message['sensor_type']
+            value = message['value']
+            timestamp = message['timestamp']
+
+            # 数据清洗
+            if not self.validate_data(sensor_type, value):
+                logger.warning(f"Invalid data from {device_id}: {value}")
+                return
+
+            # 写入InfluxDB
+            point = Point("sensor_measurement") \
+                .tag("device_id", device_id) \
+                .tag("sensor_type", sensor_type) \
+                .field("value", float(value)) \
+                .time(timestamp)
+
+            self.write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+
+            # 检查告警规则
+            self.check_alerts(device_id, sensor_type, value)
+
+        except Exception as e:
+            logger.error(f"处理消息失败: {e}", exc_info=True)
+
+    def validate_data(self, sensor_type, value):
+        """数据验证"""
+        ranges = {
+            'temperature': (-50, 100),
+            'humidity': (0, 100),
+            'pressure': (800, 1200)
+        }
+
+        if sensor_type not in ranges:
+            return True
+
+        min_val, max_val = ranges[sensor_type]
+        return min_val <= float(value) <= max_val
+
+    def check_alerts(self, device_id, sensor_type, value):
+        """检查告警规则"""
+        # 温度过高告警
+        if sensor_type == 'temperature' and float(value) > 80:
+            logger.warning(f"🚨 Temperature alert: {device_id} = {value}°C")
+            # 发送告警通知...
+
+    def run(self):
+        """主循环"""
+        logger.info("开始消费Kafka消息...")
+
+        for message in self.consumer:
+            try:
+                self.process_message(message.value)
+            except KeyboardInterrupt:
+                logger.info("收到停止信号")
+                break
+            except Exception as e:
+                logger.error(f"处理消息异常: {e}", exc_info=True)
+
+        self.consumer.close()
+        self.influx_client.close()
+
+if __name__ == '__main__':
+    processor = DataProcessor()
+    processor.run()
+```
+
+---
+
+## 19.2 安全加固
+
+### 19.2.1 镜像安全
+
+**1. 使用官方基础镜像**:
+
+```dockerfile
+# ❌ 不推荐: 使用latest标签
+FROM node:latest
+
+# ✅ 推荐: 使用具体版本 + Alpine变体
+FROM node:18.19.0-alpine3.19
+
+# ✅ 最佳: 使用SHA256摘要锁定版本
+FROM node:18.19.0-alpine3.19@sha256:...
+```
+
+**2. 最小化镜像**:
+
+```dockerfile
+# 多阶段构建 - 生产镜像仅包含必需文件
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+COPY . .
+RUN npm run build
+
+FROM node:18-alpine AS production
+RUN apk add --no-cache dumb-init
+USER node
+WORKDIR /app
+COPY --chown=node:node --from=builder /app/dist ./dist
+COPY --chown=node:node --from=builder /app/node_modules ./node_modules
+EXPOSE 3000
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "dist/main.js"]
+```
+
+**3. 镜像安全扫描**:
+
+```bash
+#!/bin/bash
+# scan-image.sh - 镜像安全扫描脚本
+
+IMAGE=$1
+
+if [ -z "$IMAGE" ]; then
+    echo "用法: $0 <镜像名称>"
+    exit 1
+fi
+
+echo "=========================================="
+echo "镜像安全扫描: $IMAGE"
+echo "=========================================="
+
+# 1. Trivy扫描
+echo -e "\n[1] Trivy漏洞扫描..."
+trivy image --severity HIGH,CRITICAL "$IMAGE"
+
+# 2. 检查镜像层数
+echo -e "\n[2] 镜像层数检查..."
+LAYERS=$(docker history "$IMAGE" --quiet | wc -l)
+echo "层数: $LAYERS"
+if [ "$LAYERS" -gt 20 ]; then
+    echo "⚠️  警告: 镜像层数过多,建议合并层"
+fi
+
+# 3. 检查镜像大小
+echo -e "\n[3] 镜像大小检查..."
+SIZE=$(docker images "$IMAGE" --format "{{.Size}}")
+echo "大小: $SIZE"
+
+# 4. 检查root用户
+echo -e "\n[4] 用户权限检查..."
+USER=$(docker inspect "$IMAGE" --format='{{.Config.User}}')
+if [ -z "$USER" ] || [ "$USER" = "root" ] || [ "$USER" = "0" ]; then
+    echo "❌ 警告: 容器使用root用户运行"
+else
+    echo "✓ 容器使用非root用户: $USER"
+fi
+
+# 5. 检查敏感文件
+echo -e "\n[5] 敏感文件检查..."
+TEMP_CONTAINER=$(docker create "$IMAGE")
+docker export "$TEMP_CONTAINER" | tar -t | grep -E "\.(key|pem|crt|env)$" || echo "✓ 未发现敏感文件"
+docker rm "$TEMP_CONTAINER" > /dev/null
+
+# 6. 生成SBOM (软件物料清单)
+echo -e "\n[6] 生成SBOM..."
+syft "$IMAGE" -o json > "${IMAGE//\//_}_sbom.json"
+echo "✓ SBOM已保存到: ${IMAGE//\//_}_sbom.json"
+
+echo -e "\n=========================================="
+echo "扫描完成"
+echo "=========================================="
+```
+
+### 19.2.2 运行时安全
+
+**1. AppArmor配置**:
+
+```bash
+# /etc/apparmor.d/docker-default-secure
+#include <tunables/global>
+
+profile docker-default-secure flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # 拒绝挂载
+  deny mount,
+
+  # 拒绝修改内核参数
+  deny @{PROC}/sys/kernel/** w,
+
+  # 拒绝访问宿主机设备
+  deny /dev/** rw,
+
+  # 允许必要的系统调用
+  capability setgid,
+  capability setuid,
+  capability net_bind_service,
+
+  # 拒绝危险系统调用
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_rawio,
+
+  # 允许容器内文件访问
+  /app/** rw,
+  /tmp/** rw,
+  /var/tmp/** rw,
+}
+```
+
+**应用到容器**:
+
+```bash
+docker run --security-opt apparmor=docker-default-secure myapp
+```
+
+**2. Seccomp配置**:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept", "accept4", "access", "bind", "brk",
+        "chdir", "clone", "close", "connect", "dup",
+        "dup2", "execve", "exit", "fork", "fstat",
+        "getcwd", "getpid", "getuid", "listen", "mmap",
+        "open", "read", "recv", "recvfrom", "send",
+        "sendto", "socket", "stat", "write"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": ["reboot", "swapon", "swapoff"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}
+```
+
+**应用Seccomp**:
+
+```bash
+docker run --security-opt seccomp=seccomp-profile.json myapp
+```
+
+**3. 只读根文件系统**:
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    image: myapp:latest
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run
+      - /app/cache:uid=1000,gid=1000,mode=1777
+    volumes:
+      - app-logs:/app/logs
+```
+
+### 19.2.3 网络安全
+
+**1. 网络隔离**:
+
+```yaml
+# network-isolation.yml
+version: '3.8'
+
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+  backend:
+    driver: bridge
+    internal: true  # 无外网访问
+    ipam:
+      config:
+        - subnet: 172.20.2.0/24
+  database:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.3.0/24
+
+services:
+  web:
+    image: nginx
+    networks:
+      - frontend
+      - backend
+
+  api:
+    image: api-server
+    networks:
+      - backend
+      - database
+
+  postgres:
+    image: postgres
+    networks:
+      - database  # 仅database网络可访问
+```
+
+**2. 防火墙规则**:
+
+```bash
+#!/bin/bash
+# docker-firewall.sh - Docker防火墙配置
+
+# 清除现有规则
+iptables -F DOCKER-USER
+iptables -X DOCKER-USER
+iptables -N DOCKER-USER
+
+# 1. 允许已建立的连接
+iptables -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# 2. 限制特定IP访问敏感端口
+iptables -A DOCKER-USER -p tcp --dport 5432 -s 10.0.0.0/8 -j ACCEPT
+iptables -A DOCKER-USER -p tcp --dport 5432 -j DROP
+
+# 3. 限制容器访问宿主机元数据服务
+iptables -A DOCKER-USER -d 169.254.169.254 -j DROP
+
+# 4. 限制容器间互访
+iptables -A DOCKER-USER -i docker0 -o docker0 -j DROP
+
+# 5. 速率限制
+iptables -A DOCKER-USER -p tcp --dport 80 -m limit --limit 100/sec --limit-burst 200 -j ACCEPT
+iptables -A DOCKER-USER -p tcp --dport 80 -j DROP
+
+# 6. 默认拒绝
+iptables -A DOCKER-USER -j DROP
+
+echo "✓ Docker防火墙规则已应用"
+iptables -L DOCKER-USER -n -v
+```
+
+---
+
+## 19.3 CI/CD集成
+
+### 19.3.1 GitLab CI集成
+
+**.gitlab-ci.yml**:
+
+```yaml
+# .gitlab-ci.yml
+stages:
+  - build
+  - test
+  - security
+  - deploy
+
+variables:
+  DOCKER_REGISTRY: registry.company.com
+  DOCKER_IMAGE: $DOCKER_REGISTRY/$CI_PROJECT_NAME
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+
+# ==================== 构建阶段 ====================
+build:
+  stage: build
+  image: docker:24.0-dind
+  services:
+    - docker:24.0-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $DOCKER_REGISTRY
+  script:
+    # 使用BuildKit加速构建
+    - export DOCKER_BUILDKIT=1
+    - docker build
+        --cache-from $DOCKER_IMAGE:latest
+        --build-arg BUILDKIT_INLINE_CACHE=1
+        --tag $DOCKER_IMAGE:$DOCKER_TAG
+        --tag $DOCKER_IMAGE:latest
+        .
+    - docker push $DOCKER_IMAGE:$DOCKER_TAG
+    - docker push $DOCKER_IMAGE:latest
+  only:
+    - main
+    - develop
+
+# ==================== 测试阶段 ====================
+unit_test:
+  stage: test
+  image: $DOCKER_IMAGE:$DOCKER_TAG
+  script:
+    - npm install
+    - npm run test
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      junit: test-results.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+
+integration_test:
+  stage: test
+  image: docker/compose:latest
+  services:
+    - docker:24.0-dind
+  script:
+    - docker-compose -f docker-compose.test.yml up -d
+    - docker-compose -f docker-compose.test.yml exec -T app npm run test:integration
+  after_script:
+    - docker-compose -f docker-compose.test.yml down -v
+
+# ==================== 安全扫描阶段 ====================
+security_scan:
+  stage: security
+  image: aquasec/trivy:latest
+  script:
+    - trivy image
+        --severity HIGH,CRITICAL
+        --exit-code 1
+        --no-progress
+        $DOCKER_IMAGE:$DOCKER_TAG
+  allow_failure: true
+
+sast:
+  stage: security
+  image: returntocorp/semgrep
+  script:
+    - semgrep --config=auto --json --output=sast-report.json .
+  artifacts:
+    reports:
+      sast: sast-report.json
+
+# ==================== 部署阶段 ====================
+deploy_staging:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no deploy@staging.company.com << EOF
+        cd /opt/myapp
+        docker pull $DOCKER_IMAGE:$DOCKER_TAG
+        docker-compose up -d
+        docker-compose ps
+      EOF
+  environment:
+    name: staging
+    url: https://staging.company.com
+  only:
+    - develop
+
+deploy_production:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no deploy@prod.company.com << EOF
+        cd /opt/myapp
+
+        # 蓝绿部署
+        export NEW_TAG=$DOCKER_TAG
+        export OLD_TAG=\$(docker ps --filter "name=myapp" --format "{{.Image}}" | cut -d: -f2)
+
+        # 启动新版本
+        docker pull $DOCKER_IMAGE:\$NEW_TAG
+        docker-compose -f docker-compose.blue-green.yml up -d blue
+
+        # 健康检查
+        for i in {1..30}; do
+          if curl -sf http://localhost:8080/health; then
+            echo "✓ 新版本健康检查通过"
+            break
+          fi
+          echo "等待服务启动... (\$i/30)"
+          sleep 2
+        done
+
+        # 切换流量
+        docker-compose -f docker-compose.blue-green.yml up -d nginx
+
+        # 停止旧版本
+        docker-compose -f docker-compose.blue-green.yml stop green
+
+        echo "✓ 部署完成: \$OLD_TAG -> \$NEW_TAG"
+      EOF
+  environment:
+    name: production
+    url: https://app.company.com
+  when: manual
+  only:
+    - main
+```
+
+### 19.3.2 Jenkins Pipeline
+
+**Jenkinsfile**:
+
+```groovy
+// Jenkinsfile
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_REGISTRY = 'registry.company.com'
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${JOB_NAME}"
+        DOCKER_TAG = "${BUILD_NUMBER}"
+        DOCKER_CREDENTIALS = credentials('docker-registry-credentials')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    // 构建Docker镜像
+                    docker.build("${DOCKER_IMAGE}:${DOCKER_TAG}")
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    // 运行测试
+                    docker.image("${DOCKER_IMAGE}:${DOCKER_TAG}").inside {
+                        sh 'npm install'
+                        sh 'npm run test'
+                    }
+                }
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            parallel {
+                stage('Trivy Scan') {
+                    steps {
+                        sh """
+                            trivy image \
+                                --severity HIGH,CRITICAL \
+                                --format json \
+                                --output trivy-report.json \
+                                ${DOCKER_IMAGE}:${DOCKER_TAG}
+                        """
+                    }
+                }
+
+                stage('Anchore Scan') {
+                    steps {
+                        writeFile file: 'anchore_images',
+                                  text: "${DOCKER_IMAGE}:${DOCKER_TAG}"
+                        anchore name: 'anchore_images',
+                                bailOnFail: false
+                    }
+                }
+            }
+        }
+
+        stage('Push') {
+            steps {
+                script {
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                        docker.image("${DOCKER_IMAGE}:${DOCKER_TAG}").push()
+                        docker.image("${DOCKER_IMAGE}:${DOCKER_TAG}").push('latest')
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                sshagent(['staging-ssh-key']) {
+                    sh """
+                        ssh deploy@staging.company.com '
+                            cd /opt/myapp &&
+                            export IMAGE_TAG=${DOCKER_TAG} &&
+                            docker-compose pull &&
+                            docker-compose up -d &&
+                            docker-compose ps
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: '确认部署到生产环境?', ok: '部署'
+
+                sshagent(['production-ssh-key']) {
+                    sh """
+                        ssh deploy@prod.company.com '
+                            cd /opt/myapp &&
+                            ./deploy.sh ${DOCKER_TAG}
+                        '
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(
+                color: 'good',
+                message: "✓ 构建成功: ${JOB_NAME} #${BUILD_NUMBER} (<${BUILD_URL}|查看详情>)"
+            )
+        }
+        failure {
+            slackSend(
+                color: 'danger',
+                message: "✗ 构建失败: ${JOB_NAME} #${BUILD_NUMBER} (<${BUILD_URL}|查看详情>)"
+            )
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+```
+
+### 19.3.3 金丝雀发布
+
+**部署脚本**:
+
+```bash
+#!/bin/bash
+# canary-deploy.sh - 金丝雀发布脚本
+
+set -e
+
+NEW_VERSION=$1
+CANARY_PERCENT=${2:-10}  # 默认10%流量
+
+if [ -z "$NEW_VERSION" ]; then
+    echo "用法: $0 <新版本> [金丝雀百分比]"
+    exit 1
+fi
+
+STACK_NAME="myapp"
+SERVICE_NAME="${STACK_NAME}_api"
+
+echo "=========================================="
+echo "金丝雀发布"
+echo "新版本: $NEW_VERSION"
+echo "金丝雀流量: $CANARY_PERCENT%"
+echo "=========================================="
+
+# 1. 获取当前版本
+CURRENT_VERSION=$(docker service inspect "$SERVICE_NAME" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' | cut -d: -f2)
+echo -e "\n当前版本: $CURRENT_VERSION"
+
+# 2. 创建金丝雀服务
+echo -e "\n[1/5] 创建金丝雀服务..."
+docker service create \
+    --name "${SERVICE_NAME}_canary" \
+    --label canary=true \
+    --network "${STACK_NAME}_backend" \
+    --replicas 1 \
+    --limit-cpu 0.5 \
+    --limit-memory 256M \
+    "registry.company.com/myapp:${NEW_VERSION}"
+
+# 3. 等待金丝雀服务就绪
+echo -e "\n[2/5] 等待金丝雀服务启动..."
+for i in {1..30}; do
+    STATUS=$(docker service ps "${SERVICE_NAME}_canary" --filter "desired-state=running" --format "{{.CurrentState}}")
+    if echo "$STATUS" | grep -q "Running"; then
+        echo "✓ 金丝雀服务已就绪"
+        break
+    fi
+    echo "等待中... ($i/30)"
+    sleep 2
+done
+
+# 4. 配置Traefik流量权重
+echo -e "\n[3/5] 配置流量权重..."
+cat > /tmp/traefik-canary.yml <<EOF
+http:
+  services:
+    api-weighted:
+      weighted:
+        services:
+          - name: api-stable
+            weight: $((100 - CANARY_PERCENT))
+          - name: api-canary
+            weight: $CANARY_PERCENT
+EOF
+
+docker config create traefik-canary-config /tmp/traefik-canary.yml
+docker service update --config-add traefik-canary-config traefik
+
+# 5. 监控金丝雀指标 (持续10分钟)
+echo -e "\n[4/5] 监控金丝雀指标..."
+MONITORING_DURATION=600
+START_TIME=$(date +%s)
+
+while true; do
+    ELAPSED=$(($(date +%s) - START_TIME))
+
+    if [ $ELAPSED -ge $MONITORING_DURATION ]; then
+        echo "✓ 监控完成"
+        break
+    fi
+
+    # 查询错误率
+    ERROR_RATE=$(curl -s 'http://prometheus:9090/api/v1/query?query=rate(http_requests_total{service="api_canary",status=~"5.."}[5m])' | jq -r '.data.result[0].value[1]')
+
+    # 查询延迟
+    LATENCY_P99=$(curl -s 'http://prometheus:9090/api/v1/query?query=histogram_quantile(0.99,rate(http_request_duration_seconds_bucket{service="api_canary"}[5m]))' | jq -r '.data.result[0].value[1]')
+
+    echo "错误率: ${ERROR_RATE:-0}  P99延迟: ${LATENCY_P99:-0}s"
+
+    # 检查是否超过阈值
+    if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+        echo "❌ 错误率过高,回滚金丝雀!"
+        ./rollback-canary.sh
+        exit 1
+    fi
+
+    sleep 30
+done
+
+# 6. 全量发布
+echo -e "\n[5/5] 金丝雀健康,开始全量发布..."
+docker service update \
+    --image "registry.company.com/myapp:${NEW_VERSION}" \
+    --update-parallelism 2 \
+    --update-delay 10s \
+    "$SERVICE_NAME"
+
+# 清理金丝雀服务
+docker service rm "${SERVICE_NAME}_canary"
+
+echo -e "\n=========================================="
+echo "✓ 发布完成: $CURRENT_VERSION -> $NEW_VERSION"
+echo "=========================================="
+```
+
+---
+
+## 19.4 迁移策略
+
+### 19.4.1 从虚拟机迁移到容器
+
+**迁移评估检查表**:
+
+```bash
+#!/bin/bash
+# assess-migration.sh - 迁移可行性评估
+
+APP_NAME=$1
+
+echo "=========================================="
+echo "应用迁移评估: $APP_NAME"
+echo "=========================================="
+
+# 1. 检查应用类型
+echo -e "\n[1] 应用类型检查"
+echo "✓ 无状态应用更适合容器化"
+echo "✓ 有状态应用需要额外的持久化方案"
+
+# 2. 检查依赖项
+echo -e "\n[2] 依赖项分析"
+ldd /usr/bin/myapp 2>/dev/null | grep "=>" | awk '{print $1}' | sort
+echo "建议: 使用官方基础镜像包含大部分系统库"
+
+# 3. 检查配置文件
+echo -e "\n[3] 配置文件位置"
+find /etc -name "*${APP_NAME}*" 2>/dev/null
+echo "建议: 使用环境变量或ConfigMap管理配置"
+
+# 4. 检查数据目录
+echo -e "\n[4] 数据目录"
+find /var -name "*${APP_NAME}*" -type d 2>/dev/null
+echo "建议: 使用Docker Volume或外部存储"
+
+# 5. 检查端口占用
+echo -e "\n[5] 监听端口"
+netstat -tlnp | grep "$APP_NAME"
+echo "建议: 确保端口不冲突"
+
+# 6. 检查系统调用
+echo -e "\n[6] 系统调用分析"
+strace -c /usr/bin/myapp & PID=$!
+sleep 5
+kill $PID 2>/dev/null
+echo "建议: 检查是否有特权操作需求"
+
+# 7. 性能基准
+echo -e "\n[7] 性能基准测试"
+echo "CPU: $(top -b -n1 | grep "$APP_NAME" | awk '{print $9}')%"
+echo "内存: $(ps aux | grep "$APP_NAME" | awk '{print $4}')%"
+
+echo -e "\n=========================================="
+echo "迁移建议:"
+echo "1. 创建Dockerfile封装应用"
+echo "2. 使用docker-compose定义服务依赖"
+echo "3. 配置健康检查"
+echo "4. 设置资源限制"
+echo "5. 准备回滚方案"
+echo "=========================================="
+```
+
+**迁移步骤**:
+
+```bash
+#!/bin/bash
+# migrate-vm-to-container.sh - 虚拟机应用容器化脚本
+
+APP_NAME="myapp"
+VM_HOST="oldvm.company.com"
+REGISTRY="registry.company.com"
+
+echo "=========================================="
+echo "虚拟机到容器迁移: $APP_NAME"
+echo "=========================================="
+
+# 第1阶段: 应用打包
+echo -e "\n[阶段1/4] 从虚拟机打包应用..."
+ssh root@$VM_HOST << 'EOF'
+    cd /opt/myapp
+    tar czf /tmp/myapp.tar.gz .
+EOF
+
+scp root@$VM_HOST:/tmp/myapp.tar.gz ./
+
+# 第2阶段: 创建Dockerfile
+echo -e "\n[阶段2/4] 生成Dockerfile..."
+cat > Dockerfile <<'DOCKERFILE'
+FROM ubuntu:22.04
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建非root用户
+RUN useradd -m -u 1000 appuser
+
+# 复制应用文件
+WORKDIR /app
+COPY myapp.tar.gz .
+RUN tar xzf myapp.tar.gz && rm myapp.tar.gz
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["./start.sh"]
+DOCKERFILE
+
+# 第3阶段: 构建镜像
+echo -e "\n[阶段3/4] 构建Docker镜像..."
+docker build -t $REGISTRY/$APP_NAME:v1.0.0 .
+
+# 第4阶段: 测试运行
+echo -e "\n[阶段4/4] 测试容器..."
+docker run -d --name ${APP_NAME}_test \
+    -p 8080:8080 \
+    -e DB_HOST=postgres.company.com \
+    -e DB_PORT=5432 \
+    $REGISTRY/$APP_NAME:v1.0.0
+
+# 健康检查
+echo "等待服务启动..."
+for i in {1..30}; do
+    if curl -sf http://localhost:8080/health > /dev/null; then
+        echo "✓ 容器运行正常"
+        break
+    fi
+    sleep 2
+done
+
+# 清理测试容器
+docker stop ${APP_NAME}_test
+docker rm ${APP_NAME}_test
+
+# 推送镜像
+echo -e "\n推送镜像到仓库..."
+docker push $REGISTRY/$APP_NAME:v1.0.0
+
+echo -e "\n=========================================="
+echo "✓ 迁移完成"
+echo "下一步:"
+echo "1. 创建docker-compose.yml"
+echo "2. 配置生产环境变量"
+echo "3. 执行灰度发布"
+echo "=========================================="
+```
+
+### 19.4.2 从Kubernetes迁移到Docker Swarm
+
+**转换工具**:
+
+```python
+#!/usr/bin/env python3
+# k8s-to-swarm.py - Kubernetes YAML转Docker Stack
+
+import yaml
+import sys
+
+def convert_deployment(k8s_yaml):
+    """转换Deployment到Docker Service"""
+    spec = k8s_yaml['spec']
+    template = spec['template']
+
+    service = {
+        'image': template['spec']['containers'][0]['image'],
+        'deploy': {
+            'replicas': spec.get('replicas', 1),
+            'restart_policy': {
+                'condition': 'on-failure'
+            }
+        }
+    }
+
+    # 转换资源限制
+    if 'resources' in template['spec']['containers'][0]:
+        resources = template['spec']['containers'][0]['resources']
+        service['deploy']['resources'] = {}
+
+        if 'limits' in resources:
+            service['deploy']['resources']['limits'] = {
+                'cpus': resources['limits'].get('cpu', '1'),
+                'memory': resources['limits'].get('memory', '512M')
+            }
+
+        if 'requests' in resources:
+            service['deploy']['resources']['reservations'] = {
+                'cpus': resources['requests'].get('cpu', '0.5'),
+                'memory': resources['requests'].get('memory', '256M')
+            }
+
+    # 转换环境变量
+    if 'env' in template['spec']['containers'][0]:
+        service['environment'] = []
+        for env in template['spec']['containers'][0]['env']:
+            service['environment'].append(f"{env['name']}={env.get('value', '')}")
+
+    # 转换端口
+    if 'ports' in template['spec']['containers'][0]:
+        service['ports'] = []
+        for port in template['spec']['containers'][0]['ports']:
+            service['ports'].append(f"{port['containerPort']}:{port['containerPort']}")
+
+    return service
+
+def main():
+    if len(sys.argv) < 2:
+        print("用法: k8s-to-swarm.py <k8s.yaml>")
+        sys.exit(1)
+
+    with open(sys.argv[1], 'r') as f:
+        k8s_docs = yaml.safe_load_all(f)
+
+        stack = {
+            'version': '3.8',
+            'services': {}
+        }
+
+        for doc in k8s_docs:
+            if doc['kind'] == 'Deployment':
+                name = doc['metadata']['name']
+                stack['services'][name] = convert_deployment(doc)
+
+        print(yaml.dump(stack, default_flow_style=False))
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 19.5 避坑指南
+
+### 19.5.1 常见错误
+
+**1. 容器时区问题**:
+
+```dockerfile
+# ❌ 错误: 容器使用UTC时区
+FROM alpine
+CMD ["date"]
+
+# ✅ 正确: 设置时区
+FROM alpine
+RUN apk add --no-cache tzdata
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+CMD ["date"]
+```
+
+**2. 日志丢失问题**:
+
+```dockerfile
+# ❌ 错误: 日志写入文件
+CMD ./app > /var/log/app.log 2>&1
+
+# ✅ 正确: 日志输出到stdout/stderr
+CMD ./app
+```
+
+**3. PID 1僵尸进程问题**:
+
+```dockerfile
+# ❌ 错误: 使用shell启动
+CMD ./start.sh
+
+# ✅ 正确: 使用exec形式或dumb-init
+FROM alpine
+RUN apk add --no-cache dumb-init
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["./app"]
+```
+
+**4. 文件权限问题**:
+
+```dockerfile
+# ❌ 错误: root用户创建文件
+COPY app.jar /app/
+USER appuser
+CMD java -jar /app/app.jar
+
+# ✅ 正确: 设置正确的所有者
+COPY --chown=appuser:appuser app.jar /app/
+USER appuser
+CMD ["java", "-jar", "/app/app.jar"]
+```
+
+**5. 环境变量展开问题**:
+
+```yaml
+# ❌ 错误: 单引号阻止变量展开
+services:
+  app:
+    command: 'echo $PATH'
+
+# ✅ 正确: 使用双引号或不加引号
+services:
+  app:
+    command: echo $PATH
+```
+
+### 19.5.2 性能陷阱
+
+**1. 过度使用bind mount**:
+
+```yaml
+# ❌ 慢: bind mount需要文件系统同步
+volumes:
+  - ./app:/app
+
+# ✅ 快: 使用named volume
+volumes:
+  - app_data:/app
+
+volumes:
+  app_data:
+```
+
+**2. 过多的层导致镜像臃肿**:
+
+```dockerfile
+# ❌ 错误: 每个RUN创建一层
+RUN apt-get update
+RUN apt-get install -y curl
+RUN apt-get install -y vim
+RUN apt-get clean
+
+# ✅ 正确: 合并命令
+RUN apt-get update && apt-get install -y \
+    curl \
+    vim \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+**3. 不使用.dockerignore**:
+
+```bash
+# .dockerignore
+node_modules
+*.log
+.git
+.DS_Store
+coverage
+*.md
+```
+
+**4. 使用latest标签**:
+
+```yaml
+# ❌ 不推荐: latest不稳定
+services:
+  app:
+    image: myapp:latest
+
+# ✅ 推荐: 使用明确版本
+services:
+  app:
+    image: myapp:v1.2.3
+```
+
+### 19.5.3 监控盲点
+
+**关键指标监控清单**:
+
+```yaml
+# prometheus-alerts.yml
+groups:
+  - name: docker_health
+    interval: 30s
+    rules:
+      # 1. 容器重启频繁
+      - alert: ContainerRestartingTooOften
+        expr: rate(container_restart_count[15m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "容器 {{ $labels.container }} 重启频繁"
+
+      # 2. 容器OOM
+      - alert: ContainerOOMKilled
+        expr: container_oom_events_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "容器 {{ $labels.container }} 发生OOM"
+
+      # 3. 磁盘空间不足
+      - alert: DockerDiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/var/lib/docker"} / node_filesystem_size_bytes) < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Docker数据目录空间不足 < 10%"
+
+      # 4. 镜像拉取失败
+      - alert: ImagePullFailed
+        expr: increase(docker_image_pull_errors_total[5m]) > 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "镜像拉取失败次数过多"
+
+      # 5. Swarm节点不可用
+      - alert: SwarmNodeUnavailable
+        expr: swarm_node_status != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Swarm节点 {{ $labels.node_name }} 不可用"
+```
+
+---
+
+## 19.6 企业级最佳实践总结
+
+### 19.6.1 镜像管理
+
+1. **使用语义化版本**: `v1.2.3`
+2. **锁定基础镜像SHA**: `FROM node:18@sha256:...`
+3. **定期扫描漏洞**: Trivy/Snyk
+4. **清理无用镜像**: `docker image prune -a`
+
+### 19.6.2 资源规划
+
+```yaml
+# 资源配置范例
+services:
+  # 高流量API
+  api:
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # 后台任务
+  worker:
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # 数据库
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+```
+
+### 19.6.3 日志与监控
+
+```yaml
+# 统一日志配置
+x-logging: &default-logging
+  driver: fluentd
+  options:
+    fluentd-address: "fluentd.company.com:24224"
+    fluentd-async: "true"
+    fluentd-retry-wait: "1s"
+    fluentd-max-retries: "10"
+    tag: "{{.Name}}"
+
+services:
+  app:
+    logging: *default-logging
+```
+
+### 19.6.4 备份策略
+
+```bash
+#!/bin/bash
+# backup-docker-volumes.sh - Docker卷备份脚本
+
+BACKUP_DIR="/backup/docker-volumes"
+DATE=$(date +%Y%m%d_%H%M%S)
+
+# 获取所有卷
+VOLUMES=$(docker volume ls -q)
+
+for volume in $VOLUMES; do
+    echo "备份卷: $volume"
+
+    # 创建临时容器挂载卷并备份
+    docker run --rm \
+        -v "$volume":/source:ro \
+        -v "$BACKUP_DIR":/backup \
+        alpine \
+        tar czf "/backup/${volume}_${DATE}.tar.gz" -C /source .
+
+    echo "✓ 备份完成: ${volume}_${DATE}.tar.gz"
+done
+
+# 删除7天前的备份
+find "$BACKUP_DIR" -name "*.tar.gz" -mtime +7 -delete
+```
+
+---
+
+*（第19章完成,约1800行。全书19章全部完成!）*
+
+## 🎉 全书完结
+
+恭喜您完成《Docker底层原理与生产实战指南》的学习!
+
+### 📚 全书章节回顾
+
+1. **第1-5章**: Docker核心概念与底层原理
+2. **第6-8章**: 镜像构建与优化
+3. **第9-12章**: 容器运行时与编排
+4. **第13章**: 生产环境部署架构
+5. **第14章**: 高可用性与灾难恢复
+6. **第15章**: 监控告警体系
+7. **第16章**: 日志收集与分析
+8. **第17章**: 性能优化
+9. **第18章**: 故障排查
+10. **第19章**: 最佳实践与案例
+
+### 🎯 学习路径建议
+
+- **初学者**: 第1-8章 → 第9-12章
+- **运维工程师**: 第13-16章 → 第17-18章
+- **架构师**: 全书系统学习
+
+### 📖 延伸阅读
+
+- Docker官方文档: https://docs.docker.com
+- Docker Swarm文档: https://docs.docker.com/engine/swarm/
+- Kubernetes进阶学习
+- 云原生技术栈
+
+---
+
+*感谢您的阅读!如有问题,欢迎交流讨论。*
