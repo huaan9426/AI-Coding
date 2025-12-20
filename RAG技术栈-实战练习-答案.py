@@ -6,7 +6,7 @@ RAG 技术栈 - 实战练习参考答案
 2. 手写余弦相似度搜索
 3. 模拟 RAG 完整流程
 """
-
+========================
 import numpy as np
 from typing import List, Dict, Tuple
 import heapq
