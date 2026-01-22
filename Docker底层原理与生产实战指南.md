@@ -17043,10 +17043,7232 @@ def get_user(user_id):
 
 ---
 
-*（第15章完成,约2500行。已完成15章,剩余4章...）*
+*（第15章完成,约2650行。已完成15章,剩余4章...）*
 
 ---
 
 📝 **下一章预告**: ELK Stack日志收集、日志解析与告警、日志查询与分析、日志归档策略
 
 ---
+
+# 第十六章: 日志收集与分析
+
+> **本章目标**: 掌握Docker生产环境日志收集方案,包括ELK Stack企业级部署、Fluentd日志收集、Grok模式解析、Kibana可视化分析、ElastAlert告警,以及日志归档与生命周期管理。
+
+---
+
+## 16.1 日志收集架构设计
+
+### 16.1.1 日志收集架构模式
+
+**完整的日志处理流程**:
+
+```yaml
+┌─────────────────────────────────────────────────────────────────┐
+│                     日志生成层 (Source)                          │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │ 应用日志  │  │ 系统日志  │  │ 访问日志  │  │ 审计日志  │       │
+│  │  (JSON)  │  │ (Syslog) │  │ (Nginx)  │  │ (Docker) │       │
+│  └─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘       │
+└────────┼─────────────┼─────────────┼─────────────┼────────────┘
+         │             │             │             │
+         ▼             ▼             ▼             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     日志采集层 (Collector)                       │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────┐      ┌──────────────────┐                │
+│  │   Fluentd/Fluent Bit    │   Filebeat       │                │
+│  │  - 多源输入             │   - 轻量级        │                │
+│  │  - 强大过滤             │   - 低资源消耗    │                │
+│  │  - 缓冲机制             │   - 直接ES集成    │                │
+│  └──────────┬───────┘      └──────────┬───────┘                │
+└─────────────┼──────────────────────────┼────────────────────────┘
+              │                          │
+              └─────────┬────────────────┘
+                        ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     日志处理层 (Processing)                      │
+├─────────────────────────────────────────────────────────────────┤
+│                   ┌──────────────┐                              │
+│                   │   Logstash   │                              │
+│                   │  - Grok解析  │                              │
+│                   │  - 数据转换  │                              │
+│                   │  - 多输出    │                              │
+│                   └──────┬───────┘                              │
+└──────────────────────────┼──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     日志存储层 (Storage)                         │
+├─────────────────────────────────────────────────────────────────┤
+│             ┌────────────────────────────┐                      │
+│             │   Elasticsearch Cluster    │                      │
+│             │  ┌──────┐ ┌──────┐ ┌──────┐│                     │
+│             │  │ ES-1 │ │ ES-2 │ │ ES-3 ││                     │
+│             │  │Master│ │ Data │ │ Data ││                     │
+│             │  └──────┘ └──────┘ └──────┘│                     │
+│             │  - 分片副本策略             │                      │
+│             │  - ILM生命周期管理          │                      │
+│             │  - 冷热数据分离             │                      │
+│             └────────────┬───────────────┘                      │
+└──────────────────────────┼──────────────────────────────────────┘
+                           │
+            ┌──────────────┼──────────────┐
+            ▼              ▼              ▼
+┌─────────────────┐ ┌─────────────┐ ┌──────────────┐
+│     Kibana      │ │ ElastAlert  │ │   Curator    │
+│   可视化分析     │ │  日志告警    │ │  索引清理    │
+└─────────────────┘ └─────────────┘ └──────────────┘
+```
+
+**架构选型对比**:
+
+| 组件 | Fluentd | Filebeat | Logstash |
+|------|---------|----------|----------|
+| **语言** | Ruby | Go | Java |
+| **资源消耗** | 中等 | 极低 | 高 |
+| **插件生态** | 丰富(1000+) | 有限 | 丰富(200+) |
+| **过滤能力** | 强 | 弱 | 强 |
+| **缓冲机制** | 内置 | 无 | 内置 |
+| **使用场景** | 复杂日志处理 | 简单日志转发 | ETL转换 |
+| **CPU占用** | 50-200MB | 10-30MB | 500MB-2GB |
+
+**推荐架构**:
+- **小规模**: Filebeat → Elasticsearch → Kibana
+- **中规模**: Fluentd → Elasticsearch → Kibana
+- **大规模**: Fluentd → Kafka → Logstash → Elasticsearch → Kibana
+
+### 16.1.2 Docker日志驱动
+
+**Docker支持的日志驱动**:
+
+```yaml
+日志驱动类型:
+  1. json-file (默认)
+     - 优点: 简单、docker logs可用
+     - 缺点: 无自动轮转、磁盘占用
+     - 适用: 开发环境
+
+  2. syslog
+     - 优点: 集成系统日志
+     - 缺点: 需要syslog服务
+     - 适用: 传统运维环境
+
+  3. journald
+     - 优点: systemd集成
+     - 缺点: 仅Linux
+     - 适用: Systemd管理的系统
+
+  4. fluentd
+     - 优点: 直接集成Fluentd
+     - 缺点: 需要Fluentd运行
+     - 适用: 生产环境
+
+  5. gelf (Graylog Extended Log Format)
+     - 优点: 结构化日志
+     - 缺点: 需要Graylog/Logstash
+     - 适用: 微服务架构
+
+  6. none
+     - 优点: 无IO开销
+     - 缺点: 无法查看日志
+     - 适用: 性能敏感场景
+```
+
+**配置Docker日志驱动**:
+
+```bash
+# 全局配置 - /etc/docker/daemon.json
+{
+  "log-driver": "fluentd",
+  "log-opts": {
+    "fluentd-address": "fluentd.example.com:24224",
+    "fluentd-async": "true",
+    "fluentd-retry-wait": "1s",
+    "fluentd-max-retries": "10",
+    "tag": "docker.{{.Name}}.{{.ID}}"
+  }
+}
+
+# 重启Docker使配置生效
+$ sudo systemctl restart docker
+
+# 单容器配置 - docker-compose.yml
+version: '3.8'
+services:
+  app:
+    image: myapp:latest
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: fluentd:24224
+        fluentd-async: "true"
+        tag: "docker.app.{{.ID}}"
+        labels: "app,version"
+        env: "ENVIRONMENT"
+
+# 单容器配置 - docker run
+$ docker run -d \
+  --log-driver=fluentd \
+  --log-opt fluentd-address=fluentd:24224 \
+  --log-opt tag="docker.nginx.{{.ID}}" \
+  nginx:latest
+```
+
+---
+
+## 16.2 Elasticsearch集群部署
+
+### 16.2.1 Elasticsearch集群架构
+
+**生产环境3节点集群架构**:
+
+```yaml
+┌─────────────────────────────────────────────────────────┐
+│                  Elasticsearch Cluster                  │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐ │
+│  │   ES-Master  │  │   ES-Data-1  │  │   ES-Data-2  │ │
+│  │              │  │              │  │              │ │
+│  │ Roles:       │  │ Roles:       │  │ Roles:       │ │
+│  │ - master     │  │ - data       │  │ - data       │ │
+│  │ - ingest     │  │ - ingest     │  │ - ingest     │ │
+│  │              │  │              │  │              │ │
+│  │ Heap: 2GB    │  │ Heap: 16GB   │  │ Heap: 16GB   │ │
+│  │ CPU: 2核     │  │ CPU: 8核     │  │ CPU: 8核     │ │
+│  │ Mem: 4GB     │  │ Mem: 32GB    │  │ Mem: 32GB    │ │
+│  │ Disk: 50GB   │  │ Disk: 500GB  │  │ Disk: 500GB  │ │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘ │
+│         │                 │                 │          │
+│         └─────────────────┼─────────────────┘          │
+│                           │                            │
+│                  (集群通信: 9300端口)                   │
+└─────────────────────────────────────────────────────────┘
+         │                  │                 │
+         └──────────────────┼─────────────────┘
+                            │
+                     (REST API: 9200端口)
+                            │
+                  ┌─────────┴─────────┐
+                  │   Load Balancer   │
+                  │  (HAProxy/Nginx)  │
+                  └───────────────────┘
+```
+
+**节点角色说明**:
+- **Master Node**: 集群管理(创建/删除索引、分配分片)
+- **Data Node**: 存储数据、执行查询
+- **Ingest Node**: 数据预处理(Pipeline)
+- **Coordinating Node**: 请求路由和结果聚合
+
+### 16.2.2 Elasticsearch Stack部署
+
+**目录结构**:
+
+```bash
+elk/
+├── elasticsearch/
+│   ├── elasticsearch.yml        # ES配置
+│   ├── jvm.options             # JVM参数
+│   └── log4j2.properties       # 日志配置
+├── logstash/
+│   ├── logstash.yml            # Logstash配置
+│   ├── pipelines.yml           # Pipeline配置
+│   └── pipeline/
+│       ├── docker.conf         # Docker日志Pipeline
+│       ├── nginx.conf          # Nginx日志Pipeline
+│       └── app.conf            # 应用日志Pipeline
+├── kibana/
+│   └── kibana.yml              # Kibana配置
+└── stack.yml                   # Docker Compose配置
+```
+
+**1. Elasticsearch集群配置**:
+
+```yaml
+# elk/stack.yml
+version: '3.8'
+
+services:
+  # ========================================
+  # Elasticsearch Master Node
+  # ========================================
+  elasticsearch-master:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: es-master
+    environment:
+      # 节点配置
+      - node.name=es-master
+      - node.roles=master,ingest
+
+      # 集群配置
+      - cluster.name=docker-elk-cluster
+      - cluster.initial_master_nodes=es-master
+      - discovery.seed_hosts=es-data-1,es-data-2
+
+      # 网络配置
+      - network.host=0.0.0.0
+      - http.port=9200
+      - transport.port=9300
+
+      # 内存配置
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+      - bootstrap.memory_lock=true
+
+      # 安全配置(生产环境必须启用)
+      - xpack.security.enabled=true
+      - xpack.security.enrollment.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+
+      # 监控配置
+      - xpack.monitoring.collection.enabled=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-master-data:/usr/share/elasticsearch/data
+      - ./elasticsearch/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro
+      - ./elasticsearch/jvm.options:/usr/share/elasticsearch/config/jvm.options:ro
+    networks:
+      - elk
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ========================================
+  # Elasticsearch Data Node 1
+  # ========================================
+  elasticsearch-data-1:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: es-data-1
+    environment:
+      - node.name=es-data-1
+      - node.roles=data,ingest
+      - cluster.name=docker-elk-cluster
+      - discovery.seed_hosts=es-master,es-data-2
+      - cluster.initial_master_nodes=es-master
+      - ES_JAVA_OPTS=-Xms16g -Xmx16g
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-data-1-data:/usr/share/elasticsearch/data
+    networks:
+      - elk
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '8'
+          memory: 32G
+        reservations:
+          cpus: '4'
+          memory: 16G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ========================================
+  # Elasticsearch Data Node 2
+  # ========================================
+  elasticsearch-data-2:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: es-data-2
+    environment:
+      - node.name=es-data-2
+      - node.roles=data,ingest
+      - cluster.name=docker-elk-cluster
+      - discovery.seed_hosts=es-master,es-data-1
+      - cluster.initial_master_nodes=es-master
+      - ES_JAVA_OPTS=-Xms16g -Xmx16g
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-data-2-data:/usr/share/elasticsearch/data
+    networks:
+      - elk
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: '8'
+          memory: 32G
+        reservations:
+          cpus: '4'
+          memory: 16G
+
+  # ========================================
+  # Kibana
+  # ========================================
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: kibana
+    environment:
+      # Elasticsearch连接
+      - ELASTICSEARCH_HOSTS=http://elasticsearch-master:9200
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+
+      # Kibana配置
+      - SERVER_NAME=kibana
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=5601
+
+      # 中文支持
+      - I18N_LOCALE=zh-CN
+
+      # 监控配置
+      - MONITORING_ENABLED=true
+      - XPACK_MONITORING_UI_CONTAINER_ELASTICSEARCH_ENABLED=true
+    volumes:
+      - kibana-data:/usr/share/kibana/data
+      - ./kibana/kibana.yml:/usr/share/kibana/config/kibana.yml:ro
+    networks:
+      - elk
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q '\"state\":\"green\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ========================================
+  # Logstash
+  # ========================================
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.0
+    container_name: logstash
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch-master:9200
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+      - LS_JAVA_OPTS=-Xms2g -Xmx2g
+      - XPACK_MONITORING_ENABLED=true
+      - XPACK_MONITORING_ELASTICSEARCH_HOSTS=http://elasticsearch-master:9200
+    volumes:
+      - ./logstash/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logstash/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    networks:
+      - elk
+    ports:
+      - "5044:5044"  # Beats input
+      - "9600:9600"  # Logstash monitoring API
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 2
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9600/_node/stats"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+networks:
+  elk:
+    driver: overlay
+    attachable: true
+
+volumes:
+  es-master-data:
+  es-data-1-data:
+  es-data-2-data:
+  kibana-data:
+```
+
+**2. Elasticsearch配置文件**:
+
+```yaml
+# elk/elasticsearch/elasticsearch.yml
+# ========================================
+# 集群配置
+# ========================================
+cluster.name: docker-elk-cluster
+
+# ========================================
+# 节点配置
+# ========================================
+node.name: ${HOSTNAME}
+node.roles: [ master, data, ingest ]
+
+# ========================================
+# 路径配置
+# ========================================
+path.data: /usr/share/elasticsearch/data
+path.logs: /usr/share/elasticsearch/logs
+
+# ========================================
+# 网络配置
+# ========================================
+network.host: 0.0.0.0
+http.port: 9200
+transport.port: 9300
+
+# ========================================
+# 发现配置
+# ========================================
+discovery.seed_hosts:
+  - es-master
+  - es-data-1
+  - es-data-2
+
+cluster.initial_master_nodes:
+  - es-master
+
+# ========================================
+# 内存配置
+# ========================================
+bootstrap.memory_lock: true
+
+# ========================================
+# 安全配置
+# ========================================
+xpack.security.enabled: true
+xpack.security.transport.ssl.enabled: false  # 生产环境建议启用
+xpack.security.http.ssl.enabled: false       # 生产环境建议启用
+
+# ========================================
+# 索引配置
+# ========================================
+# 默认分片和副本
+index.number_of_shards: 3
+index.number_of_replicas: 1
+
+# 慢查询日志
+index.search.slowlog.threshold.query.warn: 10s
+index.search.slowlog.threshold.query.info: 5s
+index.indexing.slowlog.threshold.index.warn: 10s
+
+# ========================================
+# 线程池配置
+# ========================================
+thread_pool.write.queue_size: 1000
+thread_pool.search.queue_size: 1000
+
+# ========================================
+# 缓存配置
+# ========================================
+indices.queries.cache.size: 10%
+indices.fielddata.cache.size: 20%
+indices.requests.cache.size: 2%
+
+# ========================================
+# 生命周期管理
+# ========================================
+xpack.ilm.enabled: true
+```
+
+**3. JVM配置**:
+
+```bash
+# elk/elasticsearch/jvm.options
+# ========================================
+# Heap Size (根据节点类型调整)
+# ========================================
+# Master节点
+-Xms2g
+-Xmx2g
+
+# Data节点(建议物理内存的50%, 最大32GB)
+# -Xms16g
+# -Xmx16g
+
+# ========================================
+# GC配置 (使用G1 GC)
+# ========================================
+-XX:+UseG1GC
+-XX:G1ReservePercent=25
+-XX:InitiatingHeapOccupancyPercent=30
+
+# ========================================
+# GC日志
+# ========================================
+-Xlog:gc*,gc+age=trace,safepoint:file=/usr/share/elasticsearch/logs/gc.log:utctime,pid,tags:filecount=32,filesize=64m
+
+# ========================================
+# 堆转储
+# ========================================
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=/usr/share/elasticsearch/logs/heapdump.hprof
+
+# ========================================
+# 错误日志
+# ========================================
+-XX:ErrorFile=/usr/share/elasticsearch/logs/hs_err_pid%p.log
+```
+
+### 16.2.3 索引生命周期管理(ILM)
+
+**ILM策略配置**:
+
+```bash
+# 创建日志索引ILM策略
+PUT _ilm/policy/logs-policy
+{
+  "policy": {
+    "phases": {
+      # ========================================
+      # Hot阶段: 活跃写入(0-3天)
+      # ========================================
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_size": "50GB",       # 索引大小超过50GB则滚动
+            "max_age": "1d",          # 索引创建1天后滚动
+            "max_docs": 100000000     # 索引文档数超过1亿则滚动
+          },
+          "set_priority": {
+            "priority": 100           # 高优先级
+          }
+        }
+      },
+
+      # ========================================
+      # Warm阶段: 只读,可查询(3-7天)
+      # ========================================
+      "warm": {
+        "min_age": "3d",
+        "actions": {
+          "readonly": {},             # 设置为只读
+          "forcemerge": {
+            "max_num_segments": 1     # 强制合并为1个段(提高查询性能)
+          },
+          "shrink": {
+            "number_of_shards": 1     # 缩减分片数(节省资源)
+          },
+          "allocate": {
+            "number_of_replicas": 1   # 保留1个副本
+          },
+          "set_priority": {
+            "priority": 50            # 中等优先级
+          }
+        }
+      },
+
+      # ========================================
+      # Cold阶段: 归档存储(7-30天)
+      # ========================================
+      "cold": {
+        "min_age": "7d",
+        "actions": {
+          "allocate": {
+            "require": {
+              "data": "cold"          # 迁移到冷数据节点
+            },
+            "number_of_replicas": 0   # 不保留副本(节省空间)
+          },
+          "freeze": {},               # 冻结索引(极少查询)
+          "set_priority": {
+            "priority": 0             # 低优先级
+          }
+        }
+      },
+
+      # ========================================
+      # Delete阶段: 删除(30天后)
+      # ========================================
+      "delete": {
+        "min_age": "30d",
+        "actions": {
+          "delete": {}                # 删除索引
+        }
+      }
+    }
+  }
+}
+
+# 创建索引模板并应用ILM策略
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "index.lifecycle.name": "logs-policy",
+      "index.lifecycle.rollover_alias": "logs"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "level": {
+          "type": "keyword"
+        },
+        "message": {
+          "type": "text",
+          "fields": {
+            "keyword": {
+              "type": "keyword",
+              "ignore_above": 256
+            }
+          }
+        },
+        "container_name": {
+          "type": "keyword"
+        },
+        "service_name": {
+          "type": "keyword"
+        },
+        "host": {
+          "type": "keyword"
+        }
+      }
+    }
+  }
+}
+
+# 创建初始索引
+PUT logs-000001
+{
+  "aliases": {
+    "logs": {
+      "is_write_index": true
+    }
+  }
+}
+```
+
+**验证ILM策略**:
+
+```bash
+# 查看ILM策略
+GET _ilm/policy/logs-policy
+
+# 查看索引的ILM状态
+GET logs-*/_ilm/explain
+
+# 手动触发rollover(测试用)
+POST logs/_rollover
+
+# 查看ILM统计信息
+GET _ilm/status
+```
+
+---
+
+## 16.3 Fluentd日志收集
+
+### 16.3.1 Fluentd部署配置
+
+**Fluentd Stack配置**:
+
+```yaml
+# elk/stack.yml (添加到现有配置)
+services:
+  # ========================================
+  # Fluentd Aggregator(汇聚节点)
+  # ========================================
+  fluentd:
+    image: fluent/fluentd:v1.16-1
+    container_name: fluentd
+    volumes:
+      - ./fluentd/fluent.conf:/fluentd/etc/fluent.conf:ro
+      - ./fluentd/plugins:/fluentd/plugins:ro
+      - fluentd-buffer:/fluentd/buffer
+    networks:
+      - elk
+    ports:
+      - "24224:24224"   # Forward input
+      - "24224:24224/udp"
+      - "9880:9880"     # HTTP input
+    environment:
+      - FLUENTD_CONF=fluent.conf
+      - ELASTICSEARCH_HOST=elasticsearch-master
+      - ELASTICSEARCH_PORT=9200
+      - ELASTICSEARCH_USER=elastic
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+    depends_on:
+      - elasticsearch-master
+    deploy:
+      mode: replicated
+      replicas: 2
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9880/api/plugins.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ========================================
+  # Fluent Bit (轻量级采集器,每个节点)
+  # ========================================
+  fluent-bit:
+    image: fluent/fluent-bit:2.2
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/log:/var/log:ro
+    networks:
+      - elk
+    deploy:
+      mode: global  # 每个节点一个实例
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+
+volumes:
+  fluentd-buffer:
+```
+
+**Fluentd配置文件**:
+
+```ruby
+# elk/fluentd/fluent.conf
+# ========================================
+# Source: 接收Docker日志
+# ========================================
+<source>
+  @type forward
+  @id docker_forward
+  @label @docker
+  port 24224
+  bind 0.0.0.0
+
+  # 安全配置
+  <security>
+    self_hostname fluentd
+    shared_key ${FLUENTD_SHARED_KEY}
+  </security>
+
+  # 缓冲配置
+  <transport tls>
+    cert_path /fluentd/certs/fluentd.crt
+    private_key_path /fluentd/certs/fluentd.key
+  </transport>
+</source>
+
+# ========================================
+# Source: HTTP输入(应用直接发送日志)
+# ========================================
+<source>
+  @type http
+  @id http_input
+  @label @app
+  port 9880
+  bind 0.0.0.0
+
+  # 解析JSON
+  <parse>
+    @type json
+    time_key timestamp
+    time_format %iso8601
+  </parse>
+</source>
+
+# ========================================
+# Source: Syslog输入
+# ========================================
+<source>
+  @type syslog
+  @id syslog_input
+  @label @syslog
+  port 5140
+  bind 0.0.0.0
+  tag system
+
+  <parse>
+    message_format rfc5424
+  </parse>
+</source>
+
+# ========================================
+# Label: Docker日志处理
+# ========================================
+<label @docker>
+  # Filter: 解析Docker日志
+  <filter docker.**>
+    @type parser
+    key_name log
+    reserve_data true
+    remove_key_name_field false
+
+    <parse>
+      @type json
+      time_key timestamp
+      time_format %iso8601
+      keep_time_key true
+    </parse>
+  </filter>
+
+  # Filter: 添加Kubernetes元数据(如果使用K8s)
+  <filter docker.**>
+    @type record_transformer
+    enable_ruby true
+
+    <record>
+      # 提取容器名称
+      container_name ${record["container_name"] || "unknown"}
+
+      # 提取容器ID
+      container_id ${record["container_id"] || "unknown"}
+
+      # 添加主机名
+      hostname "#{Socket.gethostname}"
+
+      # 添加时间戳(如果不存在)
+      timestamp ${record["timestamp"] || Time.now.iso8601}
+    </record>
+  </filter>
+
+  # Filter: 删除敏感信息
+  <filter docker.**>
+    @type grep
+    <exclude>
+      key message
+      pattern /(password|secret|token|key)=/i
+    </exclude>
+  </filter>
+
+  # Filter: 多行日志合并(Java堆栈跟踪)
+  <filter docker.app.**>
+    @type concat
+    key message
+    multiline_start_regexp /^(\d{4}-\d{2}-\d{2}|Exception|Error)/
+    multiline_end_regexp /^\s*at\s+/
+    flush_interval 5s
+    timeout_label @output
+  </filter>
+
+  # Match: 输出到Elasticsearch
+  <match docker.**>
+    @type elasticsearch
+    @id elasticsearch_docker
+    @log_level info
+
+    # Elasticsearch连接
+    host "#{ENV['ELASTICSEARCH_HOST']}"
+    port "#{ENV['ELASTICSEARCH_PORT']}"
+    user "#{ENV['ELASTICSEARCH_USER']}"
+    password "#{ENV['ELASTICSEARCH_PASSWORD']}"
+    scheme http
+
+    # 索引配置
+    index_name logs-docker-%Y.%m.%d
+    logstash_format true
+    logstash_prefix logs-docker
+    logstash_dateformat %Y.%m.%d
+
+    # 类型映射
+    type_name _doc
+
+    # 缓冲配置
+    <buffer tag, time>
+      @type file
+      path /fluentd/buffer/docker
+
+      # 缓冲块配置
+      chunk_limit_size 16MB
+      chunk_limit_records 10000
+
+      # 刷新配置
+      flush_mode interval
+      flush_interval 10s
+      flush_at_shutdown true
+
+      # 重试配置
+      retry_type exponential_backoff
+      retry_wait 1s
+      retry_max_interval 60s
+      retry_timeout 1h
+      retry_max_times 10
+
+      # 溢出配置
+      overflow_action drop_oldest_chunk
+
+      # 队列配置
+      total_limit_size 1GB
+    </buffer>
+
+    # 批量写入配置
+    bulk_message_request_threshold 20MB
+
+    # 健康检查
+    health_check_uri /
+    health_check_interval 30s
+
+    # 模板配置
+    template_name logs-docker
+    template_file /fluentd/etc/docker-template.json
+    template_overwrite true
+
+    # 错误处理
+    <secondary>
+      @type file
+      path /fluentd/buffer/failed/docker
+      compress gzip
+    </secondary>
+  </match>
+</label>
+
+# ========================================
+# Label: 应用日志处理
+# ========================================
+<label @app>
+  # Filter: 添加标准字段
+  <filter app.**>
+    @type record_transformer
+    <record>
+      source application
+      environment production
+      timestamp ${time.iso8601}
+    </record>
+  </filter>
+
+  # Match: 根据日志级别路由
+  <match app.**>
+    @type rewrite_tag_filter
+
+    <rule>
+      key level
+      pattern /^(ERROR|FATAL)$/
+      tag app.error.${tag}
+    </rule>
+
+    <rule>
+      key level
+      pattern /^WARN$/
+      tag app.warn.${tag}
+    </rule>
+
+    <rule>
+      key level
+      pattern /.*/
+      tag app.info.${tag}
+    </rule>
+  </match>
+
+  # Match: Error级别日志
+  <match app.error.**>
+    @type copy
+
+    # 发送到Elasticsearch
+    <store>
+      @type elasticsearch
+      host "#{ENV['ELASTICSEARCH_HOST']}"
+      port "#{ENV['ELASTICSEARCH_PORT']}"
+      user "#{ENV['ELASTICSEARCH_USER']}"
+      password "#{ENV['ELASTICSEARCH_PASSWORD']}"
+      index_name logs-app-error-%Y.%m.%d
+
+      <buffer>
+        @type file
+        path /fluentd/buffer/app-error
+        flush_interval 5s
+      </buffer>
+    </store>
+
+    # 发送告警
+    <store>
+      @type http
+      endpoint http://alertmanager:9093/api/v1/alerts
+      open_timeout 2
+      json_array true
+
+      <format>
+        @type json
+      </format>
+
+      <buffer>
+        flush_interval 1s
+      </buffer>
+    </store>
+  </match>
+
+  # Match: 其他级别日志
+  <match app.**>
+    @type elasticsearch
+    host "#{ENV['ELASTICSEARCH_HOST']}"
+    port "#{ENV['ELASTICSEARCH_PORT']}"
+    user "#{ENV['ELASTICSEARCH_USER']}"
+    password "#{ENV['ELASTICSEARCH_PASSWORD']}"
+    index_name logs-app-%Y.%m.%d
+
+    <buffer>
+      @type file
+      path /fluentd/buffer/app
+      flush_interval 10s
+    </buffer>
+  </match>
+</label>
+
+# ========================================
+# 系统监控
+# ========================================
+<source>
+  @type monitor_agent
+  bind 0.0.0.0
+  port 24220
+</source>
+
+# ========================================
+# Prometheus监控指标
+# ========================================
+<source>
+  @type prometheus
+  bind 0.0.0.0
+  port 24231
+  metrics_path /metrics
+</source>
+
+<source>
+  @type prometheus_monitor
+  <labels>
+    host #{Socket.gethostname}
+  </labels>
+</source>
+
+<source>
+  @type prometheus_output_monitor
+  <labels>
+    host #{Socket.gethostname}
+  </labels>
+</source>
+```
+
+**Elasticsearch索引模板**:
+
+```json
+// elk/fluentd/docker-template.json
+{
+  "index_patterns": ["logs-docker-*"],
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "index.lifecycle.name": "logs-policy",
+    "index.lifecycle.rollover_alias": "logs-docker",
+    "index.refresh_interval": "5s",
+    "index.translog.durability": "async",
+    "index.translog.sync_interval": "30s"
+  },
+  "mappings": {
+    "properties": {
+      "@timestamp": {
+        "type": "date"
+      },
+      "container_name": {
+        "type": "keyword"
+      },
+      "container_id": {
+        "type": "keyword"
+      },
+      "source": {
+        "type": "keyword"
+      },
+      "level": {
+        "type": "keyword"
+      },
+      "message": {
+        "type": "text",
+        "fields": {
+          "keyword": {
+            "type": "keyword",
+            "ignore_above": 512
+          }
+        },
+        "norms": false
+      },
+      "hostname": {
+        "type": "keyword"
+      },
+      "tags": {
+        "type": "keyword"
+      }
+    }
+  }
+}
+```
+
+### 16.3.2 Fluent Bit配置(轻量级采集)
+
+```ini
+# elk/fluent-bit/fluent-bit.conf
+[SERVICE]
+    Flush        5
+    Daemon       Off
+    Log_Level    info
+    Parsers_File parsers.conf
+
+# ========================================
+# Input: Docker容器日志
+# ========================================
+[INPUT]
+    Name              tail
+    Path              /var/lib/docker/containers/*/*.log
+    Parser            docker
+    Tag               docker.*
+    Refresh_Interval  5
+    Mem_Buf_Limit     50MB
+    Skip_Long_Lines   On
+    DB                /fluent-bit/tail-docker.db
+
+# ========================================
+# Input: 系统日志
+# ========================================
+[INPUT]
+    Name   systemd
+    Tag    systemd.*
+    Read_From_Tail On
+
+# ========================================
+# Filter: 解析Docker JSON
+# ========================================
+[FILTER]
+    Name                parser
+    Match               docker.*
+    Key_Name            log
+    Parser              docker-json
+    Reserve_Data        True
+    Preserve_Key        True
+
+# ========================================
+# Filter: 添加Kubernetes元数据(可选)
+# ========================================
+[FILTER]
+    Name                kubernetes
+    Match               docker.*
+    Kube_URL            https://kubernetes.default.svc:443
+    Kube_CA_File        /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+    Kube_Token_File     /var/run/secrets/kubernetes.io/serviceaccount/token
+    Kube_Tag_Prefix     docker.var.log.containers.
+    Merge_Log           On
+    Keep_Log            Off
+
+# ========================================
+# Output: 转发到Fluentd
+# ========================================
+[OUTPUT]
+    Name          forward
+    Match         *
+    Host          fluentd
+    Port          24224
+    Retry_Limit   10
+
+    # TLS配置
+    tls           on
+    tls_verify    off
+
+    # 共享密钥
+    Shared_Key    ${FLUENTD_SHARED_KEY}
+```
+
+**Parser配置**:
+
+```ini
+# elk/fluent-bit/parsers.conf
+[PARSER]
+    Name   docker
+    Format json
+    Time_Key time
+    Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+    Time_Keep On
+
+[PARSER]
+    Name   docker-json
+    Format json
+    Time_Key timestamp
+    Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+
+[PARSER]
+    Name   nginx
+    Format regex
+    Regex ^(?<remote>[^ ]*) - (?<user>[^ ]*) \[(?<time>[^\]]*)\] "(?<method>\S+)(?: +(?<path>[^\"]*?)(?: +\S*)?)?" (?<code>[^ ]*) (?<size>[^ ]*)(?: "(?<referer>[^\"]*)" "(?<agent>[^\"]*)")?$
+    Time_Key time
+    Time_Format %d/%b/%Y:%H:%M:%S %z
+
+[PARSER]
+    Name   syslog
+    Format regex
+    Regex ^\<(?<pri>[0-9]+)\>(?<time>[^ ]* {1,2}[^ ]* [^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?(?:[^\:]*\:)? *(?<message>.*)$
+    Time_Key time
+    Time_Format %b %d %H:%M:%S
+```
+
+---
+
+*（第16章完成,约2500行。已完成16章,剩余3章...）*
+
+---
+
+# 第17章: 性能优化
+
+## 17.1 容器性能分析基础
+
+### 17.1.1 性能分析方法论
+
+**USE方法（Utilization, Saturation, Errors）**
+```
+┌─────────────────────────────────────────────────────────┐
+│           容器性能分析USE方法                              │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  [1] Utilization (利用率)                                │
+│      ├─ CPU利用率                                         │
+│      ├─ 内存利用率                                         │
+│      ├─ 网络带宽利用率                                      │
+│      └─ 磁盘IO利用率                                       │
+│                                                         │
+│  [2] Saturation (饱和度)                                 │
+│      ├─ CPU运行队列长度                                    │
+│      ├─ 内存页面交换                                       │
+│      ├─ 网络数据包队列                                      │
+│      └─ 磁盘IO等待队列                                     │
+│                                                         │
+│  [3] Errors (错误率)                                     │
+│      ├─ 网络丢包率                                         │
+│      ├─ 磁盘读写错误                                       │
+│      ├─ OOM Killer事件                                   │
+│      └─ 容器重启次数                                       │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+**RED方法（Rate, Errors, Duration）- 应用层**
+```yaml
+# 服务级别性能指标
+RED方法:
+  Rate (请求率):
+    - 每秒请求数 (RPS)
+    - 每分钟事务数 (TPM)
+
+  Errors (错误率):
+    - HTTP 5xx错误率
+    - 超时错误率
+    - 业务逻辑错误率
+
+  Duration (响应时间):
+    - P50延迟 (中位数)
+    - P95延迟
+    - P99延迟
+    - 最大延迟
+```
+
+### 17.1.2 性能分析工具栈
+
+**工具选择矩阵**
+```
+┌──────────────┬─────────────┬──────────────┬─────────────┐
+│   分析层次     │   主要工具   │   适用场景    │   开销等级   │
+├──────────────┼─────────────┼──────────────┼─────────────┤
+│ 系统级       │ top/htop    │ 实时监控      │ 低          │
+│ 系统级       │ vmstat      │ 内存/CPU分析  │ 低          │
+│ 系统级       │ iostat      │ 磁盘IO分析    │ 低          │
+│ 系统级       │ netstat     │ 网络连接分析  │ 低          │
+├──────────────┼─────────────┼──────────────┼─────────────┤
+│ 容器级       │ docker stats│ 容器资源监控  │ 低          │
+│ 容器级       │ cAdvisor    │ 详细指标采集  │ 中          │
+│ 容器级       │ ctop        │ 交互式监控    │ 低          │
+├──────────────┼─────────────┼──────────────┼─────────────┤
+│ 进程级       │ strace      │ 系统调用追踪  │ 高          │
+│ 进程级       │ lsof        │ 文件句柄分析  │ 低          │
+│ 进程级       │ pmap        │ 内存映射分析  │ 低          │
+│ 进程级       │ perf        │ CPU性能分析   │ 中-高       │
+├──────────────┼─────────────┼──────────────┼─────────────┤
+│ 应用级       │ JProfiler   │ Java性能分析  │ 高          │
+│ 应用级       │ py-spy      │ Python性能分析│ 中          │
+│ 应用级       │ pprof       │ Go性能分析    │ 中          │
+└──────────────┴─────────────┴──────────────┴─────────────┘
+```
+
+**cAdvisor容器监控部署**
+```yaml
+# docker-stack-cadvisor.yml
+version: '3.8'
+
+services:
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.0
+    hostname: '{{.Node.Hostname}}'
+    command:
+      - '--housekeeping_interval=10s'
+      - '--docker_only=true'
+      - '--storage_duration=1m0s'
+      - '--disable_metrics=disk,network,tcp,udp,percpu,sched,process'
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    deploy:
+      mode: global  # 每个节点运行一个实例
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+```
+
+**部署cAdvisor**
+```bash
+# 部署cAdvisor到所有节点
+docker stack deploy -c docker-stack-cadvisor.yml monitoring
+
+# 验证部署
+docker service ls | grep cadvisor
+
+# 查看指标（选择任一节点）
+curl http://localhost:8080/metrics | grep container_cpu
+
+# 示例输出
+container_cpu_usage_seconds_total{id="/docker/abc123"} 124.5
+container_memory_usage_bytes{id="/docker/abc123"} 524288000
+```
+
+### 17.1.3 性能基准测试
+
+**容器启动性能测试**
+```bash
+#!/bin/bash
+# benchmark-container-startup.sh - 容器启动性能基准测试
+
+IMAGE="nginx:alpine"
+ITERATIONS=100
+
+echo "容器启动性能测试 - 迭代次数: $ITERATIONS"
+echo "镜像: $IMAGE"
+echo "----------------------------------------"
+
+# 测试1: 冷启动（每次删除容器）
+total_time=0
+for i in $(seq 1 $ITERATIONS); do
+    start=$(date +%s%N)
+
+    docker run -d --name test-$i $IMAGE >/dev/null
+    docker wait test-$i >/dev/null 2>&1 &
+    sleep 0.1
+    docker rm -f test-$i >/dev/null
+
+    end=$(date +%s%N)
+    elapsed=$(( (end - start) / 1000000 ))  # 转换为毫秒
+    total_time=$(( total_time + elapsed ))
+
+    if [ $(( i % 10 )) -eq 0 ]; then
+        echo "进度: $i/$ITERATIONS"
+    fi
+done
+
+avg_time=$(( total_time / ITERATIONS ))
+echo ""
+echo "冷启动平均时间: ${avg_time}ms"
+
+# 测试2: 热启动（复用容器）
+echo ""
+echo "测试热启动（start/stop）..."
+
+docker run -d --name test-hot $IMAGE >/dev/null
+sleep 1
+
+total_time=0
+for i in $(seq 1 $ITERATIONS); do
+    docker stop test-hot >/dev/null
+
+    start=$(date +%s%N)
+    docker start test-hot >/dev/null
+    end=$(date +%s%N)
+
+    elapsed=$(( (end - start) / 1000000 ))
+    total_time=$(( total_time + elapsed ))
+done
+
+docker rm -f test-hot >/dev/null
+
+avg_hot_time=$(( total_time / ITERATIONS ))
+echo "热启动平均时间: ${avg_hot_time}ms"
+echo ""
+echo "性能提升: $(( (avg_time - avg_hot_time) * 100 / avg_time ))%"
+```
+
+**执行基准测试**
+```bash
+chmod +x benchmark-container-startup.sh
+./benchmark-container-startup.sh
+
+# 预期输出
+容器启动性能测试 - 迭代次数: 100
+镜像: nginx:alpine
+----------------------------------------
+进度: 10/100
+进度: 20/100
+...
+冷启动平均时间: 523ms
+
+测试热启动（start/stop）...
+热启动平均时间: 145ms
+
+性能提升: 72%
+```
+
+## 17.2 CPU性能优化
+
+### 17.2.1 CPU限制与配额
+
+**CPU资源限制策略**
+```yaml
+# CPU限制配置示例
+services:
+  web:
+    image: myapp:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'        # 最多使用2个CPU核心
+        reservations:
+          cpus: '0.5'        # 保证至少0.5个核心
+
+  # 实时应用 - 严格CPU配额
+  realtime-processor:
+    image: processor:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+        reservations:
+          cpus: '4.0'        # 预留等于限制 - 确保独占资源
+
+  # 批处理任务 - 弹性CPU配额
+  batch-job:
+    image: batch:latest
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'        # 峰值可用8核
+        reservations:
+          cpus: '1.0'        # 基础保证1核
+```
+
+**CPU亲和性（CPU Pinning）**
+```yaml
+# docker-compose-cpu-pinning.yml
+version: '3.8'
+
+services:
+  # 场景1: 绑定到特定CPU核心
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    cpuset: "0,1"  # 仅使用CPU 0和1
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+    volumes:
+      - redis-data:/data
+
+  # 场景2: NUMA节点优化
+  database:
+    image: postgres:15-alpine
+    cpuset: "0-7"   # 使用NUMA节点0的CPU (假设0-7是节点0)
+    mem_limit: 16G
+    environment:
+      - POSTGRES_SHARED_BUFFERS=4GB
+    deploy:
+      placement:
+        constraints:
+          - node.labels.numa_node == 0
+
+  # 场景3: 避免CPU0（系统中断处理）
+  app:
+    image: myapp:latest
+    cpuset: "2-15"  # 避开CPU 0-1,留给系统和关键服务
+    deploy:
+      replicas: 4
+      resources:
+        limits:
+          cpus: '2.0'
+
+volumes:
+  redis-data:
+```
+
+**查看NUMA拓扑**
+```bash
+# 安装numactl工具
+apt-get update && apt-get install -y numactl
+
+# 查看NUMA节点信息
+numactl --hardware
+
+# 示例输出
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7 16 17 18 19 20 21 22 23
+node 0 size: 65536 MB
+node 0 free: 32768 MB
+node 1 cpus: 8 9 10 11 12 13 14 15 24 25 26 27 28 29 30 31
+node 1 size: 65536 MB
+node 1 free: 45678 MB
+
+# 查看进程NUMA分配
+numastat -p $(docker inspect -f '{{.State.Pid}}' container_name)
+```
+
+**运行时修改CPU配额**
+```bash
+# 动态调整CPU限制（无需重启容器）
+docker update --cpus="4.0" --cpuset-cpus="0-3" my-container
+
+# 查看当前CPU配置
+docker inspect my-container | jq '.[0].HostConfig.CpuQuota'
+docker inspect my-container | jq '.[0].HostConfig.CpusetCpus'
+
+# 验证生效
+docker stats my-container --no-stream
+```
+
+### 17.2.2 CPU性能分析与调优
+
+**使用perf进行CPU性能分析**
+```bash
+# 安装perf工具
+apt-get install -y linux-tools-common linux-tools-$(uname -r)
+
+# 获取容器PID
+CONTAINER_PID=$(docker inspect -f '{{.State.Pid}}' my-app)
+
+# 方法1: 记录30秒的CPU性能数据
+perf record -F 99 -p $CONTAINER_PID -g -- sleep 30
+
+# 生成火焰图可视化数据
+perf script | ./FlameGraph/stackcollapse-perf.pl | \
+  ./FlameGraph/flamegraph.pl > cpu-flamegraph.svg
+
+# 方法2: 实时查看热点函数
+perf top -p $CONTAINER_PID
+
+# 方法3: 统计CPU事件
+perf stat -p $CONTAINER_PID sleep 10
+
+# 示例输出
+ Performance counter stats for process id '12345':
+
+      8,234.56 msec task-clock                #    0.823 CPUs utilized
+         1,234      context-switches          #    0.150 K/sec
+            12      cpu-migrations            #    0.001 K/sec
+         5,678      page-faults               #    0.689 K/sec
+23,456,789,012      cycles                    #    2.848 GHz
+15,678,901,234      instructions              #    0.67  insn per cycle
+ 3,456,789,012      branches                  #  419.876 M/sec
+    12,345,678      branch-misses             #    0.36% of all branches
+```
+
+**CPU上下文切换分析**
+```bash
+# 监控容器的上下文切换
+docker stats --format "table {{.Container}}\t{{.CPUPerc}}" --no-stream
+
+# 使用pidstat查看详细上下文切换
+apt-get install -y sysstat
+
+# 每秒采样一次,显示5次
+pidstat -w -p $CONTAINER_PID 1 5
+
+# 示例输出 - 高上下文切换示例
+12:00:01      PID   cswch/s nvcswch/s  Command
+12:00:02    12345    523.00   1234.00  java
+12:00:03    12345    567.00   1456.00  java
+# cswch/s: 自愿上下文切换（IO等待）
+# nvcswch/s: 非自愿上下文切换（时间片用完）
+
+# 如果nvcswch/s很高,说明CPU竞争严重,需要:
+# 1. 增加CPU配额
+# 2. 减少线程数
+# 3. 优化应用逻辑
+```
+
+**CPU中断分析**
+```bash
+# 查看中断分布
+watch -n 1 'cat /proc/interrupts | head -20'
+
+# 查看软中断
+watch -n 1 'cat /proc/softirqs'
+
+# 将网络中断绑定到特定CPU（避免干扰应用）
+# 查找网卡中断号
+grep eth0 /proc/interrupts
+
+# 设置CPU亲和性（示例：绑定到CPU 0）
+echo 1 > /proc/irq/123/smp_affinity_list  # 123是中断号
+```
+
+### 17.2.3 CPU调度优化
+
+**CFS调度器参数调优**
+```bash
+# 调整容器CPU权重（shares）
+# 默认值1024,值越大获得的CPU时间越多
+
+# 示例:关键服务获得更多CPU时间
+docker run -d \
+  --name critical-service \
+  --cpu-shares 2048 \    # 2倍权重
+  myapp:latest
+
+docker run -d \
+  --name background-task \
+  --cpu-shares 512 \     # 0.5倍权重
+  batch:latest
+
+# 验证:在CPU竞争时,critical-service获得的CPU时间是background-task的4倍
+```
+
+**实时调度策略（谨慎使用）**
+```yaml
+# docker-compose-realtime.yml
+version: '3.8'
+
+services:
+  realtime-app:
+    image: realtime:latest
+    # 需要宿主机内核支持CONFIG_RT_GROUP_SCHED
+    cap_add:
+      - SYS_NICE      # 允许修改进程优先级
+    security_opt:
+      - apparmor=unconfined
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+        reservations:
+          cpus: '2.0'  # 确保独占CPU
+```
+
+**进程优先级调整**
+```bash
+# 在容器内调整进程优先级
+docker exec my-container bash -c '
+  # 查看当前nice值
+  ps -eo pid,ni,comm | grep myapp
+
+  # 降低优先级（提高nice值:0到19）
+  renice +10 -p $(pgrep myapp)
+
+  # 提高优先级（降低nice值:-20到0,需要root）
+  renice -5 -p $(pgrep myapp)
+'
+
+# 使用chrt设置实时优先级（需要CAP_SYS_NICE）
+docker exec my-container chrt -f -p 50 $(pgrep myapp)
+# -f: FIFO调度策略
+# -p 50: 实时优先级50（1-99）
+```
+
+## 17.3 内存性能优化
+
+### 17.3.1 内存限制与预留
+
+**内存限制最佳实践**
+```yaml
+version: '3.8'
+
+services:
+  # 场景1: Java应用 - 堆内存+元空间+堆外内存
+  java-app:
+    image: openjdk:17-slim
+    environment:
+      # JVM堆内存=容器内存的75%
+      - JAVA_OPTS=-Xms2g -Xmx2g -XX:MaxMetaspaceSize=256m
+    deploy:
+      resources:
+        limits:
+          memory: 3G      # 2G堆+256M元空间+768M堆外+OS开销
+        reservations:
+          memory: 2G
+
+  # 场景2: Redis - 内存+持久化缓冲
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 7gb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 8G      # 7G数据+1G持久化缓冲
+        reservations:
+          memory: 4G
+
+  # 场景3: Nginx - 最小内存占用
+  nginx:
+    image: nginx:alpine
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  # 场景4: 数据库 - 大内存+Swap
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_SHARED_BUFFERS=8GB
+      - POSTGRES_EFFECTIVE_CACHE_SIZE=24GB
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          memory: 16G
+    # 允许使用Swap作为缓冲
+    mem_swappiness: 10
+```
+
+**内存预留与OOM优先级**
+```yaml
+services:
+  # 关键服务 - 最低OOM优先级
+  critical-db:
+    image: postgres:15
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          memory: 16G    # 预留等于限制
+    # OOM Score Adj: -1000到1000
+    # 越低越不容易被OOM Killer杀死
+    oom_score_adj: -500
+
+  # 普通服务 - 默认OOM优先级
+  web-app:
+    image: webapp:latest
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+    # 默认oom_score_adj: 0
+
+  # 批处理任务 - 高OOM优先级（优先牺牲）
+  batch-worker:
+    image: worker:latest
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 2G
+    oom_score_adj: 500
+```
+
+### 17.3.2 内存性能分析
+
+**内存使用分析脚本**
+```bash
+#!/bin/bash
+# analyze-memory.sh - 容器内存详细分析
+
+CONTAINER=$1
+
+if [ -z "$CONTAINER" ]; then
+    echo "用法: $0 <容器名称>"
+    exit 1
+fi
+
+echo "=========================================="
+echo "容器内存分析: $CONTAINER"
+echo "=========================================="
+
+# 1. Docker Stats内存统计
+echo -e "\n[1] Docker Stats内存使用:"
+docker stats $CONTAINER --no-stream --format \
+  "table {{.MemUsage}}\t{{.MemPerc}}"
+
+# 2. Cgroup内存详细信息
+CONTAINER_ID=$(docker inspect -f '{{.Id}}' $CONTAINER)
+CGROUP_PATH="/sys/fs/cgroup/memory/docker/$CONTAINER_ID"
+
+if [ -d "$CGROUP_PATH" ]; then
+    echo -e "\n[2] Cgroup内存详细:"
+    echo "内存限制: $(cat $CGROUP_PATH/memory.limit_in_bytes | \
+      awk '{print $1/1024/1024 " MB"}')"
+    echo "当前使用: $(cat $CGROUP_PATH/memory.usage_in_bytes | \
+      awk '{print $1/1024/1024 " MB"}')"
+    echo "缓存内存: $(cat $CGROUP_PATH/memory.stat | \
+      grep ^cache | awk '{print $2/1024/1024 " MB"}')"
+    echo "RSS内存: $(cat $CGROUP_PATH/memory.stat | \
+      grep ^rss | head -1 | awk '{print $2/1024/1024 " MB"}')"
+    echo "Swap使用: $(cat $CGROUP_PATH/memory.memsw.usage_in_bytes | \
+      awk '{print $1/1024/1024 " MB"}')"
+fi
+
+# 3. 容器内进程内存排行
+echo -e "\n[3] 容器内TOP 5进程内存使用:"
+docker exec $CONTAINER sh -c '
+  ps aux --sort=-%mem | head -6 | \
+  awk "{printf \"%-15s %6s %6s %s\n\", \$1, \$3, \$4, \$11}"
+'
+
+# 4. 检查OOM事件
+echo -e "\n[4] OOM Killer事件:"
+docker inspect $CONTAINER | \
+  jq '.[0].State.OOMKilled'
+
+# 5. 内存统计历史（如果有cAdvisor）
+echo -e "\n[5] 内存趋势（最近1小时）:"
+if command -v curl &> /dev/null; then
+    curl -s "http://localhost:8080/api/v1.3/docker/$CONTAINER" | \
+      jq -r '.stats[-60:] | .[] |
+        "\(.timestamp) \(.memory_stats.usage / 1024 / 1024 | floor) MB"' | \
+      tail -10 2>/dev/null || echo "cAdvisor未运行"
+fi
+
+echo -e "\n=========================================="
+```
+
+**执行内存分析**
+```bash
+chmod +x analyze-memory.sh
+./analyze-memory.sh my-app
+
+# 示例输出
+==========================================
+容器内存分析: my-app
+==========================================
+
+[1] Docker Stats内存使用:
+MEM USAGE / LIMIT   MEM %
+1.234GiB / 2GiB     61.7%
+
+[2] Cgroup内存详细:
+内存限制: 2048 MB
+当前使用: 1264 MB
+缓存内存: 234 MB
+RSS内存: 1030 MB
+Swap使用: 0 MB
+
+[3] 容器内TOP 5进程内存使用:
+USER            CPU%   MEM%  COMMAND
+app             45.2   58.3  /usr/bin/java
+app             2.1    3.2   node
+root            0.1    0.5   nginx
+```
+
+**Java堆内存分析**
+```bash
+# 容器内执行jmap分析
+docker exec my-java-app jmap -heap 1
+
+# 示例输出
+Heap Configuration:
+   MinHeapFreeRatio         = 40
+   MaxHeapFreeRatio         = 70
+   MaxHeapSize              = 2147483648 (2048.0MB)
+   NewSize                  = 715653120 (682.5MB)
+   MaxNewSize               = 715653120 (682.5MB)
+   OldSize                  = 1431830528 (1365.5MB)
+
+Heap Usage:
+New Generation (Eden + 1 Survivor Space):
+   capacity = 644349952 (614.5MB)
+   used     = 523678432 (499.3MB)    # 81.2%使用率
+   free     = 120671520 (115.2MB)
+
+Eden Space:
+   capacity = 572653568 (546.0MB)
+   used     = 512345678 (488.6MB)    # 89.5%使用率
+
+Old Generation:
+   capacity = 1431830528 (1365.5MB)
+   used     = 834567890 (796.2MB)    # 58.3%使用率
+
+# 生成堆转储文件
+docker exec my-java-app jmap -dump:format=b,file=/tmp/heap.hprof 1
+
+# 复制到宿主机分析
+docker cp my-java-app:/tmp/heap.hprof ./
+# 使用MAT (Memory Analyzer Tool)分析
+```
+
+### 17.3.3 Huge Pages优化
+
+**Huge Pages配置**
+```bash
+# 宿主机配置Huge Pages
+# 查看当前配置
+cat /proc/meminfo | grep Huge
+
+# 示例输出
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+
+# 分配1024个2MB的Huge Pages (共2GB)
+echo 1024 > /proc/sys/vm/nr_hugepages
+
+# 持久化配置
+cat >> /etc/sysctl.conf <<EOF
+vm.nr_hugepages = 1024
+vm.hugetlb_shm_group = 0
+EOF
+
+sysctl -p
+
+# 验证
+cat /proc/meminfo | grep HugePages_Total
+# HugePages_Total:    1024
+```
+
+**Docker容器使用Huge Pages**
+```yaml
+# docker-compose-hugepages.yml
+version: '3.8'
+
+services:
+  # 数据库使用Huge Pages
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_SHARED_BUFFERS=1GB
+      # PostgreSQL使用Huge Pages
+      - POSTGRES_HUGE_PAGES=try
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - type: tmpfs
+        target: /dev/hugepages
+        tmpfs:
+          size: 2G
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+          hugepages-2MB: 1GB  # 预留1GB Huge Pages
+
+  # Redis使用Huge Pages
+  redis:
+    image: redis:7-alpine
+    command: >
+      sh -c "
+        echo never > /sys/kernel/mm/transparent_hugepage/enabled &&
+        redis-server
+          --maxmemory 2gb
+          --maxmemory-policy allkeys-lru
+      "
+    privileged: true  # 需要修改THP设置
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+        reservations:
+          hugepages-2MB: 512M
+
+volumes:
+  postgres-data:
+```
+
+**验证Huge Pages使用**
+```bash
+# 查看容器Huge Pages使用情况
+docker exec postgres grep Huge /proc/meminfo
+
+# 示例输出
+HugePages_Total:    1024
+HugePages_Free:      512  # 已使用512个(1GB)
+HugePages_Rsvd:      256
+Hugepagesize:       2048 kB
+
+# 监控Huge Pages效果
+# 对比使用前后的性能指标:
+# 1. 内存访问延迟降低
+# 2. TLB缓存命中率提升
+# 3. CPU利用率可能略微下降
+```
+
+## 17.4 网络性能优化
+
+### 17.4.1 网络模式选择
+
+**网络模式性能对比**
+```
+┌──────────────┬──────────┬──────────┬──────────┬──────────┐
+│   网络模式    │ 吞吐量    │ 延迟     │ 隔离性    │ 适用场景  │
+├──────────────┼──────────┼──────────┼──────────┼──────────┤
+│ host         │ ★★★★★   │ ★★★★★   │ ☆☆☆☆☆   │ 高性能    │
+│ bridge       │ ★★★☆☆   │ ★★★☆☆   │ ★★★★☆   │ 通用      │
+│ overlay      │ ★★☆☆☆   │ ★★☆☆☆   │ ★★★★★   │ 多主机    │
+│ macvlan      │ ★★★★☆   │ ★★★★☆   │ ★★★★★   │ 物理网络  │
+│ ipvlan       │ ★★★★☆   │ ★★★★☆   │ ★★★★★   │ 虚拟网络  │
+└──────────────┴──────────┴──────────┴──────────┴──────────┘
+```
+
+**高性能网络配置 - Host模式**
+```yaml
+# 适用于高吞吐量应用（如负载均衡器、缓存）
+version: '3.8'
+
+services:
+  haproxy:
+    image: haproxy:2.8-alpine
+    network_mode: host  # 直接使用宿主机网络
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    deploy:
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.network == high-performance
+```
+
+**高性能网络配置 - Macvlan**
+```bash
+# 创建macvlan网络
+docker network create -d macvlan \
+  --subnet=192.168.1.0/24 \
+  --gateway=192.168.1.1 \
+  --ip-range=192.168.1.192/27 \
+  -o parent=eth0 \
+  macvlan-net
+
+# 使用macvlan网络
+docker run -d \
+  --name high-perf-app \
+  --network macvlan-net \
+  --ip 192.168.1.200 \
+  myapp:latest
+
+# 验证网络性能
+docker exec high-perf-app iperf3 -c 192.168.1.1 -t 30
+
+# 预期结果:接近物理网卡性能
+# [ ID] Interval           Transfer     Bandwidth
+# [  4]   0.00-30.00  sec  33.2 GBytes  9.50 Gbits/sec
+```
+
+### 17.4.2 网络内核参数调优
+
+**系统级网络优化**
+```bash
+# /etc/sysctl.d/99-docker-network.conf
+
+# ============ TCP连接优化 ============
+# 增大连接队列
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 8192
+
+# 快速回收TIME_WAIT连接
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+
+# ============ TCP缓冲优化 ============
+# 增大TCP接收/发送缓冲区
+net.core.rmem_max = 134217728        # 128MB
+net.core.wmem_max = 134217728
+net.core.rmem_default = 16777216     # 16MB
+net.core.wmem_default = 16777216
+
+# TCP自动调优
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.tcp_mem = 786432 1048576 26777216
+
+# ============ 网络设备队列 ============
+# 增大网络设备接收队列
+net.core.netdev_max_backlog = 30000
+
+# ============ TCP拥塞控制 ============
+# 使用BBR拥塞控制算法
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# ============ 连接追踪优化 ============
+# 增大conntrack表大小
+net.netfilter.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+
+# ============ 其他优化 ============
+# 启用TCP Fast Open
+net.ipv4.tcp_fastopen = 3
+
+# 禁用TCP时间戳（减少开销）
+net.ipv4.tcp_timestamps = 0
+
+# MTU探测
+net.ipv4.tcp_mtu_probing = 1
+```
+
+**应用配置**
+```bash
+# 应用到系统
+sysctl -p /etc/sysctl.d/99-docker-network.conf
+
+# 验证配置
+sysctl net.ipv4.tcp_congestion_control
+# net.ipv4.tcp_congestion_control = bbr
+
+sysctl net.core.somaxconn
+# net.core.somaxconn = 65535
+
+# 查看TCP连接状态统计
+ss -s
+
+# 示例输出
+Total: 234
+TCP:   180 (estab 95, closed 45, orphaned 2, timewait 40)
+```
+
+### 17.4.3 容器网络性能测试
+
+**iperf3网络性能测试**
+```bash
+# 部署iperf3服务端和客户端
+cat > docker-compose-iperf3.yml <<'EOF'
+version: '3.8'
+
+services:
+  iperf3-server:
+    image: networkstatic/iperf3
+    command: -s
+    networks:
+      - perf-test
+    ports:
+      - "5201:5201"
+    deploy:
+      replicas: 1
+
+  iperf3-client:
+    image: networkstatic/iperf3
+    depends_on:
+      - iperf3-server
+    networks:
+      - perf-test
+    deploy:
+      replicas: 0  # 手动运行
+
+networks:
+  perf-test:
+    driver: bridge
+EOF
+
+docker stack deploy -c docker-compose-iperf3.yml perftest
+
+# 测试1: TCP吞吐量（单线程）
+docker run --rm --network perftest_perf-test \
+  networkstatic/iperf3 -c iperf3-server -t 30
+
+# 示例输出
+[ ID] Interval           Transfer     Bandwidth
+[  4]   0.00-30.00  sec  10.2 GBytes  2.92 Gbits/sec
+
+# 测试2: TCP吞吐量（10并发流）
+docker run --rm --network perftest_perf-test \
+  networkstatic/iperf3 -c iperf3-server -P 10 -t 30
+
+# 测试3: UDP吞吐量
+docker run --rm --network perftest_perf-test \
+  networkstatic/iperf3 -c iperf3-server -u -b 10G -t 30
+
+# 测试4: 测试延迟
+docker run --rm --network perftest_perf-test \
+  alpine ping -c 100 iperf3-server
+
+# 计算平均延迟
+# rtt min/avg/max/mdev = 0.123/0.156/0.234/0.023 ms
+```
+
+**不同网络模式性能对比脚本**
+```bash
+#!/bin/bash
+# network-benchmark.sh - 对比不同网络模式性能
+
+echo "Docker网络模式性能对比测试"
+echo "======================================"
+
+# 测试函数
+test_network() {
+    local mode=$1
+    local server_name="iperf-server-$mode"
+    local client_cmd="docker run --rm --name iperf-client-$mode"
+
+    echo ""
+    echo "测试模式: $mode"
+    echo "--------------------------------------"
+
+    # 启动服务端
+    case $mode in
+        "host")
+            docker run -d --name $server_name --network host \
+              networkstatic/iperf3 -s
+            sleep 2
+            $client_cmd --network host \
+              networkstatic/iperf3 -c localhost -t 10 | grep receiver
+            ;;
+        "bridge")
+            docker run -d --name $server_name \
+              networkstatic/iperf3 -s
+            sleep 2
+            SERVER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $server_name)
+            $client_cmd --link $server_name \
+              networkstatic/iperf3 -c $SERVER_IP -t 10 | grep receiver
+            ;;
+        "overlay")
+            docker network create -d overlay test-overlay
+            docker service create --name $server_name \
+              --network test-overlay networkstatic/iperf3 -s
+            sleep 5
+            docker run --rm --network test-overlay \
+              networkstatic/iperf3 -c $server_name -t 10 | grep receiver
+            docker service rm $server_name
+            docker network rm test-overlay
+            return
+            ;;
+    esac
+
+    # 清理
+    docker rm -f $server_name >/dev/null 2>&1
+}
+
+# 执行测试
+test_network "host"
+test_network "bridge"
+test_network "overlay"
+
+echo ""
+echo "======================================"
+echo "测试完成"
+```
+
+**执行对比测试**
+```bash
+chmod +x network-benchmark.sh
+./network-benchmark.sh
+
+# 预期输出示例
+Docker网络模式性能对比测试
+======================================
+
+测试模式: host
+--------------------------------------
+[  4]   0.00-10.00  sec  11.2 GBytes  9.62 Gbits/sec    receiver
+
+测试模式: bridge
+--------------------------------------
+[  4]   0.00-10.00  sec   3.5 GBytes  3.01 Gbits/sec    receiver
+
+测试模式: overlay
+--------------------------------------
+[  4]   0.00-10.00  sec   2.1 GBytes  1.80 Gbits/sec    receiver
+
+======================================
+结论:
+- host模式:    9.62 Gbps (基准)
+- bridge模式:  3.01 Gbps (31%性能)
+- overlay模式: 1.80 Gbps (19%性能)
+```
+
+### 17.4.4 连接池与Keep-Alive优化
+
+**Nginx连接优化**
+```nginx
+# nginx.conf - 高性能配置
+
+user nginx;
+worker_processes auto;  # 自动匹配CPU核心数
+worker_rlimit_nofile 65535;
+
+events {
+    worker_connections 16384;  # 每个worker最大连接数
+    use epoll;                 # 使用epoll事件模型
+    multi_accept on;           # 一次接受多个连接
+}
+
+http {
+    # ============ 连接优化 ============
+    keepalive_timeout 65;
+    keepalive_requests 1000;   # 单个keep-alive连接最大请求数
+
+    # ============ 上游连接池 ============
+    upstream backend {
+        server backend1:8080 max_fails=3 fail_timeout=30s;
+        server backend2:8080 max_fails=3 fail_timeout=30s;
+
+        # 连接池配置
+        keepalive 256;          # 保持256个空闲连接
+        keepalive_requests 1000;
+        keepalive_timeout 60s;
+    }
+
+    server {
+        listen 80 reuseport;    # 端口复用
+
+        location / {
+            proxy_pass http://backend;
+
+            # 启用HTTP/1.1和Keep-Alive
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+
+            # 连接超时
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 60s;
+            proxy_read_timeout 60s;
+
+            # 缓冲优化
+            proxy_buffering on;
+            proxy_buffer_size 8k;
+            proxy_buffers 32 8k;
+        }
+    }
+}
+```
+
+**数据库连接池配置**
+```python
+# Python - SQLAlchemy连接池优化
+
+from sqlalchemy import create_engine
+from sqlalchemy.pool import QueuePool
+
+# 高并发场景连接池配置
+engine = create_engine(
+    'postgresql://user:pass@db:5432/mydb',
+
+    # 连接池参数
+    poolclass=QueuePool,
+    pool_size=20,              # 常驻连接数
+    max_overflow=40,           # 峰值额外连接数（总共60）
+    pool_pre_ping=True,        # 连接健康检查
+    pool_recycle=3600,         # 1小时回收连接
+    pool_timeout=30,           # 获取连接超时
+
+    # 连接参数
+    connect_args={
+        'connect_timeout': 10,
+        'application_name': 'myapp',
+        'options': '-c statement_timeout=30000'  # 30秒查询超时
+    }
+)
+
+# 监控连接池状态
+from sqlalchemy import event
+
+@event.listens_for(engine, "connect")
+def receive_connect(dbapi_conn, connection_record):
+    print(f"新连接建立: {id(dbapi_conn)}")
+
+@event.listens_for(engine, "checkout")
+def receive_checkout(dbapi_conn, connection_record, connection_proxy):
+    pool = engine.pool
+    print(f"连接池状态 - 使用:{pool.checkedout()} 空闲:{pool.size() - pool.checkedout()}")
+```
+
+**Redis连接池配置**
+```python
+# Python - Redis连接池优化
+
+import redis
+from redis import ConnectionPool
+
+# 高性能连接池配置
+pool = ConnectionPool(
+    host='redis',
+    port=6379,
+    db=0,
+
+    # 连接池参数
+    max_connections=100,       # 最大连接数
+    socket_timeout=5,          # Socket超时
+    socket_connect_timeout=5,  # 连接超时
+    socket_keepalive=True,     # 启用TCP Keep-Alive
+    socket_keepalive_options={
+        socket.TCP_KEEPIDLE: 60,    # 60秒后发送keepalive探测
+        socket.TCP_KEEPINTVL: 10,   # 探测间隔10秒
+        socket.TCP_KEEPCNT: 3       # 探测3次失败后断开
+    },
+
+    # 重试配置
+    retry_on_timeout=True,
+    health_check_interval=30,  # 30秒健康检查
+)
+
+redis_client = redis.Redis(connection_pool=pool)
+
+# 监控连接池
+def monitor_redis_pool():
+    pool_info = pool.get_connection('_').pool._available_connections
+    print(f"Redis连接池 - 可用连接: {len(pool_info)}/{pool.max_connections}")
+```
+
+## 17.5 存储性能优化
+
+### 17.5.1 存储驱动选择
+
+**存储驱动性能对比**
+```
+┌──────────────┬──────────┬──────────┬──────────┬──────────┐
+│  存储驱动     │ 读性能    │ 写性能    │ 稳定性    │ 推荐场景  │
+├──────────────┼──────────┼──────────┼──────────┼──────────┤
+│ overlay2     │ ★★★★☆   │ ★★★★☆   │ ★★★★★   │ 通用      │
+│ aufs         │ ★★★☆☆   │ ★★☆☆☆   │ ★★★☆☆   │ 旧内核    │
+│ btrfs        │ ★★★☆☆   │ ★★★☆☆   │ ★★★☆☆   │ 快照      │
+│ zfs          │ ★★★★☆   │ ★★★★☆   │ ★★★★★   │ 企业级    │
+│ devicemapper │ ★★☆☆☆   │ ★★☆☆☆   │ ★★☆☆☆   │ 不推荐    │
+└──────────────┴──────────┴──────────┴──────────┴──────────┘
+```
+
+**overlay2优化配置**
+```json
+// /etc/docker/daemon.json
+
+{
+  "storage-driver": "overlay2",
+  "storage-opts": [
+    "overlay2.override_kernel_check=true",
+    "overlay2.size=20G"  // 限制单个容器rootfs大小
+  ],
+
+  // 数据根目录(选择高性能SSD)
+  "data-root": "/mnt/ssd/docker",
+
+  // 日志优化
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+```
+
+**验证存储驱动**
+```bash
+# 查看当前存储驱动
+docker info | grep "Storage Driver"
+
+# 查看overlay2详细信息
+docker info | grep -A 10 "Storage Driver"
+
+# 示例输出
+Storage Driver: overlay2
+  Backing Filesystem: extfs
+  Supports d_type: true
+  Native Overlay Diff: true
+  userxattr: false
+```
+
+### 17.5.2 卷性能优化
+
+**卷类型性能对比**
+```yaml
+version: '3.8'
+
+services:
+  # 场景1: 高性能读写 - 本地卷
+  database:
+    image: postgres:15
+    volumes:
+      # 直接挂载宿主机目录(性能最优)
+      - type: bind
+        source: /mnt/nvme/postgres
+        target: /var/lib/postgresql/data
+        bind:
+          propagation: rprivate
+    deploy:
+      placement:
+        constraints:
+          - node.labels.storage == nvme
+
+  # 场景2: 持久化存储 - Docker卷
+  app-data:
+    image: myapp:latest
+    volumes:
+      # Docker管理的卷(平衡性能和管理)
+      - type: volume
+        source: app-data
+        target: /data
+        volume:
+          nocopy: false
+
+  # 场景3: 临时高性能 - tmpfs
+  cache:
+    image: redis:7-alpine
+    volumes:
+      # 内存文件系统(最快,但重启丢失)
+      - type: tmpfs
+        target: /data
+        tmpfs:
+          size: 4G
+          mode: 1777
+
+volumes:
+  app-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/ssd/app-data
+```
+
+**卷性能测试脚本**
+```bash
+#!/bin/bash
+# benchmark-storage.sh - 存储性能基准测试
+
+IMAGE="alpine:latest"
+
+echo "Docker存储性能测试"
+echo "=========================================="
+
+# 测试函数
+test_storage() {
+    local mount_type=$1
+    local mount_opts=$2
+    local test_name=$3
+
+    echo ""
+    echo "测试: $test_name"
+    echo "----------------------------------------"
+
+    # 创建测试容器
+    docker run --rm $mount_opts $IMAGE sh -c '
+        # 测试1: 顺序写入
+        echo "顺序写入 1GB..."
+        time dd if=/dev/zero of=/data/test.img bs=1M count=1024 conv=fdatasync
+
+        # 测试2: 随机写入
+        echo "随机写入..."
+        time dd if=/dev/urandom of=/data/random.img bs=4K count=10000 conv=fdatasync
+
+        # 测试3: 顺序读取
+        echo "顺序读取..."
+        time dd if=/data/test.img of=/dev/null bs=1M
+
+        # 清理
+        rm -f /data/*.img
+    ' 2>&1 | grep -E "copied|real"
+}
+
+# 测试1: tmpfs (内存)
+test_storage "tmpfs" \
+  "--tmpfs /data:rw,size=2G,mode=1777" \
+  "tmpfs (内存文件系统)"
+
+# 测试2: Docker卷
+docker volume create test-vol
+test_storage "volume" \
+  "-v test-vol:/data" \
+  "Docker Volume"
+docker volume rm test-vol
+
+# 测试3: Bind挂载
+mkdir -p /tmp/docker-bench
+test_storage "bind" \
+  "-v /tmp/docker-bench:/data" \
+  "Bind Mount"
+rm -rf /tmp/docker-bench
+
+echo ""
+echo "=========================================="
+echo "测试完成"
+```
+
+**执行存储基准测试**
+```bash
+chmod +x benchmark-storage.sh
+./benchmark-storage.sh
+
+# 预期输出示例
+Docker存储性能测试
+==========================================
+
+测试: tmpfs (内存文件系统)
+----------------------------------------
+顺序写入 1GB...
+1073741824 bytes (1.1 GB) copied, 0.523 s, 2.1 GB/s
+随机写入...
+40960000 bytes (41 MB) copied, 0.156 s, 263 MB/s
+顺序读取...
+1073741824 bytes (1.1 GB) copied, 0.234 s, 4.6 GB/s
+
+测试: Docker Volume
+----------------------------------------
+顺序写入 1GB...
+1073741824 bytes (1.1 GB) copied, 2.345 s, 458 MB/s
+随机写入...
+40960000 bytes (41 MB) copied, 0.678 s, 60.4 MB/s
+顺序读取...
+1073741824 bytes (1.1 GB) copied, 1.234 s, 870 MB/s
+
+测试: Bind Mount
+----------------------------------------
+顺序写入 1GB...
+1073741824 bytes (1.1 GB) copied, 2.123 s, 506 MB/s
+随机写入...
+40960000 bytes (41 MB) copied, 0.589 s, 69.5 MB/s
+顺序读取...
+1073741824 bytes (1.1 GB) copied, 1.123 s, 956 MB/s
+```
+
+### 17.5.3 I/O调度器优化
+
+**查看和设置I/O调度器**
+```bash
+# 查看当前I/O调度器
+cat /sys/block/sda/queue/scheduler
+# 输出: [mq-deadline] kyber bfq none
+
+# 不同调度器特点:
+# - mq-deadline: 默认,平衡性能和延迟
+# - kyber: 优化延迟,适合SSD
+# - bfq: 公平队列,适合桌面
+# - none: 无调度,适合NVMe SSD
+
+# 为NVMe SSD设置none调度器
+echo none > /sys/block/nvme0n1/queue/scheduler
+
+# 为SATA SSD设置kyber调度器
+echo kyber > /sys/block/sda/queue/scheduler
+
+# 持久化配置
+cat > /etc/udev/rules.d/60-scheduler.rules <<'EOF'
+# NVMe设备使用none调度器
+ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
+
+# SSD设备使用kyber调度器
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="kyber"
+
+# HDD设备使用mq-deadline调度器
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline"
+EOF
+
+# 应用udev规则
+udevadm control --reload-rules
+udevadm trigger
+```
+
+**I/O队列深度优化**
+```bash
+# 查看当前队列深度
+cat /sys/block/nvme0n1/queue/nr_requests
+# 默认: 128
+
+# 增大队列深度(提高吞吐量,略增延迟)
+echo 1024 > /sys/block/nvme0n1/queue/nr_requests
+
+# 减小队列深度(降低延迟,略降吞吐量)
+echo 64 > /sys/block/nvme0n1/queue/nr_requests
+
+# 查看设备队列统计
+cat /sys/block/nvme0n1/queue/iostats
+```
+
+### 17.5.4 数据库存储优化案例
+
+**PostgreSQL存储优化**
+```yaml
+# docker-stack-postgres-optimized.yml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+
+    environment:
+      # ============ 内存配置 ============
+      POSTGRES_SHARED_BUFFERS: 8GB          # 25%的系统内存
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 24GB  # 75%的系统内存
+      POSTGRES_WORK_MEM: 64MB               # 每个查询操作内存
+      POSTGRES_MAINTENANCE_WORK_MEM: 2GB   # 维护操作内存
+
+      # ============ WAL配置 ============
+      POSTGRES_WAL_BUFFERS: 16MB
+      POSTGRES_MAX_WAL_SIZE: 4GB
+      POSTGRES_MIN_WAL_SIZE: 1GB
+      POSTGRES_WAL_COMPRESSION: on
+
+      # ============ 检查点配置 ============
+      POSTGRES_CHECKPOINT_COMPLETION_TARGET: 0.9
+      POSTGRES_CHECKPOINT_TIMEOUT: 15min
+
+      # ============ I/O优化 ============
+      POSTGRES_EFFECTIVE_IO_CONCURRENCY: 200  # SSD推荐值
+      POSTGRES_RANDOM_PAGE_COST: 1.1          # SSD推荐1.1
+
+    volumes:
+      # 数据目录 - NVMe SSD
+      - type: bind
+        source: /mnt/nvme/postgres/data
+        target: /var/lib/postgresql/data
+
+      # WAL目录 - 单独的高速磁盘
+      - type: bind
+        source: /mnt/ssd/postgres/wal
+        target: /var/lib/postgresql/wal
+
+      # 临时文件 - tmpfs
+      - type: tmpfs
+        target: /var/lib/postgresql/tmp
+        tmpfs:
+          size: 4G
+
+    deploy:
+      resources:
+        limits:
+          cpus: '16'
+          memory: 32G
+        reservations:
+          cpus: '8'
+          memory: 16G
+
+      placement:
+        constraints:
+          - node.labels.storage == nvme
+          - node.labels.role == database
+```
+
+**PostgreSQL自定义配置**
+```bash
+# custom-postgres.conf - 进一步优化
+
+# ============ 查询规划器 ============
+effective_cache_size = '24GB'
+random_page_cost = 1.1              # SSD
+seq_page_cost = 1.0
+cpu_tuple_cost = 0.01
+cpu_index_tuple_cost = 0.005
+cpu_operator_cost = 0.0025
+
+# ============ 并发配置 ============
+max_connections = 200
+max_worker_processes = 16
+max_parallel_workers_per_gather = 4
+max_parallel_workers = 16
+max_parallel_maintenance_workers = 4
+
+# ============ WAL性能 ============
+wal_level = replica
+synchronous_commit = off            # 异步提交,提高性能(可能丢失少量数据)
+wal_writer_delay = 200ms
+commit_delay = 100
+commit_siblings = 5
+
+# ============ 自动清理 ============
+autovacuum = on
+autovacuum_max_workers = 4
+autovacuum_naptime = 10s
+autovacuum_vacuum_cost_limit = 1000
+
+# ============ 日志配置 ============
+logging_collector = on
+log_destination = 'csvlog'
+log_directory = 'log'
+log_filename = 'postgresql-%Y-%m-%d.log'
+log_min_duration_statement = 100    # 记录>100ms的查询
+log_checkpoints = on
+log_connections = on
+log_disconnections = on
+log_lock_waits = on
+log_temp_files = 0
+```
+
+**挂载配置文件**
+```yaml
+services:
+  postgres:
+    volumes:
+      - ./custom-postgres.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+```
+
+## 17.6 应用层优化
+
+### 17.6.1 应用容器化最佳实践
+
+**多阶段构建优化**
+```dockerfile
+# Dockerfile.optimized - Python Flask应用优化示例
+
+# ============ 阶段1: 构建依赖 ============
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# 安装构建依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制依赖文件(利用缓存)
+COPY requirements.txt .
+
+# 安装Python包到独立目录
+RUN pip install --user --no-cache-dir --no-warn-script-location \
+    -r requirements.txt
+
+# ============ 阶段2: 运行时镜像 ============
+FROM python:3.11-slim
+
+# 创建非root用户
+RUN groupadd -r app && useradd -r -g app app
+
+WORKDIR /app
+
+# 仅安装运行时依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从构建阶段复制Python包
+COPY --from=builder /root/.local /home/app/.local
+
+# 复制应用代码
+COPY --chown=app:app . .
+
+# 设置环境变量
+ENV PATH=/home/app/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+# 切换到非root用户
+USER app
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8000/health', timeout=2)"
+
+# 启动应用
+CMD ["gunicorn", "--config", "gunicorn_config.py", "app:app"]
+```
+
+**Gunicorn高性能配置**
+```python
+# gunicorn_config.py
+
+import multiprocessing
+import os
+
+# ============ Server Socket ============
+bind = "0.0.0.0:8000"
+backlog = 2048
+
+# ============ Worker进程 ============
+# CPU密集型: workers = CPU核心数
+# I/O密集型: workers = 2-4 * CPU核心数
+workers = int(os.getenv("GUNICORN_WORKERS", multiprocessing.cpu_count() * 2 + 1))
+
+# Worker类型
+worker_class = "gevent"  # 或 "sync" / "gthread" / "eventlet"
+worker_connections = 1000
+
+# ============ Worker超时 ============
+timeout = 30
+graceful_timeout = 30
+keepalive = 5
+
+# ============ 进程管理 ============
+max_requests = 10000        # 处理N个请求后重启worker(防止内存泄漏)
+max_requests_jitter = 1000  # 随机抖动
+worker_tmp_dir = "/dev/shm" # 使用共享内存
+
+# ============ 日志 ============
+accesslog = "-"  # stdout
+errorlog = "-"   # stderr
+loglevel = "info"
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)s'
+
+# ============ 性能优化 ============
+preload_app = True  # 预加载应用(减少内存,加快启动)
+
+def on_starting(server):
+    """服务器启动时"""
+    print("Gunicorn正在启动...")
+
+def when_ready(server):
+    """服务器就绪时"""
+    print(f"Gunicorn已就绪 - Workers: {workers}")
+
+def on_reload(server):
+    """代码重载时"""
+    print("检测到代码变更,重新加载...")
+```
+
+### 17.6.2 缓存策略优化
+
+**多层缓存架构**
+```yaml
+version: '3.8'
+
+services:
+  # ============ L1缓存: 应用内存缓存 ============
+  app:
+    image: myapp:latest
+    environment:
+      # Python缓存配置
+      CACHE_TYPE: "simple"
+      CACHE_DEFAULT_TIMEOUT: 300
+    deploy:
+      replicas: 4
+      resources:
+        limits:
+          memory: 2G        # 应用内存包含缓存
+
+  # ============ L2缓存: Redis ============
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+        --maxmemory 4gb
+        --maxmemory-policy allkeys-lru
+        --save ""                      # 禁用RDB持久化(纯缓存)
+        --appendonly no                # 禁用AOF
+        --tcp-backlog 511
+        --timeout 0
+        --tcp-keepalive 300
+        --hz 10                        # 降低内部任务频率
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 5G                   # 4G数据+1G开销
+        reservations:
+          memory: 4G
+
+  # ============ L3缓存: Nginx缓存 ============
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx-cache.conf:/etc/nginx/conf.d/default.conf:ro
+      - nginx-cache:/var/cache/nginx
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  nginx-cache:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=1G
+```
+
+**Nginx缓存配置**
+```nginx
+# nginx-cache.conf
+
+# 缓存路径配置
+proxy_cache_path /var/cache/nginx/api
+    levels=1:2
+    keys_zone=api_cache:100m
+    max_size=1g
+    inactive=60m
+    use_temp_path=off;
+
+proxy_cache_path /var/cache/nginx/static
+    levels=1:2
+    keys_zone=static_cache:50m
+    max_size=5g
+    inactive=7d
+    use_temp_path=off;
+
+# 缓存键定义
+map $request_method $skip_cache {
+    default 1;
+    GET 0;
+    HEAD 0;
+}
+
+server {
+    listen 80;
+
+    # ============ API缓存 ============
+    location /api/ {
+        proxy_pass http://app:8000;
+
+        proxy_cache api_cache;
+        proxy_cache_key "$scheme$request_method$host$request_uri";
+        proxy_cache_valid 200 5m;
+        proxy_cache_valid 404 1m;
+        proxy_cache_bypass $skip_cache;
+        proxy_no_cache $skip_cache;
+
+        # 缓存头
+        add_header X-Cache-Status $upstream_cache_status;
+
+        # 并发控制
+        proxy_cache_lock on;
+        proxy_cache_lock_timeout 5s;
+        proxy_cache_lock_age 10s;
+
+        # 陈旧缓存策略
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503;
+        proxy_cache_background_update on;
+    }
+
+    # ============ 静态文件缓存 ============
+    location /static/ {
+        proxy_pass http://app:8000;
+
+        proxy_cache static_cache;
+        proxy_cache_valid 200 7d;
+        proxy_cache_valid 404 1h;
+
+        add_header X-Cache-Status $upstream_cache_status;
+        add_header Cache-Control "public, max-age=604800";
+    }
+}
+```
+
+**Redis缓存模式**
+```python
+# cache_patterns.py - Redis缓存模式
+
+import redis
+import hashlib
+import json
+from functools import wraps
+
+redis_client = redis.Redis(
+    host='redis',
+    port=6379,
+    db=0,
+    decode_responses=True,
+    socket_keepalive=True,
+    socket_connect_timeout=5,
+    socket_timeout=5,
+    connection_pool=redis.ConnectionPool(max_connections=50)
+)
+
+# ============ 模式1: Cache-Aside (缓存旁路) ============
+def cache_aside(key_prefix, ttl=300):
+    """装饰器:Cache-Aside模式"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # 生成缓存键
+            cache_key = f"{key_prefix}:{_generate_key(args, kwargs)}"
+
+            # 1. 尝试从缓存读取
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+
+            # 2. 缓存未命中,查询数据库
+            result = func(*args, **kwargs)
+
+            # 3. 写入缓存
+            redis_client.setex(cache_key, ttl, json.dumps(result))
+
+            return result
+        return wrapper
+    return decorator
+
+# 使用示例
+@cache_aside("user", ttl=600)
+def get_user(user_id):
+    # 数据库查询
+    return db.query(f"SELECT * FROM users WHERE id={user_id}")
+
+# ============ 模式2: Write-Through (写穿透) ============
+def write_through(key_prefix):
+    """写入时同步更新缓存"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+
+            # 同步更新缓存
+            cache_key = f"{key_prefix}:{args[0]}"
+            redis_client.set(cache_key, json.dumps(result))
+
+            return result
+        return wrapper
+    return decorator
+
+@write_through("user")
+def update_user(user_id, data):
+    # 更新数据库
+    db.update(f"UPDATE users SET ... WHERE id={user_id}")
+    return data
+
+# ============ 模式3: Write-Behind (异步写回) ============
+import asyncio
+from queue import Queue
+
+write_queue = Queue()
+
+async def async_write_worker():
+    """异步写入worker"""
+    while True:
+        if not write_queue.empty():
+            item = write_queue.get()
+            # 批量写入数据库
+            db.batch_update(item)
+        await asyncio.sleep(1)
+
+def write_behind(key_prefix):
+    """写入缓存,异步持久化到数据库"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+
+            # 立即写入缓存
+            cache_key = f"{key_prefix}:{args[0]}"
+            redis_client.set(cache_key, json.dumps(result))
+
+            # 加入异步队列
+            write_queue.put((args[0], result))
+
+            return result
+        return wrapper
+    return decorator
+
+# ============ 辅助函数 ============
+def _generate_key(args, kwargs):
+    """生成缓存键"""
+    key_data = f"{args}:{sorted(kwargs.items())}"
+    return hashlib.md5(key_data.encode()).hexdigest()
+
+# ============ 缓存预热 ============
+def warm_cache(keys_list):
+    """批量预热缓存"""
+    pipeline = redis_client.pipeline()
+
+    for key in keys_list:
+        data = fetch_from_db(key)
+        pipeline.setex(f"user:{key}", 600, json.dumps(data))
+
+    pipeline.execute()
+    print(f"预热了 {len(keys_list)} 个缓存键")
+
+# ============ 缓存失效策略 ============
+def invalidate_cache_pattern(pattern):
+    """批量删除匹配的缓存"""
+    cursor = 0
+    while True:
+        cursor, keys = redis_client.scan(
+            cursor, match=pattern, count=100
+        )
+        if keys:
+            redis_client.delete(*keys)
+        if cursor == 0:
+            break
+
+# 示例:删除所有用户缓存
+invalidate_cache_pattern("user:*")
+```
+
+### 17.6.3 异步处理与队列优化
+
+**Celery异步任务队列**
+```yaml
+# docker-stack-celery.yml
+version: '3.8'
+
+services:
+  # ============ Web应用 ============
+  web:
+    image: myapp:latest
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+    deploy:
+      replicas: 4
+
+  # ============ Celery Worker ============
+  celery-worker:
+    image: myapp:latest
+    command: celery -A tasks worker --loglevel=info --concurrency=8
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CELERYD_PREFETCH_MULTIPLIER: 4   # 每个worker预取4个任务
+      CELERYD_MAX_TASKS_PER_CHILD: 1000  # 处理1000个任务后重启
+    deploy:
+      replicas: 4
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  # ============ Celery Beat (定时任务) ============
+  celery-beat:
+    image: myapp:latest
+    command: celery -A tasks beat --loglevel=info
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+    deploy:
+      replicas: 1
+
+  # ============ Flower (监控) ============
+  flower:
+    image: mher/flower:latest
+    command: celery --broker=redis://redis:6379/0 flower --port=5555
+    ports:
+      - "5555:5555"
+    deploy:
+      replicas: 1
+
+networks:
+  default:
+    driver: overlay
+```
+
+**Celery任务优化**
+```python
+# tasks.py - Celery任务优化
+
+from celery import Celery, group, chord, chain
+from celery.exceptions import SoftTimeLimitExceeded
+import time
+
+app = Celery('tasks')
+
+# ============ 配置优化 ============
+app.conf.update(
+    # Broker设置
+    broker_url='redis://redis:6379/0',
+    broker_connection_retry_on_startup=True,
+    broker_connection_max_retries=10,
+
+    # Result Backend
+    result_backend='redis://redis:6379/1',
+    result_expires=3600,  # 结果保留1小时
+
+    # 任务执行
+    task_acks_late=True,              # 任务完成后才确认
+    task_reject_on_worker_lost=True,  # Worker丢失时拒绝任务
+    task_time_limit=600,              # 硬超时10分钟
+    task_soft_time_limit=540,         # 软超时9分钟
+
+    # 性能优化
+    worker_prefetch_multiplier=4,     # 预取倍数
+    worker_max_tasks_per_child=1000,  # 防止内存泄漏
+
+    # 序列化
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+
+    # 路由
+    task_routes={
+        'tasks.cpu_intensive': {'queue': 'cpu'},
+        'tasks.io_intensive': {'queue': 'io'},
+    }
+)
+
+# ============ 任务示例 ============
+@app.task(bind=True, max_retries=3)
+def process_data(self, data_id):
+    """带重试的任务"""
+    try:
+        # 模拟处理
+        result = heavy_computation(data_id)
+        return result
+
+    except SoftTimeLimitExceeded:
+        # 软超时处理
+        cleanup()
+        raise
+
+    except Exception as exc:
+        # 指数退避重试
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries)
+
+@app.task
+def cpu_intensive_task(data):
+    """CPU密集型任务"""
+    return sum(i**2 for i in range(data))
+
+@app.task(queue='io')
+def io_intensive_task(url):
+    """I/O密集型任务"""
+    import requests
+    return requests.get(url).text
+
+# ============ 任务编排 ============
+# 并行任务组
+job = group(
+    process_data.s(1),
+    process_data.s(2),
+    process_data.s(3)
+)
+result = job.apply_async()
+
+# 链式任务
+job = chain(
+    fetch_data.s(),
+    process_data.s(),
+    save_result.s()
+)
+result = job.apply_async()
+
+# Chord (分散-聚合)
+callback = aggregate_results.s()
+header = [process_data.s(i) for i in range(100)]
+job = chord(header)(callback)
+result = job.apply_async()
+
+# ============ 任务优先级 ============
+@app.task
+def high_priority_task():
+    pass
+
+# 发送高优先级任务
+high_priority_task.apply_async(priority=9)  # 0-9,9最高
+```
+
+**RabbitMQ高性能配置**
+```yaml
+# 如果使用RabbitMQ而非Redis
+services:
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: secret
+
+      # 性能优化
+      RABBITMQ_VM_MEMORY_HIGH_WATERMARK: 0.6        # 60%内存阈值
+      RABBITMQ_DISK_FREE_LIMIT: "2GB"
+      RABBITMQ_CHANNEL_MAX: 2048
+
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+        reservations:
+          memory: 2G
+
+volumes:
+  rabbitmq-data:
+```
+
+**rabbitmq.conf高级配置**
+```ini
+# rabbitmq.conf - 高性能配置
+
+# ============ 网络配置 ============
+listeners.tcp.default = 5672
+management.tcp.port = 15672
+
+# ============ 内存管理 ============
+vm_memory_high_watermark.relative = 0.6
+vm_memory_high_watermark_paging_ratio = 0.75
+
+# ============ 磁盘管理 ============
+disk_free_limit.absolute = 2GB
+
+# ============ 连接配置 ============
+channel_max = 2048
+heartbeat = 60
+
+# ============ 队列配置 ============
+# 延迟队列
+queue_master_locator = min-masters
+
+# ============ 集群配置 ============
+cluster_partition_handling = autoheal
+
+# ============ 日志 ============
+log.file.level = warning
+log.console = true
+log.console.level = info
+```
+
+---
+
+*（第17章完成,约2000行。已完成17章,剩余2章...）*
+
+---
+
+# 第18章: 故障排查
+
+## 18.1 故障排查方法论
+
+### 18.1.1 系统化排查流程
+
+**5步故障排查法**
+```
+┌─────────────────────────────────────────────────────────┐
+│               Docker故障排查标准流程                       │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  [1] 问题定义 (Define)                                   │
+│      ├─ 现象描述 (What)                                  │
+│      ├─ 发生时间 (When)                                  │
+│      ├─ 影响范围 (Scope)                                 │
+│      └─ 业务影响 (Impact)                                │
+│                                                         │
+│  [2] 信息收集 (Gather)                                   │
+│      ├─ 容器状态 (docker ps/inspect)                     │
+│      ├─ 系统资源 (CPU/内存/磁盘/网络)                     │
+│      ├─ 日志信息 (应用日志/系统日志)                      │
+│      └─ 监控数据 (Prometheus/Grafana)                    │
+│                                                         │
+│  [3] 假设验证 (Hypothesize)                              │
+│      ├─ 列出可能原因                                      │
+│      ├─ 按概率排序                                        │
+│      └─ 逐一验证假设                                      │
+│                                                         │
+│  [4] 问题定位 (Isolate)                                  │
+│      ├─ 缩小问题范围                                      │
+│      ├─ 找到根本原因                                      │
+│      └─ 确认触发条件                                      │
+│                                                         │
+│  [5] 解决验证 (Resolve)                                  │
+│      ├─ 实施解决方案                                      │
+│      ├─ 验证问题解决                                      │
+│      ├─ 文档记录                                          │
+│      └─ 预防措施                                          │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+**故障排查决策树**
+```
+容器无法访问
+    │
+    ├─> 容器是否运行? (docker ps)
+    │   ├─ 否 → 18.2.1 容器启动失败
+    │   └─ 是 → 继续
+    │
+    ├─> 容器健康检查? (docker inspect)
+    │   ├─ 失败 → 18.2.2 健康检查失败
+    │   └─ 通过 → 继续
+    │
+    ├─> 端口是否监听? (netstat/ss)
+    │   ├─ 否 → 应用未启动
+    │   └─ 是 → 继续
+    │
+    ├─> 网络连通性? (ping/telnet)
+    │   ├─ 否 → 18.3 网络问题
+    │   └─ 是 → 继续
+    │
+    └─> 应用响应? (curl/http请求)
+        ├─ 超时 → 18.4 性能问题
+        ├─ 错误 → 18.2.4 应用错误
+        └─ 正常 → 负载均衡器/DNS问题
+```
+
+### 18.1.2 快速诊断工具箱
+
+**一键诊断脚本**
+```bash
+#!/bin/bash
+# docker-diagnose.sh - Docker快速诊断工具
+
+CONTAINER=$1
+
+if [ -z "$CONTAINER" ]; then
+    echo "用法: $0 <容器名称或ID>"
+    exit 1
+fi
+
+echo "=========================================="
+echo "Docker容器快速诊断: $CONTAINER"
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "=========================================="
+
+# 1. 容器基本状态
+echo -e "\n[1] 容器状态"
+echo "----------------------------------------"
+docker ps -a --filter "name=$CONTAINER" --format \
+  "状态: {{.Status}}\n创建: {{.CreatedAt}}\n镜像: {{.Image}}\n端口: {{.Ports}}"
+
+# 2. 容器详细信息
+echo -e "\n[2] 容器配置"
+echo "----------------------------------------"
+docker inspect $CONTAINER | jq -r '
+  .[0] | {
+    "运行状态": .State.Status,
+    "启动时间": .State.StartedAt,
+    "退出代码": .State.ExitCode,
+    "OOM被杀": .State.OOMKilled,
+    "重启次数": .RestartCount,
+    "IP地址": .NetworkSettings.IPAddress,
+    "网络模式": .HostConfig.NetworkMode,
+    "CPU配额": .HostConfig.CpuQuota,
+    "内存限制": .HostConfig.Memory
+  }
+' | column -t -s ':'
+
+# 3. 资源使用情况
+echo -e "\n[3] 资源使用"
+echo "----------------------------------------"
+docker stats $CONTAINER --no-stream --format \
+  "CPU: {{.CPUPerc}}\n内存: {{.MemUsage}} ({{.MemPerc}})\n网络: {{.NetIO}}\n磁盘: {{.BlockIO}}"
+
+# 4. 容器进程
+echo -e "\n[4] 容器进程"
+echo "----------------------------------------"
+docker top $CONTAINER
+
+# 5. 最近日志(最后50行)
+echo -e "\n[5] 最近日志(最后50行)"
+echo "----------------------------------------"
+docker logs --tail 50 $CONTAINER 2>&1 | tail -20
+
+# 6. 健康检查
+echo -e "\n[6] 健康检查"
+echo "----------------------------------------"
+docker inspect $CONTAINER | jq -r '
+  .[0].State.Health // "未配置健康检查" |
+  if type == "object" then
+    "状态: " + .Status + "\n" +
+    "失败次数: " + (.FailingStreak | tostring) + "\n" +
+    "最后检查: " + (.Log[-1].Start // "N/A")
+  else . end
+'
+
+# 7. 网络连接
+echo -e "\n[7] 网络连接"
+echo "----------------------------------------"
+docker exec $CONTAINER sh -c 'netstat -tunlp 2>/dev/null || ss -tunlp' 2>/dev/null | head -10 || echo "无法获取网络信息"
+
+# 8. 磁盘使用
+echo -e "\n[8] 磁盘使用"
+echo "----------------------------------------"
+docker exec $CONTAINER df -h 2>/dev/null | grep -E "Filesystem|/$" || echo "无法获取磁盘信息"
+
+# 9. 相关事件
+echo -e "\n[9] 容器事件(最近10条)"
+echo "----------------------------------------"
+docker events --filter "container=$CONTAINER" --since 1h --until 0s 2>/dev/null | tail -10 || echo "无近期事件"
+
+# 10. 建议操作
+echo -e "\n[10] 诊断建议"
+echo "----------------------------------------"
+
+# 检查容器状态
+STATUS=$(docker inspect -f '{{.State.Status}}' $CONTAINER)
+if [ "$STATUS" != "running" ]; then
+    echo "⚠️  容器未运行,建议:"
+    echo "   1. 查看退出原因: docker logs $CONTAINER"
+    echo "   2. 检查启动命令: docker inspect $CONTAINER | jq '.[0].Config.Cmd'"
+    echo "   3. 尝试重启: docker start $CONTAINER"
+fi
+
+# 检查OOM
+OOM=$(docker inspect -f '{{.State.OOMKilled}}' $CONTAINER)
+if [ "$OOM" = "true" ]; then
+    echo "⚠️  检测到OOM Killer,建议:"
+    echo "   1. 增加内存限制: docker update --memory 2g $CONTAINER"
+    echo "   2. 分析内存使用: docker stats $CONTAINER"
+    echo "   3. 检查应用内存泄漏"
+fi
+
+# 检查重启次数
+RESTART_COUNT=$(docker inspect -f '{{.RestartCount}}' $CONTAINER)
+if [ "$RESTART_COUNT" -gt 5 ]; then
+    echo "⚠️  容器频繁重启($RESTART_COUNT次),建议:"
+    echo "   1. 查看启动日志: docker logs $CONTAINER"
+    echo "   2. 检查健康检查配置"
+    echo "   3. 验证依赖服务是否正常"
+fi
+
+echo -e "\n=========================================="
+echo "诊断完成"
+echo "=========================================="
+```
+
+**执行快速诊断**
+```bash
+chmod +x docker-diagnose.sh
+./docker-diagnose.sh my-app
+
+# 示例输出(部分)
+==========================================
+Docker容器快速诊断: my-app
+时间: 2025-12-10 14:30:00
+==========================================
+
+[1] 容器状态
+----------------------------------------
+状态: Up 2 hours
+创建: 2025-12-10 12:30:00
+镜像: myapp:latest
+端口: 0.0.0.0:8080->8080/tcp
+
+[3] 资源使用
+----------------------------------------
+CPU: 45.23%
+内存: 1.2GiB / 2GiB (60%)
+网络: 1.2MB / 3.4MB
+磁盘: 45MB / 12MB
+
+[10] 诊断建议
+----------------------------------------
+⚠️  容器频繁重启(8次),建议:
+   1. 查看启动日志: docker logs my-app
+   2. 检查健康检查配置
+   3. 验证依赖服务是否正常
+```
+
+## 18.2 容器故障排查
+
+### 18.2.1 容器无法启动
+
+**问题场景1: 镜像拉取失败**
+```bash
+# 症状
+docker run myapp:latest
+# Unable to find image 'myapp:latest' locally
+# Error response from daemon: pull access denied for myapp
+
+# 排查步骤
+# 1. 检查镜像是否存在
+docker images | grep myapp
+
+# 2. 检查镜像仓库连接
+docker login registry.example.com
+# 输入用户名密码
+
+# 3. 手动拉取镜像
+docker pull registry.example.com/myapp:latest
+
+# 4. 使用完整镜像名
+docker run registry.example.com/myapp:latest
+
+# 5. 检查网络连接
+curl -I https://registry.example.com
+ping registry.example.com
+
+# 解决方案
+# A. 配置镜像仓库认证
+cat > ~/.docker/config.json <<EOF
+{
+  "auths": {
+    "registry.example.com": {
+      "auth": "base64(username:password)"
+    }
+  }
+}
+EOF
+
+# B. 使用本地构建
+docker build -t myapp:latest .
+
+# C. 配置镜像加速器
+cat > /etc/docker/daemon.json <<EOF
+{
+  "registry-mirrors": [
+    "https://mirror.example.com"
+  ]
+}
+EOF
+systemctl restart docker
+```
+
+**问题场景2: 端口冲突**
+```bash
+# 症状
+docker run -d -p 8080:8080 myapp
+# Error: Bind for 0.0.0.0:8080 failed: port is already allocated
+
+# 排查步骤
+# 1. 查看端口占用
+netstat -tunlp | grep 8080
+# 或
+ss -tunlp | grep 8080
+# 或
+lsof -i :8080
+
+# 示例输出
+tcp  0  0  0.0.0.0:8080  0.0.0.0:*  LISTEN  12345/docker-proxy
+
+# 2. 查找占用端口的容器
+docker ps --format "{{.ID}}\t{{.Ports}}" | grep 8080
+
+# 3. 停止冲突的容器
+docker stop <container_id>
+
+# 解决方案
+# A. 使用不同端口
+docker run -d -p 8081:8080 myapp
+
+# B. 停止占用端口的服务
+systemctl stop apache2  # 如果是系统服务
+
+# C. 使用动态端口分配
+docker run -d -p 8080 myapp  # Docker自动分配宿主机端口
+docker port <container_id>   # 查看分配的端口
+```
+
+**问题场景3: 资源不足**
+```bash
+# 症状
+docker run -d --memory 16g myapp
+# Error: Cannot start container: not enough memory
+
+# 排查步骤
+# 1. 检查系统可用内存
+free -h
+#               total        used        free      shared  buff/cache   available
+# Mem:           15Gi       12Gi        500Mi       100Mi        2.5Gi        2.5Gi
+
+# 2. 检查Docker资源使用
+docker stats --no-stream
+
+# 3. 检查磁盘空间
+df -h
+docker system df
+
+# 示例输出
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          25        10        8.5GB     4.2GB (49%)
+Containers      15        10        2.1GB     500MB (23%)
+Local Volumes   5         3         1.2GB     800MB (66%)
+
+# 解决方案
+# A. 降低资源限制
+docker run -d --memory 4g myapp
+
+# B. 清理未使用资源
+docker system prune -a --volumes
+# 警告: 会删除所有未使用的镜像、容器、网络、卷
+
+# C. 增加系统资源
+# - 增加物理内存
+# - 调整swap大小
+dd if=/dev/zero of=/swapfile bs=1G count=8
+mkswap /swapfile
+swapon /swapfile
+
+# D. 迁移到资源充足的节点(Swarm)
+docker service update --constraint-add node.labels.size==large myapp
+```
+
+**问题场景4: 依赖服务未就绪**
+```bash
+# 症状
+docker logs myapp
+# Error: connection refused to database:5432
+# Container exits immediately after start
+
+# 排查步骤
+# 1. 检查依赖服务状态
+docker ps | grep database
+
+# 2. 测试连接
+docker run --rm --network myapp_network \
+  alpine sh -c 'nc -zv database 5432'
+
+# 3. 查看容器启动顺序
+docker-compose ps
+
+# 解决方案
+# A. 使用depends_on + 健康检查
+version: '3.8'
+services:
+  database:
+    image: postgres:15
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    image: myapp:latest
+    depends_on:
+      database:
+        condition: service_healthy
+
+# B. 应用内实现重试逻辑
+import time
+import psycopg2
+
+def connect_db(max_retries=30, delay=2):
+    for i in range(max_retries):
+        try:
+            conn = psycopg2.connect(
+                host="database",
+                port=5432,
+                user="postgres"
+            )
+            return conn
+        except psycopg2.OperationalError:
+            if i < max_retries - 1:
+                print(f"数据库连接失败,{delay}秒后重试... ({i+1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                raise
+
+# C. 使用wait-for-it脚本
+#!/bin/bash
+# wait-for-it.sh
+set -e
+
+host="$1"
+shift
+cmd="$@"
+
+until nc -z "$host" 5432; do
+  echo "等待 $host:5432..."
+  sleep 1
+done
+
+echo "$host:5432 已就绪"
+exec $cmd
+
+# Dockerfile
+COPY wait-for-it.sh /usr/local/bin/
+ENTRYPOINT ["wait-for-it.sh", "database:5432", "--"]
+CMD ["python", "app.py"]
+```
+
+### 18.2.2 容器异常退出
+
+**退出代码分析**
+```bash
+# 查看容器退出代码
+docker inspect -f '{{.State.ExitCode}}' myapp
+
+# 常见退出代码含义
+# 0    : 正常退出
+# 1    : 应用错误(通用错误)
+# 125  : Docker守护进程错误
+# 126  : 命令无法执行
+# 127  : 命令未找到
+# 128+n: 信号终止(n为信号编号)
+#   137 = 128 + 9 (SIGKILL,强制杀死)
+#   139 = 128 + 11 (SIGSEGV,段错误)
+#   143 = 128 + 15 (SIGTERM,正常终止)
+```
+
+**场景1: OOM Killer**
+```bash
+# 症状
+docker inspect -f '{{.State.OOMKilled}}' myapp
+# true
+
+docker logs myapp
+# (无输出或突然中断)
+
+# 查看系统日志
+dmesg | grep -i "out of memory"
+journalctl -k | grep -i "killed process"
+
+# 示例输出
+[12345.678] Out of memory: Killed process 23456 (java) total-vm:4194304kB
+
+# 排查步骤
+# 1. 查看内存限制
+docker inspect myapp | jq '.[0].HostConfig.Memory'
+
+# 2. 查看实际内存使用
+docker stats myapp --no-stream
+
+# 3. 分析内存趋势
+# 使用cAdvisor或Prometheus查看历史数据
+
+# 解决方案
+# A. 增加内存限制
+docker update --memory 4g --memory-swap 6g myapp
+
+# B. 调整OOM优先级
+docker update --oom-score-adj -500 myapp  # 降低被杀概率
+
+# C. 优化应用内存使用
+# Java应用
+docker run -e JAVA_OPTS="-Xms1g -Xmx2g -XX:+UseG1GC" myapp
+
+# D. 启用Swap(谨慎使用)
+docker run --memory 2g --memory-swap 4g myapp
+```
+
+**场景2: 应用崩溃**
+```bash
+# 症状
+docker logs myapp
+# Traceback (most recent call last):
+#   File "app.py", line 42
+#     result = process_data(None)
+# AttributeError: 'NoneType' object has no attribute 'split'
+
+# 排查步骤
+# 1. 查看完整日志
+docker logs --tail 200 myapp > myapp.log
+
+# 2. 进入容器调试(如果可以启动)
+docker run -it --entrypoint /bin/bash myapp
+
+# 3. 检查配置文件
+docker exec myapp cat /app/config.yaml
+
+# 4. 查看环境变量
+docker exec myapp env
+
+# 解决方案
+# A. 修复代码bug
+def process_data(data):
+    if data is None:
+        raise ValueError("data cannot be None")
+    return data.split(',')
+
+# B. 添加异常处理
+try:
+    result = process_data(data)
+except Exception as e:
+    logger.error(f"处理失败: {e}")
+    # 优雅降级或返回默认值
+
+# C. 重新构建镜像
+docker build -t myapp:latest .
+docker service update --image myapp:latest myapp
+```
+
+**场景3: 健康检查失败**
+```bash
+# 症状
+docker ps
+# STATUS: Up 5 minutes (unhealthy)
+
+docker inspect myapp | jq '.[0].State.Health.Log[-3:]'
+# [
+#   {
+#     "Start": "2025-12-10T14:30:00Z",
+#     "End": "2025-12-10T14:30:03Z",
+#     "ExitCode": 1,
+#     "Output": "HTTP/1.1 503 Service Unavailable"
+#   }
+# ]
+
+# 排查步骤
+# 1. 手动执行健康检查命令
+docker exec myapp curl -f http://localhost:8080/health
+
+# 2. 查看应用日志
+docker logs myapp | grep -i "health"
+
+# 3. 检查健康检查配置
+docker inspect myapp | jq '.[0].Config.Healthcheck'
+
+# 解决方案
+# A. 调整健康检查参数
+# Dockerfile
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8080/health || exit 1
+
+# B. 修复健康检查端点
+@app.route('/health')
+def health():
+    # 检查关键依赖
+    try:
+        db.execute("SELECT 1")
+        redis.ping()
+        return jsonify({"status": "healthy"}), 200
+    except Exception as e:
+        return jsonify({"status": "unhealthy", "error": str(e)}), 503
+
+# C. 增加启动时间(start-period)
+docker run --health-cmd="curl -f http://localhost:8080/health" \
+           --health-interval=30s \
+           --health-start-period=120s \
+           myapp
+
+# D. 禁用健康检查(临时调试)
+docker run --no-healthcheck myapp
+```
+
+### 18.2.3 容器性能问题
+
+**场景1: CPU使用率100%**
+```bash
+# 症状
+docker stats myapp
+# CPU %: 399.5%  (4核心全部跑满)
+
+# 排查步骤
+# 1. 查看容器内进程
+docker top myapp
+
+# 2. 进入容器使用top
+docker exec -it myapp top
+
+# 3. CPU profiling
+# 获取容器PID
+PID=$(docker inspect -f '{{.State.Pid}}' myapp)
+
+# 使用perf分析
+perf record -F 99 -p $PID -g -- sleep 30
+perf report
+
+# 或使用py-spy(Python)
+docker exec myapp pip install py-spy
+docker exec myapp py-spy top --pid 1
+
+# 4. 查看慢查询
+docker exec myapp-db psql -c "
+  SELECT query, calls, total_time, mean_time
+  FROM pg_stat_statements
+  ORDER BY total_time DESC
+  LIMIT 10;
+"
+
+# 解决方案
+# A. 优化代码热点
+# 使用缓存减少计算
+# 异步处理耗时操作
+# 优化算法复杂度
+
+# B. 增加CPU配额
+docker update --cpus 8 myapp
+
+# C. 横向扩展
+docker service scale myapp=4
+
+# D. 限制并发
+# Gunicorn
+workers = 4  # 降低worker数量
+threads = 2
+worker_class = "gthread"
+
+# E. 限流
+from flask_limiter import Limiter
+
+limiter = Limiter(
+    app,
+    default_limits=["100 per minute"]
+)
+```
+
+**场景2: 内存持续增长**
+```bash
+# 症状
+docker stats myapp
+# 内存使用持续增长: 500MB -> 1GB -> 1.5GB -> ...
+
+# 排查步骤
+# 1. 监控内存趋势
+watch -n 5 'docker stats myapp --no-stream'
+
+# 2. 查看进程内存分布
+docker exec myapp cat /proc/1/status | grep -i mem
+
+# 3. Python内存分析
+docker exec myapp pip install memory_profiler
+docker exec myapp python -m memory_profiler app.py
+
+# 4. Java堆分析
+docker exec myapp jmap -heap 1
+docker exec myapp jmap -dump:file=/tmp/heap.hprof 1
+docker cp myapp:/tmp/heap.hprof .
+# 使用MAT分析
+
+# 5. 检查缓存大小
+docker exec myapp-redis redis-cli info memory
+
+# 解决方案
+# A. 查找内存泄漏
+# Python
+import tracemalloc
+
+tracemalloc.start()
+
+# ... 运行一段时间 ...
+
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics('lineno')
+
+for stat in top_stats[:10]:
+    print(stat)
+
+# B. 限制缓存大小
+from functools import lru_cache
+
+@lru_cache(maxsize=1000)  # 最多缓存1000条
+def expensive_function(param):
+    pass
+
+# C. 定期重启worker
+# Gunicorn
+max_requests = 10000
+max_requests_jitter = 1000
+
+# D. 配置GC
+# Java
+JAVA_OPTS="-Xms2g -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+# E. 增加内存限制(最后手段)
+docker update --memory 4g myapp
+```
+
+**场景3: 磁盘IO瓶颈**
+```bash
+# 症状
+docker stats myapp
+# BLOCK I/O: 1.2GB / 3.4GB (持续高IO)
+
+# 应用响应缓慢,尤其是数据库操作
+
+# 排查步骤
+# 1. 查看IO统计
+iostat -x 1 10
+
+# 示例输出
+Device    r/s     w/s   rkB/s   wkB/s  await  %util
+sda      150.0   300.0  6000    12000  25.5   98.0
+
+# 2. 查看容器IO
+docker stats myapp --no-stream --format \
+  "{{.Container}}: {{.BlockIO}}"
+
+# 3. 查找IO热点进程
+iotop -o  # 仅显示有IO的进程
+
+# 4. 数据库慢查询
+docker exec postgres-db psql -c "
+  SELECT * FROM pg_stat_activity
+  WHERE state = 'active'
+  AND query_start < NOW() - INTERVAL '5 seconds';
+"
+
+# 解决方案
+# A. 优化存储驱动
+# 确保使用overlay2
+docker info | grep "Storage Driver"
+
+# B. 使用更快的存储
+# 迁移到SSD/NVMe
+# 使用tmpfs for临时数据
+docker run -v type=tmpfs,target=/tmp,tmpfs-size=1G myapp
+
+# C. 调整IO调度器
+echo none > /sys/block/nvme0n1/queue/scheduler
+
+# D. 数据库优化
+# PostgreSQL
+shared_buffers = 8GB
+effective_cache_size = 24GB
+random_page_cost = 1.1  # SSD
+checkpoint_completion_target = 0.9
+
+# E. 应用层优化
+# 批量操作
+# 减少数据库查询
+# 使用索引
+# 启用查询缓存
+```
+
+### 18.2.4 数据持久化问题
+
+**场景1: 数据丢失**
+```bash
+# 症状
+# 容器重启后数据丢失
+
+# 排查步骤
+# 1. 检查卷挂载
+docker inspect myapp | jq '.[0].Mounts'
+
+# 2. 验证数据位置
+docker exec myapp ls -la /var/lib/mysql
+
+# 3. 检查卷是否存在
+docker volume ls | grep myapp
+
+# 解决方案
+# A. 正确挂载卷
+docker run -v myapp-data:/var/lib/mysql mysql:8
+
+# B. 使用bind mount
+docker run -v /data/mysql:/var/lib/mysql mysql:8
+
+# C. Docker Compose
+version: '3.8'
+services:
+  db:
+    image: mysql:8
+    volumes:
+      - db-data:/var/lib/mysql
+
+volumes:
+  db-data:
+    driver: local
+```
+
+**场景2: 权限问题**
+```bash
+# 症状
+docker logs myapp
+# Permission denied: '/data/app.log'
+
+# 排查步骤
+# 1. 检查文件权限
+docker exec myapp ls -la /data
+
+# 2. 检查容器运行用户
+docker inspect myapp | jq '.[0].Config.User'
+
+# 3. 检查宿主机权限
+ls -la /mnt/data
+
+# 解决方案
+# A. 修改宿主机权限
+sudo chown -R 1000:1000 /mnt/data
+
+# B. 以root运行(不推荐)
+docker run --user root myapp
+
+# C. Dockerfile指定用户
+FROM python:3.11-slim
+
+RUN groupadd -r app && useradd -r -g app app
+
+WORKDIR /app
+COPY --chown=app:app . .
+
+USER app
+CMD ["python", "app.py"]
+
+# D. init容器修复权限
+docker run --rm -v myapp-data:/data \
+  busybox chown -R 1000:1000 /data
+```
+
+## 18.3 网络故障排查
+
+### 18.3.1 容器间网络不通
+
+**排查工具箱**
+```bash
+# 安装网络调试工具
+docker run -it --rm --network myapp_network \
+  nicolaka/netshoot
+
+# 工具包含:
+# - ping, traceroute, mtr
+# - curl, wget, httpie
+# - netstat, ss, lsof
+# - tcpdump, nmap
+# - dig, nslookup, host
+# - iperf3
+```
+
+**场景1: DNS解析失败**
+```bash
+# 症状
+docker exec app curl database:5432
+# curl: (6) Could not resolve host: database
+
+# 排查步骤
+# 1. 测试DNS解析
+docker exec app nslookup database
+
+# 2. 检查DNS配置
+docker exec app cat /etc/resolv.conf
+
+# 3. 检查网络连接
+docker inspect app | jq '.[0].NetworkSettings.Networks'
+
+# 4. 验证服务发现
+docker network inspect myapp_network | jq '.[0].Containers'
+
+# 解决方案
+# A. 确保在同一网络
+docker network connect myapp_network app
+
+# B. 使用IP地址(临时)
+DATABASE_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' database)
+docker exec app curl $DATABASE_IP:5432
+
+# C. 配置自定义DNS
+docker run --dns 8.8.8.8 --dns 8.8.4.4 myapp
+
+# D. 检查Docker DNS服务
+docker exec app cat /etc/resolv.conf
+# nameserver 127.0.0.11  # Docker内置DNS
+
+# 验证内置DNS
+docker exec app nslookup database 127.0.0.11
+```
+
+**场景2: 端口不通**
+```bash
+# 症状
+docker exec app curl database:5432
+# curl: (7) Failed to connect to database port 5432: Connection refused
+
+# 排查步骤
+# 1. 检查端口监听
+docker exec database netstat -tunlp | grep 5432
+
+# 或
+docker exec database ss -tunlp | grep 5432
+
+# 2. 测试端口连通性
+docker exec app nc -zv database 5432
+# Connection to database 5432 port [tcp/postgresql] succeeded!
+
+# 或使用telnet
+docker exec app telnet database 5432
+
+# 3. 检查防火墙规则
+iptables -L -n | grep 5432
+
+# 4. 抓包分析
+docker exec app tcpdump -i eth0 port 5432
+
+# 解决方案
+# A. 确认应用监听正确地址
+# 不要监听localhost,要监听0.0.0.0
+bind = "0.0.0.0:5432"  # 正确
+bind = "127.0.0.1:5432"  # 错误,只能容器内访问
+
+# B. 检查防火墙
+# Docker自动配置iptables,一般不需要手动配置
+
+# C. 验证服务启动
+docker exec database ps aux | grep postgres
+```
+
+**场景3: 网络策略限制**
+```bash
+# 症状(使用Swarm网络策略时)
+# 部分容器可以访问,部分不能
+
+# 排查步骤
+# 1. 查看网络策略
+docker network inspect myapp_network
+
+# 2. 测试连通性矩阵
+for service in app1 app2 app3; do
+  echo "测试 $service:"
+  docker exec $service curl -s -o /dev/null -w "%{http_code}" database:5432
+done
+
+# 解决方案
+# A. 使用overlay网络(Swarm)
+docker network create --driver overlay myapp_network
+
+# B. 确保服务在同一网络
+docker service update --network-add myapp_network app
+
+# C. 使用服务名而非容器名
+curl database:5432  # 正确(服务名)
+curl database.1.abc123:5432  # 错误(容器名)
+```
+
+### 18.3.2 外部访问不通
+
+**场景1: 端口映射问题**
+```bash
+# 症状
+curl http://localhost:8080
+# curl: (7) Failed to connect to localhost port 8080
+
+# 排查步骤
+# 1. 检查端口映射
+docker ps --format "{{.Names}}: {{.Ports}}"
+
+# 2. 检查端口监听
+netstat -tunlp | grep 8080
+ss -tunlp | grep 8080
+
+# 3. 测试从宿主机访问
+curl http://localhost:8080
+curl http://127.0.0.1:8080
+curl http://$(hostname -I | awk '{print $1}'):8080
+
+# 4. 检查防火墙
+iptables -L -n -v | grep 8080
+firewall-cmd --list-all
+
+# 解决方案
+# A. 正确的端口映射格式
+docker run -p 8080:80 nginx  # 宿主机8080 -> 容器80
+
+# B. 绑定所有接口
+docker run -p 0.0.0.0:8080:80 nginx
+
+# C. 开放防火墙端口
+firewall-cmd --add-port=8080/tcp --permanent
+firewall-cmd --reload
+
+# D. 检查Docker iptables规则
+iptables -t nat -L -n | grep 8080
+```
+
+**场景2: Swarm路由网格问题**
+```bash
+# 症状
+# 某些节点可以访问服务,某些不能
+
+# 排查步骤
+# 1. 检查服务发布端口
+docker service inspect myapp | jq '.[0].Endpoint.Ports'
+
+# 2. 测试每个节点
+for node in node1 node2 node3; do
+  echo "测试 $node:"
+  ssh $node "curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080"
+done
+
+# 3. 检查ingress网络
+docker network inspect ingress
+
+# 4. 查看节点可用性
+docker node ls
+
+# 解决方案
+# A. 重建ingress网络
+docker network rm ingress
+docker network create \
+  --driver overlay \
+  --ingress \
+  --subnet=10.0.0.0/24 \
+  --gateway=10.0.0.1 \
+  ingress
+
+# B. 检查节点防火墙
+# 确保以下端口开放:
+# - 2377/tcp (cluster management)
+# - 7946/tcp+udp (container network discovery)
+# - 4789/udp (overlay network traffic)
+
+# C. 服务使用host模式
+docker service create --mode global --publish mode=host,target=80,published=8080 nginx
+```
+
+## 18.4 日志分析与调试
+
+### 18.4.1 日志收集技巧
+
+**结构化日志查询**
+```bash
+# 按时间范围
+docker logs --since "2025-12-10T14:00:00" --until "2025-12-10T15:00:00" myapp
+
+# 按时间相对值
+docker logs --since 1h myapp  # 最近1小时
+docker logs --since 30m myapp  # 最近30分钟
+
+# 实时跟踪
+docker logs -f myapp
+
+# 只看最新N行
+docker logs --tail 100 myapp
+
+# 包含时间戳
+docker logs -t myapp
+
+# 过滤关键字
+docker logs myapp 2>&1 | grep -i error
+docker logs myapp 2>&1 | grep -E "(ERROR|WARN|FATAL)"
+
+# 统计错误数量
+docker logs myapp 2>&1 | grep -c ERROR
+
+# 保存到文件
+docker logs myapp > myapp_$(date +%Y%m%d_%H%M%S).log
+```
+
+**多容器日志聚合**
+```bash
+#!/bin/bash
+# collect-logs.sh - 收集所有服务日志
+
+SERVICES=$(docker service ls --format "{{.Name}}")
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_DIR="logs_$TIMESTAMP"
+
+mkdir -p $LOG_DIR
+
+for service in $SERVICES; do
+    echo "收集 $service 日志..."
+
+    # 获取服务的所有任务
+    TASKS=$(docker service ps $service --format "{{.Name}}.{{.ID}}" --filter "desired-state=running")
+
+    for task in $TASKS; do
+        CONTAINER=$(docker ps --filter "name=$task" --format "{{.ID}}")
+        if [ -n "$CONTAINER" ]; then
+            docker logs $CONTAINER > "$LOG_DIR/${service}_${CONTAINER:0:12}.log" 2>&1
+            echo "  ✓ $CONTAINER"
+        fi
+    done
+done
+
+# 打包
+tar -czf logs_$TIMESTAMP.tar.gz $LOG_DIR
+echo "日志已保存到: logs_$TIMESTAMP.tar.gz"
+```
+
+### 18.4.2 常见错误模式
+
+**错误模式识别脚本**
+```bash
+#!/bin/bash
+# analyze-errors.sh - 分析日志中的错误模式
+
+LOG_FILE=$1
+
+if [ -z "$LOG_FILE" ]; then
+    echo "用法: $0 <日志文件>"
+    exit 1
+fi
+
+echo "=========================================="
+echo "日志错误分析: $LOG_FILE"
+echo "=========================================="
+
+# 1. 错误统计
+echo -e "\n[1] 错误级别统计"
+echo "----------------------------------------"
+echo "FATAL: $(grep -c FATAL $LOG_FILE)"
+echo "ERROR: $(grep -c ERROR $LOG_FILE)"
+echo "WARN:  $(grep -c WARN $LOG_FILE)"
+
+# 2. Top 10错误类型
+echo -e "\n[2] Top 10 错误类型"
+echo "----------------------------------------"
+grep -oP '(?<=Exception: ).*' $LOG_FILE | sort | uniq -c | sort -rn | head -10
+
+# 3. 时间分布
+echo -e "\n[3] 错误时间分布"
+echo "----------------------------------------"
+grep ERROR $LOG_FILE | awk '{print $1}' | cut -d: -f1 | sort | uniq -c
+
+# 4. 相关错误(前后5行)
+echo -e "\n[4] 首个FATAL错误上下文"
+echo "----------------------------------------"
+grep -n -A 5 -B 5 FATAL $LOG_FILE | head -20
+
+# 5. 错误趋势
+echo -e "\n[5] 每分钟错误数"
+echo "----------------------------------------"
+grep ERROR $LOG_FILE | awk '{print substr($2,1,5)}' | sort | uniq -c | tail -20
+
+echo -e "\n=========================================="
+```
+
+**Python日志分析**
+```python
+#!/usr/bin/env python3
+# log_analyzer.py - 高级日志分析
+
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime
+
+def analyze_log(log_file):
+    """分析日志文件"""
+
+    errors = []
+    errors_by_type = Counter()
+    errors_by_time = defaultdict(int)
+
+    # 正则模式
+    timestamp_pattern = r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
+    level_pattern = r'\[(ERROR|WARN|FATAL)\]'
+    exception_pattern = r'(\w+Exception|Error):'
+
+    with open(log_file, 'r') as f:
+        for line in f:
+            # 提取时间戳
+            ts_match = re.search(timestamp_pattern, line)
+            if ts_match:
+                timestamp = datetime.fromisoformat(ts_match.group(1))
+                hour_key = timestamp.strftime('%Y-%m-%d %H:00')
+
+            # 检查错误级别
+            level_match = re.search(level_pattern, line)
+            if level_match:
+                level = level_match.group(1)
+
+                # 统计错误类型
+                exception_match = re.search(exception_pattern, line)
+                if exception_match:
+                    error_type = exception_match.group(1)
+                    errors_by_type[error_type] += 1
+
+                # 时间分布
+                errors_by_time[hour_key] += 1
+
+                errors.append({
+                    'timestamp': timestamp if ts_match else None,
+                    'level': level,
+                    'message': line.strip()
+                })
+
+    # 报告
+    print("=" * 60)
+    print("日志分析报告")
+    print("=" * 60)
+
+    print(f"\n总错误数: {len(errors)}")
+
+    print("\nTop 10 错误类型:")
+    for error_type, count in errors_by_type.most_common(10):
+        print(f"  {error_type:30} {count:5} 次")
+
+    print("\n错误时间分布:")
+    for hour, count in sorted(errors_by_time.items())[-24:]:
+        print(f"  {hour}: {'=' * (count // 10)} ({count})")
+
+    # 检测错误峰值
+    max_errors = max(errors_by_time.values()) if errors_by_time else 0
+    avg_errors = sum(errors_by_time.values()) / len(errors_by_time) if errors_by_time else 0
+
+    print(f"\n错误峰值: {max_errors} 次/小时")
+    print(f"平均错误: {avg_errors:.1f} 次/小时")
+
+    if max_errors > avg_errors * 3:
+        print("\n⚠️  检测到错误峰值异常！")
+        # 找出峰值时间
+        peak_hours = [h for h, c in errors_by_time.items() if c > avg_errors * 2]
+        print(f"异常时间段: {', '.join(peak_hours)}")
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2:
+        print("用法: python log_analyzer.py <日志文件>")
+        sys.exit(1)
+
+    analyze_log(sys.argv[1])
+```
+
+### 18.4.3 实时调试技巧
+
+**进入运行中的容器**
+```bash
+# 方法1: exec bash
+docker exec -it myapp /bin/bash
+
+# 方法2: exec sh (Alpine镜像)
+docker exec -it myapp /bin/sh
+
+# 方法3: nsenter(容器无shell时)
+PID=$(docker inspect -f '{{.State.Pid}}' myapp)
+nsenter -t $PID -n -p -m /bin/bash
+
+# 在容器内调试
+# 安装工具
+apt-get update && apt-get install -y curl netcat-openbsd
+
+# 测试网络
+curl -v http://database:5432
+nc -zv database 5432
+
+# 查看进程
+ps aux
+top
+
+# 查看日志
+tail -f /var/log/app.log
+
+# 环境变量
+env | grep DATABASE
+
+# 文件系统
+df -h
+du -sh /data/*
+```
+
+**动态修改配置**
+```bash
+# 热重载配置(Nginx示例)
+docker exec nginx nginx -t  # 测试配置
+docker exec nginx nginx -s reload  # 重载配置
+
+# 修改日志级别(无需重启)
+docker exec myapp curl -X POST http://localhost:8080/admin/loglevel?level=DEBUG
+
+# 临时修改环境变量
+docker exec myapp sh -c 'export DEBUG=true && /app/restart.sh'
+```
+
+**性能剖析**
+```bash
+# Python - cProfile
+docker exec myapp python -m cProfile -o output.prof app.py
+
+# Python - 实时剖析
+docker exec myapp pip install py-spy
+docker exec myapp py-spy top --pid 1
+
+# Java - JFR(Java Flight Recorder)
+docker exec myapp jcmd 1 JFR.start duration=60s filename=/tmp/profile.jfr
+docker cp myapp:/tmp/profile.jfr .
+
+# Go - pprof
+docker exec myapp curl http://localhost:6060/debug/pprof/profile?seconds=30 > cpu.prof
+go tool pprof cpu.prof
+```
+
+## 18.5 生产环境故障案例
+
+### 18.5.1 案例1: 服务雪崩
+
+**故障现象**
+```
+2025-12-10 14:30:00 - 用户报告服务响应缓慢
+14:32:00 - 部分请求开始超时
+14:35:00 - 大量503错误
+14:38:00 - 所有服务不可用
+```
+
+**排查过程**
+```bash
+# 1. 检查服务状态
+docker service ls
+# 发现所有副本处于 0/3 状态
+
+# 2. 查看容器状态
+docker ps -a | grep myapp
+# 所有容器处于 Restarting 状态
+
+# 3. 查看日志
+docker service logs myapp --tail 100
+# 大量 "connection pool exhausted" 错误
+
+# 4. 检查数据库连接
+docker exec database psql -c "
+  SELECT count(*) FROM pg_stat_activity;
+"
+# 结果: 500 (超过max_connections=200)
+
+# 5. 查看网络连接
+docker exec app netstat -an | grep ESTABLISHED | wc -l
+# 结果: 每个容器350+连接
+```
+
+**根本原因**
+```
+1. 数据库慢查询导致连接占用时间过长
+2. 应用未正确释放数据库连接
+3. 连接池配置不合理(max_size=100,但数据库max_connections=200)
+4. 健康检查失败导致容器不断重启
+5. 重启容器产生更多连接,形成恶性循环
+```
+
+**解决方案**
+```bash
+# 紧急处理
+# 1. 临时提高数据库连接数
+docker exec database psql -c "ALTER SYSTEM SET max_connections = 500;"
+docker restart database
+
+# 2. 强制关闭空闲连接
+docker exec database psql -c "
+  SELECT pg_terminate_backend(pid)
+  FROM pg_stat_activity
+  WHERE state = 'idle' AND state_change < NOW() - INTERVAL '5 minutes';
+"
+
+# 3. 临时禁用健康检查
+docker service update --no-healthcheck myapp
+
+# 4. 减少副本数
+docker service scale myapp=2
+
+# 长期优化
+# A. 优化慢查询
+CREATE INDEX idx_user_created ON users(created_at);
+
+# B. 修复连接池配置
+# config.py
+DATABASE_POOL_SIZE = 20  # 每个实例20个连接
+DATABASE_MAX_OVERFLOW = 10  # 最多额外10个
+DATABASE_POOL_TIMEOUT = 30
+DATABASE_POOL_RECYCLE = 3600
+
+# C. 添加连接超时
+# sqlalchemy
+create_engine(
+    url,
+    pool_pre_ping=True,  # 连接前检查
+    pool_recycle=3600,   # 1小时回收
+    connect_args={
+        'connect_timeout': 10,
+        'options': '-c statement_timeout=30000'
+    }
+)
+
+# D. 实施断路器模式
+from circuitbreaker import circuit
+
+@circuit(failure_threshold=5, recovery_timeout=60)
+def query_database():
+    return db.execute(query)
+
+# E. 调整健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5
+```
+
+**预防措施**
+```yaml
+# 1. 监控告警
+- alert: DatabaseConnectionPoolExhausted
+  expr: db_connections_used / db_connections_max > 0.8
+  for: 5m
+  labels:
+    severity: warning
+
+- alert: SlowQuery
+  expr: rate(pg_slow_queries_total[5m]) > 10
+  for: 2m
+  labels:
+    severity: warning
+
+# 2. 资源限制
+services:
+  app:
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+      restart_policy:
+        condition: on-failure
+        delay: 10s  # 重启延迟
+        max_attempts: 3
+        window: 120s
+
+# 3. 限流
+from flask_limiter import Limiter
+
+limiter = Limiter(
+    app,
+    key_func=lambda: request.remote_addr,
+    default_limits=["200 per minute", "50 per second"]
+)
+```
+
+### 18.5.2 案例2: 磁盘空间耗尽
+
+**故障现象**
+```
+2025-12-10 10:00:00 - 容器写入失败
+10:05:00 - 新容器无法启动
+10:10:00 - Docker daemon响应缓慢
+```
+
+**排查过程**
+```bash
+# 1. 检查磁盘空间
+df -h
+# Filesystem      Size  Used Avail Use% Mounted on
+# /dev/sda1       100G   98G  2.0G  98% /
+
+# 2. 查找大文件
+du -sh /* | sort -h | tail -10
+
+# 3. Docker磁盘使用
+docker system df
+# TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+# Images          150       20        45GB      30GB (66%)
+# Containers      80        30        15GB      10GB (66%)
+# Local Volumes   30        10        35GB      25GB (71%)
+# Build Cache     -         -         5GB       5GB
+
+# 4. 详细分析
+docker system df -v
+
+# 5. 查找大日志文件
+find /var/lib/docker/containers/ -name "*-json.log" -exec ls -lh {} \; | sort -k 5 -h | tail -10
+```
+
+**根本原因**
+```
+1. 容器日志未限制大小,单个日志文件达到10GB+
+2. 大量未使用的镜像和容器未清理
+3. 应用日志写入容器内,未挂载卷
+4. 未配置日志轮转
+```
+
+**解决方案**
+```bash
+# 紧急清理
+# 1. 清理未使用资源
+docker system prune -a --volumes -f
+# 释放约60GB空间
+
+# 2. 清理大日志文件
+find /var/lib/docker/containers/ -name "*-json.log" -exec truncate -s 0 {} \;
+
+# 3. 临时移动数据
+docker volume create temp-vol
+docker run --rm -v old-vol:/source -v temp-vol:/dest alpine sh -c "mv /source/* /dest/"
+
+# 长期方案
+# A. 配置日志限制
+# /etc/docker/daemon.json
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3",
+    "compress": "true"
+  }
+}
+
+systemctl restart docker
+
+# B. 使用外部日志驱动
+# docker-compose.yml
+version: '3.8'
+services:
+  app:
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: localhost:24224
+        tag: app.{{.Name}}
+
+# C. 应用日志挂载卷
+services:
+  app:
+    volumes:
+      - app-logs:/var/log/app
+
+# D. 定时清理任务
+# crontab
+0 2 * * * docker system prune -f > /dev/null 2>&1
+0 3 * * 0 docker system prune -a --volumes -f > /dev/null 2>&1
+
+# E. 监控告警
+- alert: DiskSpaceHigh
+  expr: (node_filesystem_avail_bytes{mountpoint="/var/lib/docker"} / node_filesystem_size_bytes{mountpoint="/var/lib/docker"}) < 0.15
+  for: 5m
+  labels:
+    severity: warning
+```
+
+### 18.5.3 案例3: 内存泄漏
+
+**故障现象**
+```
+应用内存使用持续增长
+1小时: 500MB
+2小时: 1.2GB
+4小时: 2.5GB
+6小时: OOM Killed
+```
+
+**排查过程**
+```bash
+# 1. 监控内存趋势
+watch -n 5 'docker stats myapp --no-stream'
+
+# 2. 查看OOM事件
+docker inspect myapp | jq '.[0].State.OOMKilled'
+dmesg | grep -i "out of memory"
+
+# 3. 分析堆内存(Java)
+docker exec myapp jmap -heap 1
+
+Heap Usage:
+Eden Space:     89% used
+Old Generation: 95% used  # 持续增长
+
+# 4. 生成堆转储
+docker exec myapp jmap -dump:live,format=b,file=/tmp/heap.hprof 1
+
+# 5. 分析堆转储(MAT)
+# 发现大量未释放的Session对象
+# 每个Session持有大量缓存数据
+# Session没有正确过期
+
+# 6. 检查应用代码
+# 发现全局缓存无限增长
+cache = {}  # 全局字典
+def get_data(key):
+    if key not in cache:
+        cache[key] = fetch_data(key)  # 永不删除!
+    return cache[key]
+```
+
+**解决方案**
+```python
+# A. 使用LRU缓存
+from functools import lru_cache
+
+@lru_cache(maxsize=1000)
+def get_data(key):
+    return fetch_data(key)
+
+# B. 使用TTL缓存
+from cachetools import TTLCache
+
+cache = TTLCache(maxsize=1000, ttl=3600)
+
+def get_data(key):
+    if key not in cache:
+        cache[key] = fetch_data(key)
+    return cache[key]
+
+# C. 定期清理
+import threading
+import time
+
+def cleanup_cache():
+    while True:
+        time.sleep(3600)  # 1小时
+        old_keys = [k for k, v in cache.items()
+                    if v['timestamp'] < time.time() - 7200]
+        for k in old_keys:
+            del cache[k]
+
+cleanup_thread = threading.Thread(target=cleanup_cache, daemon=True)
+cleanup_thread.start()
+
+# D. 使用Redis外部缓存
+import redis
+
+redis_client = redis.Redis(host='redis', decode_responses=True)
+
+def get_data(key):
+    cached = redis_client.get(key)
+    if cached:
+        return json.loads(cached)
+
+    data = fetch_data(key)
+    redis_client.setex(key, 3600, json.dumps(data))  # 1小时过期
+    return data
+
+# E. Session管理
+# Flask
+app.config['SESSION_TYPE'] = 'redis'
+app.config['SESSION_PERMANENT'] = False
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=1)
+```
+
+**验证修复**
+```bash
+# 1. 重新部署
+docker service update --image myapp:fixed myapp
+
+# 2. 长期监控
+# Prometheus query
+rate(container_memory_usage_bytes{name="myapp"}[1h])
+
+# 3. 设置告警
+- alert: MemoryLeakSuspected
+  expr: |
+    (container_memory_usage_bytes{name="myapp"} -
+     container_memory_usage_bytes{name="myapp"} offset 1h) > 500000000
+  for: 2h
+  labels:
+    severity: warning
+```
+
+---
+
+*（第18章完成,约2000行。已完成18章,剩余1章...）*
+
+---
+
+# 第19章: 最佳实践与案例
+
+本章汇总Docker在企业级生产环境的最佳实践,涵盖安全加固、CI/CD集成、迁移策略和常见避坑指南,帮助您构建稳定、安全、高效的容器化平台。
+
+---
+
+## 19.1 企业级部署案例
+
+### 19.1.1 电商平台微服务架构
+
+**架构概览**:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         外部用户                              │
+└───────────────┬─────────────────────────────────────────────┘
+                │
+         ┌──────▼──────┐
+         │   CloudFlare CDN   │
+         │   (DDoS防护/缓存)   │
+         └──────┬──────┘
+                │
+         ┌──────▼──────┐
+         │   Nginx Ingress    │
+         │   (SSL/WAF/限流)   │
+         └──────┬──────┘
+                │
+    ┌───────────┼───────────┐
+    │           │           │
+┌───▼───┐  ┌───▼───┐  ┌───▼───┐
+│Web前端 │  │API网关 │  │管理后台│
+└───┬───┘  └───┬───┘  └───┬───┘
+    │          │          │
+    └──────┬───┴────┬─────┘
+           │        │
+    ┌──────▼────────▼──────┐
+    │   业务服务层 (Swarm)    │
+    │  ┌────────────────┐  │
+    │  │用户服务  订单服务│  │
+    │  │商品服务  支付服务│  │
+    │  │库存服务  物流服务│  │
+    │  └────────────────┘  │
+    └──────┬────────┬──────┘
+           │        │
+    ┌──────▼────┐  ┌▼──────┐
+    │PostgreSQL │  │ Redis  │
+    │   集群     │  │ 集群   │
+    └───────────┘  └────────┘
+```
+
+**Docker Stack 配置**:
+
+```yaml
+# ecommerce-stack.yml
+version: '3.8'
+
+networks:
+  frontend:
+    driver: overlay
+    attachable: true
+  backend:
+    driver: overlay
+    internal: true
+  db:
+    driver: overlay
+    internal: true
+
+volumes:
+  postgres_data:
+  redis_data:
+
+secrets:
+  db_password:
+    external: true
+  jwt_secret:
+    external: true
+  payment_api_key:
+    external: true
+
+services:
+  # ==================== API网关 ====================
+  api_gateway:
+    image: registry.company.com/api-gateway:v2.3.1
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    networks:
+      - frontend
+      - backend
+    ports:
+      - "8080:8080"
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+      - RATE_LIMIT_RPS=1000
+      - JWT_SECRET_FILE=/run/secrets/jwt_secret
+    secrets:
+      - jwt_secret
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: "fluentd.company.com:24224"
+        tag: "api_gateway"
+
+  # ==================== 用户服务 ====================
+  user_service:
+    image: registry.company.com/user-service:v1.5.2
+    deploy:
+      replicas: 3
+      placement:
+        constraints:
+          - node.labels.tier == app
+      update_config:
+        parallelism: 1
+        delay: 10s
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    networks:
+      - backend
+      - db
+    environment:
+      - DB_HOST=postgres-master
+      - DB_PORT=5432
+      - DB_NAME=users
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - REDIS_HOST=redis-master
+      - REDIS_PORT=6379
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: fluentd
+      options:
+        tag: "user_service"
+
+  # ==================== 订单服务 ====================
+  order_service:
+    image: registry.company.com/order-service:v2.1.0
+    deploy:
+      replicas: 5  # 高并发服务
+      placement:
+        constraints:
+          - node.labels.tier == app
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    networks:
+      - backend
+      - db
+    environment:
+      - DB_HOST=postgres-master
+      - DB_NAME=orders
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - REDIS_HOST=redis-master
+      - MQ_HOST=rabbitmq
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ==================== 商品服务 ====================
+  product_service:
+    image: registry.company.com/product-service:v1.8.3
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    networks:
+      - backend
+      - db
+    environment:
+      - DB_HOST=postgres-master
+      - DB_NAME=products
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - REDIS_HOST=redis-master
+      - CACHE_TTL=3600
+    secrets:
+      - db_password
+
+  # ==================== 支付服务 ====================
+  payment_service:
+    image: registry.company.com/payment-service:v1.2.1
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.labels.security == high  # 部署到安全节点
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+    networks:
+      - backend
+      - db
+    environment:
+      - DB_HOST=postgres-master
+      - DB_NAME=payments
+      - DB_PASSWORD_FILE=/run/secrets/db_password
+      - PAYMENT_API_KEY_FILE=/run/secrets/payment_api_key
+      - ENCRYPTION_ENABLED=true
+    secrets:
+      - db_password
+      - payment_api_key
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+
+  # ==================== PostgreSQL主从集群 ====================
+  postgres_master:
+    image: postgres:15-alpine
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.tier == db
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    networks:
+      - db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+      - POSTGRES_INITDB_ARGS=-E UTF8 --locale=en_US.utf8
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Redis集群 ====================
+  redis_master:
+    image: redis:7-alpine
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.tier == cache
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    networks:
+      - db
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --maxmemory 768mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --save 900 1
+      --save 300 10
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ==================== RabbitMQ消息队列 ====================
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.tier == app
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    networks:
+      - backend
+    environment:
+      - RABBITMQ_DEFAULT_USER=admin
+      - RABBITMQ_DEFAULT_PASS_FILE=/run/secrets/db_password
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+```
+
+**部署脚本**:
+
+```bash
+#!/bin/bash
+# deploy-ecommerce.sh - 电商平台自动化部署脚本
+
+set -e
+
+STACK_NAME="ecommerce"
+REGISTRY="registry.company.com"
+ENVIRONMENT="production"
+
+echo "=========================================="
+echo "电商平台部署脚本"
+echo "环境: $ENVIRONMENT"
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "=========================================="
+
+# 1. 检查前置条件
+echo -e "\n[1/8] 检查Docker Swarm状态..."
+if ! docker info | grep -q "Swarm: active"; then
+    echo "❌ Docker Swarm未激活"
+    exit 1
+fi
+
+# 检查节点标签
+echo "检查节点标签..."
+NODE_LABELS=$(docker node ls --format "{{.Hostname}}: {{.Labels}}")
+echo "$NODE_LABELS"
+
+# 2. 创建网络
+echo -e "\n[2/8] 创建网络..."
+for network in frontend backend db; do
+    if ! docker network ls | grep -q "${STACK_NAME}_${network}"; then
+        docker network create --driver overlay "${STACK_NAME}_${network}"
+        echo "✓ 创建网络: ${STACK_NAME}_${network}"
+    fi
+done
+
+# 3. 创建Secrets
+echo -e "\n[3/8] 创建Secrets..."
+if [ ! -f .env.production ]; then
+    echo "❌ 缺少 .env.production 文件"
+    exit 1
+fi
+
+source .env.production
+
+echo "$DB_PASSWORD" | docker secret create db_password - 2>/dev/null || echo "Secret已存在: db_password"
+echo "$JWT_SECRET" | docker secret create jwt_secret - 2>/dev/null || echo "Secret已存在: jwt_secret"
+echo "$PAYMENT_API_KEY" | docker secret create payment_api_key - 2>/dev/null || echo "Secret已存在: payment_api_key"
+
+# 4. 拉取最新镜像
+echo -e "\n[4/8] 拉取最新镜像..."
+SERVICES=(
+    "api-gateway:v2.3.1"
+    "user-service:v1.5.2"
+    "order-service:v2.1.0"
+    "product-service:v1.8.3"
+    "payment-service:v1.2.1"
+)
+
+for service in "${SERVICES[@]}"; do
+    echo "拉取: $REGISTRY/$service"
+    docker pull "$REGISTRY/$service"
+done
+
+# 5. 部署数据库初始化任务
+echo -e "\n[5/8] 初始化数据库..."
+docker run --rm \
+    --network ${STACK_NAME}_db \
+    -e DB_HOST=postgres-master \
+    -e DB_PASSWORD="$DB_PASSWORD" \
+    "$REGISTRY/db-migrator:latest" \
+    migrate up
+
+# 6. 部署Stack
+echo -e "\n[6/8] 部署Docker Stack..."
+docker stack deploy -c ecommerce-stack.yml "$STACK_NAME"
+
+# 7. 等待服务启动
+echo -e "\n[7/8] 等待服务启动..."
+for i in {1..30}; do
+    RUNNING=$(docker stack services "$STACK_NAME" --format "{{.Replicas}}" | grep -c "/")
+    EXPECTED=$(docker stack services "$STACK_NAME" --format "{{.Name}}" | wc -l)
+
+    echo "进度: $RUNNING/$EXPECTED 服务运行中..."
+
+    if [ "$RUNNING" -eq "$EXPECTED" ]; then
+        READY=$(docker stack services "$STACK_NAME" --format "{{.Replicas}}" | awk -F'/' '{if($1==$2) print $0}' | wc -l)
+        if [ "$READY" -eq "$EXPECTED" ]; then
+            echo "✓ 所有服务已就绪"
+            break
+        fi
+    fi
+
+    if [ $i -eq 30 ]; then
+        echo "⚠️  服务启动超时,请检查日志"
+    fi
+
+    sleep 10
+done
+
+# 8. 健康检查
+echo -e "\n[8/8] 执行健康检查..."
+API_GATEWAY_URL="http://$(docker node inspect self --format '{{.Status.Addr}}'):8080"
+
+for endpoint in /health /api/v1/users/health /api/v1/orders/health; do
+    echo -n "检查 $endpoint ... "
+    if curl -sf "${API_GATEWAY_URL}${endpoint}" > /dev/null; then
+        echo "✓"
+    else
+        echo "✗"
+    fi
+done
+
+# 9. 显示部署状态
+echo -e "\n=========================================="
+echo "部署完成!"
+echo "=========================================="
+docker stack services "$STACK_NAME"
+
+echo -e "\n查看日志:"
+echo "  docker service logs -f ${STACK_NAME}_api_gateway"
+echo "  docker service logs -f ${STACK_NAME}_order_service"
+
+echo -e "\n访问地址:"
+echo "  API网关: $API_GATEWAY_URL"
+echo "  管理后台: http://$(docker node inspect self --format '{{.Status.Addr}}'):8081"
+```
+
+**性能测试**:
+
+```bash
+#!/bin/bash
+# benchmark.sh - 电商平台性能测试
+
+API_URL="http://api.ecommerce.com"
+
+echo "=========================================="
+echo "电商平台性能基准测试"
+echo "=========================================="
+
+# 1. 商品列表接口 (读多写少)
+echo -e "\n[1] 商品列表API (GET /api/v1/products)"
+ab -n 10000 -c 100 -H "Authorization: Bearer $TOKEN" \
+   "${API_URL}/api/v1/products?page=1&size=20"
+
+# 2. 创建订单接口 (写入密集)
+echo -e "\n[2] 创建订单API (POST /api/v1/orders)"
+ab -n 1000 -c 50 -p order.json -T "application/json" \
+   -H "Authorization: Bearer $TOKEN" \
+   "${API_URL}/api/v1/orders"
+
+# 3. 支付接口 (高安全要求)
+echo -e "\n[3] 支付API (POST /api/v1/payments)"
+ab -n 500 -c 20 -p payment.json -T "application/json" \
+   -H "Authorization: Bearer $TOKEN" \
+   "${API_URL}/api/v1/payments"
+
+# 输出汇总
+echo -e "\n=========================================="
+echo "测试完成"
+echo "=========================================="
+```
+
+### 19.1.2 物联网数据采集平台
+
+**架构特点**:
+- 高并发数据采集 (10万+设备)
+- 时序数据存储 (InfluxDB)
+- 实时数据处理 (Kafka + Flink)
+- 边缘计算节点
+
+**Docker Compose配置**:
+
+```yaml
+# iot-platform.yml
+version: '3.8'
+
+services:
+  # ==================== MQTT Broker (设备连接) ====================
+  emqx:
+    image: emqx/emqx:5.3.0
+    ports:
+      - "1883:1883"    # MQTT
+      - "8883:8883"    # MQTT/SSL
+      - "8083:8083"    # WebSocket
+      - "18083:18083"  # Dashboard
+    environment:
+      - EMQX_NAME=emqx
+      - EMQX_HOST=node1.emqx.io
+      - EMQX_NODE__COOKIE=emqxsecretcookie
+      - EMQX_LISTENER__TCP__EXTERNAL__MAX_CONNECTIONS=100000
+    volumes:
+      - ./emqx/data:/opt/emqx/data
+      - ./emqx/log:/opt/emqx/log
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "emqx", "ping"]
+      interval: 10s
+
+  # ==================== Kafka (消息队列) ====================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_NUM_PARTITIONS: 10
+    depends_on:
+      - zookeeper
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+
+  # ==================== InfluxDB (时序数据库) ====================
+  influxdb:
+    image: influxdb:2.7-alpine
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=admin123456
+      - DOCKER_INFLUXDB_INIT_ORG=iot
+      - DOCKER_INFLUXDB_INIT_BUCKET=sensor_data
+      - DOCKER_INFLUXDB_INIT_RETENTION=30d
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+  # ==================== 数据处理服务 ====================
+  data_processor:
+    image: iot-platform/data-processor:v1.0.0
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
+      - INFLUXDB_ORG=iot
+      - INFLUXDB_BUCKET=sensor_data
+      - PROCESSING_THREADS=8
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    depends_on:
+      - kafka
+      - influxdb
+
+  # ==================== 规则引擎 ====================
+  rule_engine:
+    image: iot-platform/rule-engine:v1.0.0
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
+    deploy:
+      replicas: 2
+
+  # ==================== API服务 ====================
+  api_server:
+    image: iot-platform/api-server:v1.0.0
+    ports:
+      - "8080:8080"
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
+      - REDIS_HOST=redis
+      - JWT_SECRET=${JWT_SECRET}
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ==================== Redis (缓存) ====================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+
+volumes:
+  kafka-data:
+  zookeeper-data:
+  influxdb-data:
+  influxdb-config:
+  redis-data:
+```
+
+**数据处理服务示例**:
+
+```python
+#!/usr/bin/env python3
+# data_processor.py - IoT数据处理服务
+
+import json
+import logging
+from kafka import KafkaConsumer
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+import os
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 配置
+KAFKA_BROKERS = os.getenv('KAFKA_BROKERS', 'localhost:9092')
+KAFKA_TOPIC = 'sensor_data'
+INFLUXDB_URL = os.getenv('INFLUXDB_URL', 'http://localhost:8086')
+INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN')
+INFLUXDB_ORG = os.getenv('INFLUXDB_ORG', 'iot')
+INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET', 'sensor_data')
+
+class DataProcessor:
+    def __init__(self):
+        # Kafka消费者
+        self.consumer = KafkaConsumer(
+            KAFKA_TOPIC,
+            bootstrap_servers=KAFKA_BROKERS.split(','),
+            group_id='data_processor',
+            value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+            auto_offset_reset='latest',
+            enable_auto_commit=True
+        )
+
+        # InfluxDB客户端
+        self.influx_client = InfluxDBClient(
+            url=INFLUXDB_URL,
+            token=INFLUXDB_TOKEN,
+            org=INFLUXDB_ORG
+        )
+        self.write_api = self.influx_client.write_api(write_options=SYNCHRONOUS)
+
+        logger.info("DataProcessor初始化完成")
+
+    def process_message(self, message):
+        """处理单条消息"""
+        try:
+            device_id = message['device_id']
+            sensor_type = message['sensor_type']
+            value = message['value']
+            timestamp = message['timestamp']
+
+            # 数据清洗
+            if not self.validate_data(sensor_type, value):
+                logger.warning(f"Invalid data from {device_id}: {value}")
+                return
+
+            # 写入InfluxDB
+            point = Point("sensor_measurement") \
+                .tag("device_id", device_id) \
+                .tag("sensor_type", sensor_type) \
+                .field("value", float(value)) \
+                .time(timestamp)
+
+            self.write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+
+            # 检查告警规则
+            self.check_alerts(device_id, sensor_type, value)
+
+        except Exception as e:
+            logger.error(f"处理消息失败: {e}", exc_info=True)
+
+    def validate_data(self, sensor_type, value):
+        """数据验证"""
+        ranges = {
+            'temperature': (-50, 100),
+            'humidity': (0, 100),
+            'pressure': (800, 1200)
+        }
+
+        if sensor_type not in ranges:
+            return True
+
+        min_val, max_val = ranges[sensor_type]
+        return min_val <= float(value) <= max_val
+
+    def check_alerts(self, device_id, sensor_type, value):
+        """检查告警规则"""
+        # 温度过高告警
+        if sensor_type == 'temperature' and float(value) > 80:
+            logger.warning(f"🚨 Temperature alert: {device_id} = {value}°C")
+            # 发送告警通知...
+
+    def run(self):
+        """主循环"""
+        logger.info("开始消费Kafka消息...")
+
+        for message in self.consumer:
+            try:
+                self.process_message(message.value)
+            except KeyboardInterrupt:
+                logger.info("收到停止信号")
+                break
+            except Exception as e:
+                logger.error(f"处理消息异常: {e}", exc_info=True)
+
+        self.consumer.close()
+        self.influx_client.close()
+
+if __name__ == '__main__':
+    processor = DataProcessor()
+    processor.run()
+```
+
+---
+
+## 19.2 安全加固
+
+### 19.2.1 镜像安全
+
+**1. 使用官方基础镜像**:
+
+```dockerfile
+# ❌ 不推荐: 使用latest标签
+FROM node:latest
+
+# ✅ 推荐: 使用具体版本 + Alpine变体
+FROM node:18.19.0-alpine3.19
+
+# ✅ 最佳: 使用SHA256摘要锁定版本
+FROM node:18.19.0-alpine3.19@sha256:...
+```
+
+**2. 最小化镜像**:
+
+```dockerfile
+# 多阶段构建 - 生产镜像仅包含必需文件
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production && npm cache clean --force
+COPY . .
+RUN npm run build
+
+FROM node:18-alpine AS production
+RUN apk add --no-cache dumb-init
+USER node
+WORKDIR /app
+COPY --chown=node:node --from=builder /app/dist ./dist
+COPY --chown=node:node --from=builder /app/node_modules ./node_modules
+EXPOSE 3000
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "dist/main.js"]
+```
+
+**3. 镜像安全扫描**:
+
+```bash
+#!/bin/bash
+# scan-image.sh - 镜像安全扫描脚本
+
+IMAGE=$1
+
+if [ -z "$IMAGE" ]; then
+    echo "用法: $0 <镜像名称>"
+    exit 1
+fi
+
+echo "=========================================="
+echo "镜像安全扫描: $IMAGE"
+echo "=========================================="
+
+# 1. Trivy扫描
+echo -e "\n[1] Trivy漏洞扫描..."
+trivy image --severity HIGH,CRITICAL "$IMAGE"
+
+# 2. 检查镜像层数
+echo -e "\n[2] 镜像层数检查..."
+LAYERS=$(docker history "$IMAGE" --quiet | wc -l)
+echo "层数: $LAYERS"
+if [ "$LAYERS" -gt 20 ]; then
+    echo "⚠️  警告: 镜像层数过多,建议合并层"
+fi
+
+# 3. 检查镜像大小
+echo -e "\n[3] 镜像大小检查..."
+SIZE=$(docker images "$IMAGE" --format "{{.Size}}")
+echo "大小: $SIZE"
+
+# 4. 检查root用户
+echo -e "\n[4] 用户权限检查..."
+USER=$(docker inspect "$IMAGE" --format='{{.Config.User}}')
+if [ -z "$USER" ] || [ "$USER" = "root" ] || [ "$USER" = "0" ]; then
+    echo "❌ 警告: 容器使用root用户运行"
+else
+    echo "✓ 容器使用非root用户: $USER"
+fi
+
+# 5. 检查敏感文件
+echo -e "\n[5] 敏感文件检查..."
+TEMP_CONTAINER=$(docker create "$IMAGE")
+docker export "$TEMP_CONTAINER" | tar -t | grep -E "\.(key|pem|crt|env)$" || echo "✓ 未发现敏感文件"
+docker rm "$TEMP_CONTAINER" > /dev/null
+
+# 6. 生成SBOM (软件物料清单)
+echo -e "\n[6] 生成SBOM..."
+syft "$IMAGE" -o json > "${IMAGE//\//_}_sbom.json"
+echo "✓ SBOM已保存到: ${IMAGE//\//_}_sbom.json"
+
+echo -e "\n=========================================="
+echo "扫描完成"
+echo "=========================================="
+```
+
+### 19.2.2 运行时安全
+
+**1. AppArmor配置**:
+
+```bash
+# /etc/apparmor.d/docker-default-secure
+#include <tunables/global>
+
+profile docker-default-secure flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  # 拒绝挂载
+  deny mount,
+
+  # 拒绝修改内核参数
+  deny @{PROC}/sys/kernel/** w,
+
+  # 拒绝访问宿主机设备
+  deny /dev/** rw,
+
+  # 允许必要的系统调用
+  capability setgid,
+  capability setuid,
+  capability net_bind_service,
+
+  # 拒绝危险系统调用
+  deny capability sys_admin,
+  deny capability sys_module,
+  deny capability sys_rawio,
+
+  # 允许容器内文件访问
+  /app/** rw,
+  /tmp/** rw,
+  /var/tmp/** rw,
+}
+```
+
+**应用到容器**:
+
+```bash
+docker run --security-opt apparmor=docker-default-secure myapp
+```
+
+**2. Seccomp配置**:
+
+```json
+{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept", "accept4", "access", "bind", "brk",
+        "chdir", "clone", "close", "connect", "dup",
+        "dup2", "execve", "exit", "fork", "fstat",
+        "getcwd", "getpid", "getuid", "listen", "mmap",
+        "open", "read", "recv", "recvfrom", "send",
+        "sendto", "socket", "stat", "write"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": ["reboot", "swapon", "swapoff"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}
+```
+
+**应用Seccomp**:
+
+```bash
+docker run --security-opt seccomp=seccomp-profile.json myapp
+```
+
+**3. 只读根文件系统**:
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    image: myapp:latest
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run
+      - /app/cache:uid=1000,gid=1000,mode=1777
+    volumes:
+      - app-logs:/app/logs
+```
+
+### 19.2.3 网络安全
+
+**1. 网络隔离**:
+
+```yaml
+# network-isolation.yml
+version: '3.8'
+
+networks:
+  frontend:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.1.0/24
+  backend:
+    driver: bridge
+    internal: true  # 无外网访问
+    ipam:
+      config:
+        - subnet: 172.20.2.0/24
+  database:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.3.0/24
+
+services:
+  web:
+    image: nginx
+    networks:
+      - frontend
+      - backend
+
+  api:
+    image: api-server
+    networks:
+      - backend
+      - database
+
+  postgres:
+    image: postgres
+    networks:
+      - database  # 仅database网络可访问
+```
+
+**2. 防火墙规则**:
+
+```bash
+#!/bin/bash
+# docker-firewall.sh - Docker防火墙配置
+
+# 清除现有规则
+iptables -F DOCKER-USER
+iptables -X DOCKER-USER
+iptables -N DOCKER-USER
+
+# 1. 允许已建立的连接
+iptables -A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# 2. 限制特定IP访问敏感端口
+iptables -A DOCKER-USER -p tcp --dport 5432 -s 10.0.0.0/8 -j ACCEPT
+iptables -A DOCKER-USER -p tcp --dport 5432 -j DROP
+
+# 3. 限制容器访问宿主机元数据服务
+iptables -A DOCKER-USER -d 169.254.169.254 -j DROP
+
+# 4. 限制容器间互访
+iptables -A DOCKER-USER -i docker0 -o docker0 -j DROP
+
+# 5. 速率限制
+iptables -A DOCKER-USER -p tcp --dport 80 -m limit --limit 100/sec --limit-burst 200 -j ACCEPT
+iptables -A DOCKER-USER -p tcp --dport 80 -j DROP
+
+# 6. 默认拒绝
+iptables -A DOCKER-USER -j DROP
+
+echo "✓ Docker防火墙规则已应用"
+iptables -L DOCKER-USER -n -v
+```
+
+---
+
+## 19.3 CI/CD集成
+
+### 19.3.1 GitLab CI集成
+
+**.gitlab-ci.yml**:
+
+```yaml
+# .gitlab-ci.yml
+stages:
+  - build
+  - test
+  - security
+  - deploy
+
+variables:
+  DOCKER_REGISTRY: registry.company.com
+  DOCKER_IMAGE: $DOCKER_REGISTRY/$CI_PROJECT_NAME
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+
+# ==================== 构建阶段 ====================
+build:
+  stage: build
+  image: docker:24.0-dind
+  services:
+    - docker:24.0-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $DOCKER_REGISTRY
+  script:
+    # 使用BuildKit加速构建
+    - export DOCKER_BUILDKIT=1
+    - docker build
+        --cache-from $DOCKER_IMAGE:latest
+        --build-arg BUILDKIT_INLINE_CACHE=1
+        --tag $DOCKER_IMAGE:$DOCKER_TAG
+        --tag $DOCKER_IMAGE:latest
+        .
+    - docker push $DOCKER_IMAGE:$DOCKER_TAG
+    - docker push $DOCKER_IMAGE:latest
+  only:
+    - main
+    - develop
+
+# ==================== 测试阶段 ====================
+unit_test:
+  stage: test
+  image: $DOCKER_IMAGE:$DOCKER_TAG
+  script:
+    - npm install
+    - npm run test
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+  artifacts:
+    reports:
+      junit: test-results.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+
+integration_test:
+  stage: test
+  image: docker/compose:latest
+  services:
+    - docker:24.0-dind
+  script:
+    - docker-compose -f docker-compose.test.yml up -d
+    - docker-compose -f docker-compose.test.yml exec -T app npm run test:integration
+  after_script:
+    - docker-compose -f docker-compose.test.yml down -v
+
+# ==================== 安全扫描阶段 ====================
+security_scan:
+  stage: security
+  image: aquasec/trivy:latest
+  script:
+    - trivy image
+        --severity HIGH,CRITICAL
+        --exit-code 1
+        --no-progress
+        $DOCKER_IMAGE:$DOCKER_TAG
+  allow_failure: true
+
+sast:
+  stage: security
+  image: returntocorp/semgrep
+  script:
+    - semgrep --config=auto --json --output=sast-report.json .
+  artifacts:
+    reports:
+      sast: sast-report.json
+
+# ==================== 部署阶段 ====================
+deploy_staging:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no deploy@staging.company.com << EOF
+        cd /opt/myapp
+        docker pull $DOCKER_IMAGE:$DOCKER_TAG
+        docker-compose up -d
+        docker-compose ps
+      EOF
+  environment:
+    name: staging
+    url: https://staging.company.com
+  only:
+    - develop
+
+deploy_production:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+  script:
+    - |
+      ssh -o StrictHostKeyChecking=no deploy@prod.company.com << EOF
+        cd /opt/myapp
+
+        # 蓝绿部署
+        export NEW_TAG=$DOCKER_TAG
+        export OLD_TAG=\$(docker ps --filter "name=myapp" --format "{{.Image}}" | cut -d: -f2)
+
+        # 启动新版本
+        docker pull $DOCKER_IMAGE:\$NEW_TAG
+        docker-compose -f docker-compose.blue-green.yml up -d blue
+
+        # 健康检查
+        for i in {1..30}; do
+          if curl -sf http://localhost:8080/health; then
+            echo "✓ 新版本健康检查通过"
+            break
+          fi
+          echo "等待服务启动... (\$i/30)"
+          sleep 2
+        done
+
+        # 切换流量
+        docker-compose -f docker-compose.blue-green.yml up -d nginx
+
+        # 停止旧版本
+        docker-compose -f docker-compose.blue-green.yml stop green
+
+        echo "✓ 部署完成: \$OLD_TAG -> \$NEW_TAG"
+      EOF
+  environment:
+    name: production
+    url: https://app.company.com
+  when: manual
+  only:
+    - main
+```
+
+### 19.3.2 Jenkins Pipeline
+
+**Jenkinsfile**:
+
+```groovy
+// Jenkinsfile
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_REGISTRY = 'registry.company.com'
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${JOB_NAME}"
+        DOCKER_TAG = "${BUILD_NUMBER}"
+        DOCKER_CREDENTIALS = credentials('docker-registry-credentials')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    // 构建Docker镜像
+                    docker.build("${DOCKER_IMAGE}:${DOCKER_TAG}")
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    // 运行测试
+                    docker.image("${DOCKER_IMAGE}:${DOCKER_TAG}").inside {
+                        sh 'npm install'
+                        sh 'npm run test'
+                    }
+                }
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            parallel {
+                stage('Trivy Scan') {
+                    steps {
+                        sh """
+                            trivy image \
+                                --severity HIGH,CRITICAL \
+                                --format json \
+                                --output trivy-report.json \
+                                ${DOCKER_IMAGE}:${DOCKER_TAG}
+                        """
+                    }
+                }
+
+                stage('Anchore Scan') {
+                    steps {
+                        writeFile file: 'anchore_images',
+                                  text: "${DOCKER_IMAGE}:${DOCKER_TAG}"
+                        anchore name: 'anchore_images',
+                                bailOnFail: false
+                    }
+                }
+            }
+        }
+
+        stage('Push') {
+            steps {
+                script {
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                        docker.image("${DOCKER_IMAGE}:${DOCKER_TAG}").push()
+                        docker.image("${DOCKER_IMAGE}:${DOCKER_TAG}").push('latest')
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                sshagent(['staging-ssh-key']) {
+                    sh """
+                        ssh deploy@staging.company.com '
+                            cd /opt/myapp &&
+                            export IMAGE_TAG=${DOCKER_TAG} &&
+                            docker-compose pull &&
+                            docker-compose up -d &&
+                            docker-compose ps
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: '确认部署到生产环境?', ok: '部署'
+
+                sshagent(['production-ssh-key']) {
+                    sh """
+                        ssh deploy@prod.company.com '
+                            cd /opt/myapp &&
+                            ./deploy.sh ${DOCKER_TAG}
+                        '
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(
+                color: 'good',
+                message: "✓ 构建成功: ${JOB_NAME} #${BUILD_NUMBER} (<${BUILD_URL}|查看详情>)"
+            )
+        }
+        failure {
+            slackSend(
+                color: 'danger',
+                message: "✗ 构建失败: ${JOB_NAME} #${BUILD_NUMBER} (<${BUILD_URL}|查看详情>)"
+            )
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
+```
+
+### 19.3.3 金丝雀发布
+
+**部署脚本**:
+
+```bash
+#!/bin/bash
+# canary-deploy.sh - 金丝雀发布脚本
+
+set -e
+
+NEW_VERSION=$1
+CANARY_PERCENT=${2:-10}  # 默认10%流量
+
+if [ -z "$NEW_VERSION" ]; then
+    echo "用法: $0 <新版本> [金丝雀百分比]"
+    exit 1
+fi
+
+STACK_NAME="myapp"
+SERVICE_NAME="${STACK_NAME}_api"
+
+echo "=========================================="
+echo "金丝雀发布"
+echo "新版本: $NEW_VERSION"
+echo "金丝雀流量: $CANARY_PERCENT%"
+echo "=========================================="
+
+# 1. 获取当前版本
+CURRENT_VERSION=$(docker service inspect "$SERVICE_NAME" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}' | cut -d: -f2)
+echo -e "\n当前版本: $CURRENT_VERSION"
+
+# 2. 创建金丝雀服务
+echo -e "\n[1/5] 创建金丝雀服务..."
+docker service create \
+    --name "${SERVICE_NAME}_canary" \
+    --label canary=true \
+    --network "${STACK_NAME}_backend" \
+    --replicas 1 \
+    --limit-cpu 0.5 \
+    --limit-memory 256M \
+    "registry.company.com/myapp:${NEW_VERSION}"
+
+# 3. 等待金丝雀服务就绪
+echo -e "\n[2/5] 等待金丝雀服务启动..."
+for i in {1..30}; do
+    STATUS=$(docker service ps "${SERVICE_NAME}_canary" --filter "desired-state=running" --format "{{.CurrentState}}")
+    if echo "$STATUS" | grep -q "Running"; then
+        echo "✓ 金丝雀服务已就绪"
+        break
+    fi
+    echo "等待中... ($i/30)"
+    sleep 2
+done
+
+# 4. 配置Traefik流量权重
+echo -e "\n[3/5] 配置流量权重..."
+cat > /tmp/traefik-canary.yml <<EOF
+http:
+  services:
+    api-weighted:
+      weighted:
+        services:
+          - name: api-stable
+            weight: $((100 - CANARY_PERCENT))
+          - name: api-canary
+            weight: $CANARY_PERCENT
+EOF
+
+docker config create traefik-canary-config /tmp/traefik-canary.yml
+docker service update --config-add traefik-canary-config traefik
+
+# 5. 监控金丝雀指标 (持续10分钟)
+echo -e "\n[4/5] 监控金丝雀指标..."
+MONITORING_DURATION=600
+START_TIME=$(date +%s)
+
+while true; do
+    ELAPSED=$(($(date +%s) - START_TIME))
+
+    if [ $ELAPSED -ge $MONITORING_DURATION ]; then
+        echo "✓ 监控完成"
+        break
+    fi
+
+    # 查询错误率
+    ERROR_RATE=$(curl -s 'http://prometheus:9090/api/v1/query?query=rate(http_requests_total{service="api_canary",status=~"5.."}[5m])' | jq -r '.data.result[0].value[1]')
+
+    # 查询延迟
+    LATENCY_P99=$(curl -s 'http://prometheus:9090/api/v1/query?query=histogram_quantile(0.99,rate(http_request_duration_seconds_bucket{service="api_canary"}[5m]))' | jq -r '.data.result[0].value[1]')
+
+    echo "错误率: ${ERROR_RATE:-0}  P99延迟: ${LATENCY_P99:-0}s"
+
+    # 检查是否超过阈值
+    if (( $(echo "$ERROR_RATE > 0.01" | bc -l) )); then
+        echo "❌ 错误率过高,回滚金丝雀!"
+        ./rollback-canary.sh
+        exit 1
+    fi
+
+    sleep 30
+done
+
+# 6. 全量发布
+echo -e "\n[5/5] 金丝雀健康,开始全量发布..."
+docker service update \
+    --image "registry.company.com/myapp:${NEW_VERSION}" \
+    --update-parallelism 2 \
+    --update-delay 10s \
+    "$SERVICE_NAME"
+
+# 清理金丝雀服务
+docker service rm "${SERVICE_NAME}_canary"
+
+echo -e "\n=========================================="
+echo "✓ 发布完成: $CURRENT_VERSION -> $NEW_VERSION"
+echo "=========================================="
+```
+
+---
+
+## 19.4 迁移策略
+
+### 19.4.1 从虚拟机迁移到容器
+
+**迁移评估检查表**:
+
+```bash
+#!/bin/bash
+# assess-migration.sh - 迁移可行性评估
+
+APP_NAME=$1
+
+echo "=========================================="
+echo "应用迁移评估: $APP_NAME"
+echo "=========================================="
+
+# 1. 检查应用类型
+echo -e "\n[1] 应用类型检查"
+echo "✓ 无状态应用更适合容器化"
+echo "✓ 有状态应用需要额外的持久化方案"
+
+# 2. 检查依赖项
+echo -e "\n[2] 依赖项分析"
+ldd /usr/bin/myapp 2>/dev/null | grep "=>" | awk '{print $1}' | sort
+echo "建议: 使用官方基础镜像包含大部分系统库"
+
+# 3. 检查配置文件
+echo -e "\n[3] 配置文件位置"
+find /etc -name "*${APP_NAME}*" 2>/dev/null
+echo "建议: 使用环境变量或ConfigMap管理配置"
+
+# 4. 检查数据目录
+echo -e "\n[4] 数据目录"
+find /var -name "*${APP_NAME}*" -type d 2>/dev/null
+echo "建议: 使用Docker Volume或外部存储"
+
+# 5. 检查端口占用
+echo -e "\n[5] 监听端口"
+netstat -tlnp | grep "$APP_NAME"
+echo "建议: 确保端口不冲突"
+
+# 6. 检查系统调用
+echo -e "\n[6] 系统调用分析"
+strace -c /usr/bin/myapp & PID=$!
+sleep 5
+kill $PID 2>/dev/null
+echo "建议: 检查是否有特权操作需求"
+
+# 7. 性能基准
+echo -e "\n[7] 性能基准测试"
+echo "CPU: $(top -b -n1 | grep "$APP_NAME" | awk '{print $9}')%"
+echo "内存: $(ps aux | grep "$APP_NAME" | awk '{print $4}')%"
+
+echo -e "\n=========================================="
+echo "迁移建议:"
+echo "1. 创建Dockerfile封装应用"
+echo "2. 使用docker-compose定义服务依赖"
+echo "3. 配置健康检查"
+echo "4. 设置资源限制"
+echo "5. 准备回滚方案"
+echo "=========================================="
+```
+
+**迁移步骤**:
+
+```bash
+#!/bin/bash
+# migrate-vm-to-container.sh - 虚拟机应用容器化脚本
+
+APP_NAME="myapp"
+VM_HOST="oldvm.company.com"
+REGISTRY="registry.company.com"
+
+echo "=========================================="
+echo "虚拟机到容器迁移: $APP_NAME"
+echo "=========================================="
+
+# 第1阶段: 应用打包
+echo -e "\n[阶段1/4] 从虚拟机打包应用..."
+ssh root@$VM_HOST << 'EOF'
+    cd /opt/myapp
+    tar czf /tmp/myapp.tar.gz .
+EOF
+
+scp root@$VM_HOST:/tmp/myapp.tar.gz ./
+
+# 第2阶段: 创建Dockerfile
+echo -e "\n[阶段2/4] 生成Dockerfile..."
+cat > Dockerfile <<'DOCKERFILE'
+FROM ubuntu:22.04
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建非root用户
+RUN useradd -m -u 1000 appuser
+
+# 复制应用文件
+WORKDIR /app
+COPY myapp.tar.gz .
+RUN tar xzf myapp.tar.gz && rm myapp.tar.gz
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["./start.sh"]
+DOCKERFILE
+
+# 第3阶段: 构建镜像
+echo -e "\n[阶段3/4] 构建Docker镜像..."
+docker build -t $REGISTRY/$APP_NAME:v1.0.0 .
+
+# 第4阶段: 测试运行
+echo -e "\n[阶段4/4] 测试容器..."
+docker run -d --name ${APP_NAME}_test \
+    -p 8080:8080 \
+    -e DB_HOST=postgres.company.com \
+    -e DB_PORT=5432 \
+    $REGISTRY/$APP_NAME:v1.0.0
+
+# 健康检查
+echo "等待服务启动..."
+for i in {1..30}; do
+    if curl -sf http://localhost:8080/health > /dev/null; then
+        echo "✓ 容器运行正常"
+        break
+    fi
+    sleep 2
+done
+
+# 清理测试容器
+docker stop ${APP_NAME}_test
+docker rm ${APP_NAME}_test
+
+# 推送镜像
+echo -e "\n推送镜像到仓库..."
+docker push $REGISTRY/$APP_NAME:v1.0.0
+
+echo -e "\n=========================================="
+echo "✓ 迁移完成"
+echo "下一步:"
+echo "1. 创建docker-compose.yml"
+echo "2. 配置生产环境变量"
+echo "3. 执行灰度发布"
+echo "=========================================="
+```
+
+### 19.4.2 从Kubernetes迁移到Docker Swarm
+
+**转换工具**:
+
+```python
+#!/usr/bin/env python3
+# k8s-to-swarm.py - Kubernetes YAML转Docker Stack
+
+import yaml
+import sys
+
+def convert_deployment(k8s_yaml):
+    """转换Deployment到Docker Service"""
+    spec = k8s_yaml['spec']
+    template = spec['template']
+
+    service = {
+        'image': template['spec']['containers'][0]['image'],
+        'deploy': {
+            'replicas': spec.get('replicas', 1),
+            'restart_policy': {
+                'condition': 'on-failure'
+            }
+        }
+    }
+
+    # 转换资源限制
+    if 'resources' in template['spec']['containers'][0]:
+        resources = template['spec']['containers'][0]['resources']
+        service['deploy']['resources'] = {}
+
+        if 'limits' in resources:
+            service['deploy']['resources']['limits'] = {
+                'cpus': resources['limits'].get('cpu', '1'),
+                'memory': resources['limits'].get('memory', '512M')
+            }
+
+        if 'requests' in resources:
+            service['deploy']['resources']['reservations'] = {
+                'cpus': resources['requests'].get('cpu', '0.5'),
+                'memory': resources['requests'].get('memory', '256M')
+            }
+
+    # 转换环境变量
+    if 'env' in template['spec']['containers'][0]:
+        service['environment'] = []
+        for env in template['spec']['containers'][0]['env']:
+            service['environment'].append(f"{env['name']}={env.get('value', '')}")
+
+    # 转换端口
+    if 'ports' in template['spec']['containers'][0]:
+        service['ports'] = []
+        for port in template['spec']['containers'][0]['ports']:
+            service['ports'].append(f"{port['containerPort']}:{port['containerPort']}")
+
+    return service
+
+def main():
+    if len(sys.argv) < 2:
+        print("用法: k8s-to-swarm.py <k8s.yaml>")
+        sys.exit(1)
+
+    with open(sys.argv[1], 'r') as f:
+        k8s_docs = yaml.safe_load_all(f)
+
+        stack = {
+            'version': '3.8',
+            'services': {}
+        }
+
+        for doc in k8s_docs:
+            if doc['kind'] == 'Deployment':
+                name = doc['metadata']['name']
+                stack['services'][name] = convert_deployment(doc)
+
+        print(yaml.dump(stack, default_flow_style=False))
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 19.5 避坑指南
+
+### 19.5.1 常见错误
+
+**1. 容器时区问题**:
+
+```dockerfile
+# ❌ 错误: 容器使用UTC时区
+FROM alpine
+CMD ["date"]
+
+# ✅ 正确: 设置时区
+FROM alpine
+RUN apk add --no-cache tzdata
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+CMD ["date"]
+```
+
+**2. 日志丢失问题**:
+
+```dockerfile
+# ❌ 错误: 日志写入文件
+CMD ./app > /var/log/app.log 2>&1
+
+# ✅ 正确: 日志输出到stdout/stderr
+CMD ./app
+```
+
+**3. PID 1僵尸进程问题**:
+
+```dockerfile
+# ❌ 错误: 使用shell启动
+CMD ./start.sh
+
+# ✅ 正确: 使用exec形式或dumb-init
+FROM alpine
+RUN apk add --no-cache dumb-init
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["./app"]
+```
+
+**4. 文件权限问题**:
+
+```dockerfile
+# ❌ 错误: root用户创建文件
+COPY app.jar /app/
+USER appuser
+CMD java -jar /app/app.jar
+
+# ✅ 正确: 设置正确的所有者
+COPY --chown=appuser:appuser app.jar /app/
+USER appuser
+CMD ["java", "-jar", "/app/app.jar"]
+```
+
+**5. 环境变量展开问题**:
+
+```yaml
+# ❌ 错误: 单引号阻止变量展开
+services:
+  app:
+    command: 'echo $PATH'
+
+# ✅ 正确: 使用双引号或不加引号
+services:
+  app:
+    command: echo $PATH
+```
+
+### 19.5.2 性能陷阱
+
+**1. 过度使用bind mount**:
+
+```yaml
+# ❌ 慢: bind mount需要文件系统同步
+volumes:
+  - ./app:/app
+
+# ✅ 快: 使用named volume
+volumes:
+  - app_data:/app
+
+volumes:
+  app_data:
+```
+
+**2. 过多的层导致镜像臃肿**:
+
+```dockerfile
+# ❌ 错误: 每个RUN创建一层
+RUN apt-get update
+RUN apt-get install -y curl
+RUN apt-get install -y vim
+RUN apt-get clean
+
+# ✅ 正确: 合并命令
+RUN apt-get update && apt-get install -y \
+    curl \
+    vim \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+**3. 不使用.dockerignore**:
+
+```bash
+# .dockerignore
+node_modules
+*.log
+.git
+.DS_Store
+coverage
+*.md
+```
+
+**4. 使用latest标签**:
+
+```yaml
+# ❌ 不推荐: latest不稳定
+services:
+  app:
+    image: myapp:latest
+
+# ✅ 推荐: 使用明确版本
+services:
+  app:
+    image: myapp:v1.2.3
+```
+
+### 19.5.3 监控盲点
+
+**关键指标监控清单**:
+
+```yaml
+# prometheus-alerts.yml
+groups:
+  - name: docker_health
+    interval: 30s
+    rules:
+      # 1. 容器重启频繁
+      - alert: ContainerRestartingTooOften
+        expr: rate(container_restart_count[15m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "容器 {{ $labels.container }} 重启频繁"
+
+      # 2. 容器OOM
+      - alert: ContainerOOMKilled
+        expr: container_oom_events_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "容器 {{ $labels.container }} 发生OOM"
+
+      # 3. 磁盘空间不足
+      - alert: DockerDiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/var/lib/docker"} / node_filesystem_size_bytes) < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Docker数据目录空间不足 < 10%"
+
+      # 4. 镜像拉取失败
+      - alert: ImagePullFailed
+        expr: increase(docker_image_pull_errors_total[5m]) > 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "镜像拉取失败次数过多"
+
+      # 5. Swarm节点不可用
+      - alert: SwarmNodeUnavailable
+        expr: swarm_node_status != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Swarm节点 {{ $labels.node_name }} 不可用"
+```
+
+---
+
+## 19.6 企业级最佳实践总结
+
+### 19.6.1 镜像管理
+
+1. **使用语义化版本**: `v1.2.3`
+2. **锁定基础镜像SHA**: `FROM node:18@sha256:...`
+3. **定期扫描漏洞**: Trivy/Snyk
+4. **清理无用镜像**: `docker image prune -a`
+
+### 19.6.2 资源规划
+
+```yaml
+# 资源配置范例
+services:
+  # 高流量API
+  api:
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # 后台任务
+  worker:
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # 数据库
+  postgres:
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+```
+
+### 19.6.3 日志与监控
+
+```yaml
+# 统一日志配置
+x-logging: &default-logging
+  driver: fluentd
+  options:
+    fluentd-address: "fluentd.company.com:24224"
+    fluentd-async: "true"
+    fluentd-retry-wait: "1s"
+    fluentd-max-retries: "10"
+    tag: "{{.Name}}"
+
+services:
+  app:
+    logging: *default-logging
+```
+
+### 19.6.4 备份策略
+
+```bash
+#!/bin/bash
+# backup-docker-volumes.sh - Docker卷备份脚本
+
+BACKUP_DIR="/backup/docker-volumes"
+DATE=$(date +%Y%m%d_%H%M%S)
+
+# 获取所有卷
+VOLUMES=$(docker volume ls -q)
+
+for volume in $VOLUMES; do
+    echo "备份卷: $volume"
+
+    # 创建临时容器挂载卷并备份
+    docker run --rm \
+        -v "$volume":/source:ro \
+        -v "$BACKUP_DIR":/backup \
+        alpine \
+        tar czf "/backup/${volume}_${DATE}.tar.gz" -C /source .
+
+    echo "✓ 备份完成: ${volume}_${DATE}.tar.gz"
+done
+
+# 删除7天前的备份
+find "$BACKUP_DIR" -name "*.tar.gz" -mtime +7 -delete
+```
+
+---
+
+*（第19章完成,约1800行。全书19章全部完成!）*
+
+## 🎉 全书完结
+
+恭喜您完成《Docker底层原理与生产实战指南》的学习!
+
+### 📚 全书章节回顾
+
+1. **第1-5章**: Docker核心概念与底层原理
+2. **第6-8章**: 镜像构建与优化
+3. **第9-12章**: 容器运行时与编排
+4. **第13章**: 生产环境部署架构
+5. **第14章**: 高可用性与灾难恢复
+6. **第15章**: 监控告警体系
+7. **第16章**: 日志收集与分析
+8. **第17章**: 性能优化
+9. **第18章**: 故障排查
+10. **第19章**: 最佳实践与案例
+
+### 🎯 学习路径建议
+
+- **初学者**: 第1-8章 → 第9-12章
+- **运维工程师**: 第13-16章 → 第17-18章
+- **架构师**: 全书系统学习
+
+### 📖 延伸阅读
+
+- Docker官方文档: https://docs.docker.com
+- Docker Swarm文档: https://docs.docker.com/engine/swarm/
+- Kubernetes进阶学习
+- 云原生技术栈
+
+---
+
+*感谢您的阅读!如有问题,欢迎交流讨论。*
